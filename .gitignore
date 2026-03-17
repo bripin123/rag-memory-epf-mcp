@@ -144,4 +144,4 @@ coverage/
 
 # Backup files
 *.bak
-*.backup 
+*.backup .npmrc
