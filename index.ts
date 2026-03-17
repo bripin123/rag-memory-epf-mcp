@@ -154,22 +154,22 @@ class RAGKnowledgeGraphManager {
 
   private async initializeEmbeddingModel() {
     try {
-      console.error('🤖 Loading sentence transformer model: all-MiniLM-L12-v2...');
-      
+      console.error('🤖 Loading embedding model: gte-multilingual-base (768-dim, 70+ languages)...');
+
       // Configure environment to allow remote model downloads
       env.allowRemoteModels = true;
       env.allowLocalModels = true;
-      
+
       this.embeddingModel = await pipeline(
         'feature-extraction',
-        'sentence-transformers/all-MiniLM-L12-v2',
-        { 
+        'onnx-community/gte-multilingual-base',
+        {
           revision: 'main',
         }
       );
-      
+
       this.modelInitialized = true;
-      console.error('✅ Sentence transformer model loaded successfully');
+      console.error('✅ gte-multilingual-base model loaded successfully');
       
     } catch (error) {
       console.error('❌ Failed to load embedding model:', error);
@@ -1039,7 +1039,7 @@ class RAGKnowledgeGraphManager {
   }
 
   // Generate embeddings using sentence transformers
-  private async generateEmbedding(text: string, dimensions = 384): Promise<Float32Array> {
+  private async generateEmbedding(text: string, dimensions = 768): Promise<Float32Array> {
     if (this.modelInitialized && this.embeddingModel) {
       try {
         // Use the real sentence transformer model

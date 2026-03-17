@@ -49,14 +49,14 @@ export const migrations: Migration[] = [
       // Vector embeddings using sqlite-vec for document chunks
       db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING vec0(
-          embedding FLOAT[384]
+          embedding FLOAT[768]
         )
       `);
 
       // Vector embeddings for entities using sqlite-vec
       db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS entity_embeddings USING vec0(
-          embedding FLOAT[384]
+          embedding FLOAT[768]
         )
       `);
 
@@ -153,6 +153,49 @@ export const migrations: Migration[] = [
       // SQLite doesn't support dropping columns, so we'd need to recreate the table
       // For now, we'll just mark this as not reversible
       throw new Error('This migration cannot be reversed due to SQLite limitations');
+    }
+  },
+
+  {
+    version: 3,
+    description: 'Upgrade embedding dimensions from 384 to 768 (gte-multilingual-base)',
+    up: (db) => {
+      // Drop old 384-dim vector tables
+      db.exec(`DROP TABLE IF EXISTS chunks`);
+      db.exec(`DROP TABLE IF EXISTS entity_embeddings`);
+
+      // Recreate with 768 dimensions
+      db.exec(`
+        CREATE VIRTUAL TABLE chunks USING vec0(
+          embedding FLOAT[768]
+        )
+      `);
+      db.exec(`
+        CREATE VIRTUAL TABLE entity_embeddings USING vec0(
+          embedding FLOAT[768]
+        )
+      `);
+
+      // Clear stale embedding metadata (embeddings need to be regenerated)
+      db.exec(`DELETE FROM entity_embedding_metadata`);
+    },
+    down: (db) => {
+      // Revert to 384 dimensions
+      db.exec(`DROP TABLE IF EXISTS chunks`);
+      db.exec(`DROP TABLE IF EXISTS entity_embeddings`);
+
+      db.exec(`
+        CREATE VIRTUAL TABLE chunks USING vec0(
+          embedding FLOAT[384]
+        )
+      `);
+      db.exec(`
+        CREATE VIRTUAL TABLE entity_embeddings USING vec0(
+          embedding FLOAT[384]
+        )
+      `);
+
+      db.exec(`DELETE FROM entity_embedding_metadata`);
     }
   }
 ]; 
