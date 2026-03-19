@@ -154,7 +154,7 @@ class RAGKnowledgeGraphManager {
 
   private async initializeEmbeddingModel() {
     try {
-      console.error('🤖 Loading embedding model: gte-multilingual-base (768-dim, 70+ languages)...');
+      console.error('🤖 Loading embedding model: jina-embeddings-v5-text-nano-retrieval (768-dim, 119+ languages)...');
 
       // Configure environment to allow remote model downloads
       env.allowRemoteModels = true;
@@ -162,14 +162,14 @@ class RAGKnowledgeGraphManager {
 
       this.embeddingModel = await pipeline(
         'feature-extraction',
-        'onnx-community/gte-multilingual-base',
+        'jinaai/jina-embeddings-v5-text-nano-retrieval',
         {
           revision: 'main',
         }
       );
 
       this.modelInitialized = true;
-      console.error('✅ gte-multilingual-base model loaded successfully');
+      console.error('✅ jina-embeddings-v5-text-nano-retrieval model loaded successfully');
       
     } catch (error) {
       console.error('❌ Failed to load embedding model:', error);
@@ -505,7 +505,7 @@ class RAGKnowledgeGraphManager {
       name: result.name,
       entityType: result.entityType,
       observations: JSON.parse(result.observations),
-      similarity: 1 / (1 + result.distance) // Convert distance to similarity score
+      similarity: Math.max(0, 1 - result.distance / 2) // Convert cosine distance (0-2) to similarity (1-0)
     }));
     
     // Get relationships between the found entities

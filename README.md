@@ -7,17 +7,17 @@
 
 An advanced MCP server for **RAG-enabled memory** through a knowledge graph with **multilingual vector search** capabilities.
 
-**Fork of:** [rag-memory-mcp](https://github.com/ttommyth/rag-memory-mcp) — upgraded with **gte-multilingual-base** (768-dim, 70+ languages) for significantly better multilingual semantic search.
+**Fork of:** [rag-memory-mcp](https://github.com/ttommyth/rag-memory-mcp) — upgraded with **jina-embeddings-v5-text-nano-retrieval** (768-dim, 119+ languages) for significantly better multilingual semantic search.
 
 ## What's Different
 
 | | rag-memory-mcp (original) | rag-memory-epf-mcp (this fork) |
 |---|---|---|
-| **Embedding Model** | all-MiniLM-L12-v2 | **gte-multilingual-base** |
+| **Embedding Model** | all-MiniLM-L12-v2 | **jina-embeddings-v5-text-nano-retrieval** |
 | **Dimensions** | 384 | **768** |
-| **Languages** | English only | **70+ (Korean, Arabic, Chinese, etc.)** |
-| **Quality** | ~49 MTEB | **SOTA on MIRACL/MLDR** |
-| **Max Tokens** | 256 | **8192** |
+| **Languages** | English only | **119+ (Korean, Arabic, Chinese, etc.)** |
+| **Quality** | ~49 MTEB | **71.0 MTEB English v2** |
+| **Max Tokens** | 256 | **32768** |
 
 ## Quick Start
 
@@ -111,4 +111,4 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
-**Built with**: TypeScript, SQLite, sqlite-vec, Hugging Face Transformers (gte-multilingual-base), Model Context Protocol SDK
+**Built with**: TypeScript, SQLite, sqlite-vec, Hugging Face Transformers (jina-embeddings-v5-text-nano-retrieval), Model Context Protocol SDK
