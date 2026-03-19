@@ -1626,7 +1626,6 @@ class RAGKnowledgeGraphManager {
         m.text,
         m.start_pos,
         m.end_pos,
-        m.metadata as chunk_metadata,
         c.distance,
         COALESCE(d.metadata, '{}') as doc_metadata
       FROM chunks c
@@ -1646,7 +1645,6 @@ class RAGKnowledgeGraphManager {
       text: string;
       start_pos: number;
       end_pos: number;
-      chunk_metadata: string;
       distance: number;
       doc_metadata: string;
     }>;
@@ -1744,7 +1742,7 @@ class RAGKnowledgeGraphManager {
         result.chunk_type === 'relationship' ? 1 : 2 // Shorter summary for relationships
       );
       
-      const vectorSimilarity = 1 / (1 + result.distance);
+      const vectorSimilarity = Math.max(0, 1 - result.distance / 2);
       const finalScore = Math.max(vectorSimilarity, relevanceScore) + graphBoost;
       
       // Determine document title and source ID
