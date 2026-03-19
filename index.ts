@@ -1112,7 +1112,7 @@ class RAGKnowledgeGraphManager {
         return new Float32Array(embedding.slice(0, dimensions));
         
       } catch (error) {
-        console.error('⚠️ Embedding model failed, falling back to enhanced general semantic embedding:', error);
+        console.error(`⚠️ Embedding model failed for text "${text.slice(0, 50)}...":`, error instanceof Error ? error.message : error);
         // Fall through to enhanced general implementation
       }
     }
@@ -1120,8 +1120,8 @@ class RAGKnowledgeGraphManager {
     // Enhanced general-purpose semantic embedding
     const embedding = new Array(dimensions).fill(0);
     
-    // Normalize and tokenize text
-    const normalizedText = text.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+    // Normalize and tokenize text (preserve Unicode letters including Korean, Arabic, etc.)
+    const normalizedText = text.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
     const words = normalizedText.split(' ').filter(word => word.length > 1);
     
     if (words.length === 0) {
