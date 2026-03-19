@@ -154,7 +154,7 @@ class RAGKnowledgeGraphManager {
 
   private async initializeEmbeddingModel() {
     try {
-      console.error('🤖 Loading embedding model: jina-embeddings-v5-text-nano-retrieval (768-dim, 119+ languages)...');
+      console.error('🤖 Loading embedding model: jina-embeddings-v5-text-small (768-dim, 119+ languages)...');
 
       // Configure environment to allow remote model downloads
       env.allowRemoteModels = true;
@@ -162,14 +162,14 @@ class RAGKnowledgeGraphManager {
 
       this.embeddingModel = await pipeline(
         'feature-extraction',
-        'jinaai/jina-embeddings-v5-text-nano-retrieval',
+        'jinaai/jina-embeddings-v5-text-small',
         {
           revision: 'main',
         }
       );
 
       this.modelInitialized = true;
-      console.error('✅ jina-embeddings-v5-text-nano-retrieval model loaded successfully');
+      console.error('✅ jina-embeddings-v5-text-small model loaded successfully');
       
     } catch (error) {
       console.error('❌ Failed to load embedding model:', error);
@@ -904,11 +904,11 @@ class RAGKnowledgeGraphManager {
         // Delete existing embedding if any
         this.db.prepare(`DELETE FROM chunks WHERE rowid = ?`).run(chunk.rowid);
         
-        // Insert new embedding
+        // Insert new embedding with explicit rowid to match chunk_metadata
         const result = this.db.prepare(`
-          INSERT INTO chunks (embedding) VALUES (?)
-        `).run(Buffer.from(embedding.buffer));
-        
+          INSERT INTO chunks (rowid, embedding) VALUES (?, ?)
+        `).run(chunk.rowid, Buffer.from(embedding.buffer));
+
         if (result.changes > 0) {
           embeddedCount++;
         }
@@ -1335,21 +1335,20 @@ class RAGKnowledgeGraphManager {
         // First, delete any existing embedding for this rowid
         this.db.prepare(`DELETE FROM chunks WHERE rowid = ?`).run(chunk.rowid);
         
-        // Insert new embedding, letting vec0 handle the rowid
+        // Insert new embedding with explicit rowid to match chunk_metadata
         const result = this.db.prepare(`
-          INSERT INTO chunks (embedding) VALUES (?)
-        `).run(Buffer.from(embedding.buffer));
-        
+          INSERT INTO chunks (rowid, embedding) VALUES (?, ?)
+        `).run(chunk.rowid, Buffer.from(embedding.buffer));
+
         if (result.changes > 0) {
           embeddedCount++;
-          // console.log(`✅ Embedded chunk ${chunk.chunk_id} with rowid ${result.lastInsertRowid}`);
         }
       } catch (error) {
         console.error(`Failed to embed chunk ${chunk.chunk_id}:`, error);
         // Continue with other chunks instead of failing completely
       }
     }
-    
+
     console.error(`✅ Chunks embedded: ${embeddedCount} embeddings created`);
     return { documentId, embeddedChunks: embeddedCount };
   }
