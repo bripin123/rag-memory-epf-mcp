@@ -902,19 +902,20 @@ class RAGKnowledgeGraphManager {
     for (const chunk of chunks) {
       // Generate embedding
       const embedding = await this.generateEmbedding(chunk.text);
+      const rowid = Number(chunk.rowid);
 
       try {
         // Delete existing embedding if any
-        this.db.prepare(`DELETE FROM chunks WHERE rowid = ?`).run(chunk.rowid);
+        this.db.prepare(`DELETE FROM chunks WHERE rowid = ?`).run(rowid);
 
         // Insert new embedding with explicit rowid to match chunk_metadata
         this.db.prepare(`
           INSERT INTO chunks (rowid, embedding) VALUES (?, ?)
-        `).run(chunk.rowid, Buffer.from(embedding.buffer));
+        `).run(rowid, Buffer.from(embedding.buffer));
 
         embeddedCount++;
       } catch (error) {
-        const errMsg = `chunk ${chunk.chunk_id} (rowid=${chunk.rowid}): ${error instanceof Error ? error.message : String(error)}`;
+        const errMsg = `chunk ${chunk.chunk_id} (rowid=${rowid}): ${error instanceof Error ? error.message : String(error)}`;
         console.error(`Failed to embed ${errMsg}`);
         errors.push(errMsg);
       }
@@ -1334,20 +1335,21 @@ class RAGKnowledgeGraphManager {
     for (const chunk of chunks) {
       // Generate embedding
       const embedding = await this.generateEmbedding(chunk.text);
+      const rowid = Number(chunk.rowid);
 
       // Store in vector table
       try {
         // First, delete any existing embedding for this rowid
-        this.db.prepare(`DELETE FROM chunks WHERE rowid = ?`).run(chunk.rowid);
+        this.db.prepare(`DELETE FROM chunks WHERE rowid = ?`).run(rowid);
 
         // Insert new embedding with explicit rowid to match chunk_metadata
         this.db.prepare(`
           INSERT INTO chunks (rowid, embedding) VALUES (?, ?)
-        `).run(chunk.rowid, Buffer.from(embedding.buffer));
+        `).run(rowid, Buffer.from(embedding.buffer));
 
         embeddedCount++;
       } catch (error) {
-        const errMsg = `chunk ${chunk.chunk_id} (rowid=${chunk.rowid}): ${error instanceof Error ? error.message : String(error)}`;
+        const errMsg = `chunk ${chunk.chunk_id} (rowid=${rowid}): ${error instanceof Error ? error.message : String(error)}`;
         console.error(`Failed to embed ${errMsg}`);
         errors.push(errMsg);
       }
