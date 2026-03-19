@@ -7,17 +7,18 @@
 
 An advanced MCP server for **RAG-enabled memory** through a knowledge graph with **multilingual vector search** capabilities.
 
-**Fork of:** [rag-memory-mcp](https://github.com/ttommyth/rag-memory-mcp) — upgraded with **jina-embeddings-v5-text-nano-retrieval** (768-dim, 119+ languages) for significantly better multilingual semantic search.
+**Fork of:** [rag-memory-mcp](https://github.com/ttommyth/rag-memory-mcp) — upgraded with **BGE-M3** (1024-dim, 100+ languages) for significantly better multilingual semantic search.
 
 ## What's Different
 
 | | rag-memory-mcp (original) | rag-memory-epf-mcp (this fork) |
 |---|---|---|
-| **Embedding Model** | all-MiniLM-L12-v2 | **jina-embeddings-v5-text-nano-retrieval** |
-| **Dimensions** | 384 | **768** |
-| **Languages** | English only | **119+ (Korean, Arabic, Chinese, etc.)** |
-| **Quality** | ~49 MTEB | **71.0 MTEB English v2** |
-| **Max Tokens** | 256 | **32768** |
+| **Embedding Model** | all-MiniLM-L12-v2 | **BGE-M3** |
+| **Dimensions** | 384 | **1024** |
+| **Languages** | English only | **100+ (Korean, Chinese, Japanese, Arabic, etc.)** |
+| **MTEB Score** | ~49 | **63.0+** |
+| **Max Tokens** | 256 | **8192** |
+| **Unicode Support** | ASCII only fallback | **Full Unicode (CJK, Arabic, Cyrillic, etc.)** |
 
 ## Quick Start
 
@@ -47,30 +48,36 @@ An advanced MCP server for **RAG-enabled memory** through a knowledge graph with
 }
 ```
 
-## Migration from rag-memory-mcp
+## Migration
 
-If you have an existing database from the original `rag-memory-mcp`:
+### From rag-memory-mcp (original)
 
-1. Replace `rag-memory-mcp` with `rag-memory-epf-mcp@latest` in your `.mcp.json`
-2. **Migration v3 runs automatically** — recreates vector tables with 768 dimensions
+1. Replace `rag-memory-mcp` with `rag-memory-epf-mcp@latest` in your config
+2. Migrations run automatically (384 → 1024 dimensions)
 3. Re-embed your data:
    - `embedAllEntities()` — re-embeds all entities
    - `embedChunks(documentId)` — re-embeds each document's chunks
+
+### From rag-memory-epf-mcp v1.2.x (jina-v5-nano)
+
+1. Update to `rag-memory-epf-mcp@latest`
+2. Migration v5 runs automatically (768 → 1024 dimensions)
+3. Re-embed your data (same commands as above)
 
 Your entities, relationships, documents, and chunk text are preserved. Only vector embeddings are regenerated.
 
 ## Tools
 
-### 📚 Document Management
+### Document Management
 - `storeDocument`: Store documents with metadata
 - `chunkDocument`: Create text chunks with configurable parameters
-- `embedChunks`: Generate 768-dim vector embeddings
+- `embedChunks`: Generate 1024-dim vector embeddings
 - `extractTerms`: Extract potential entity terms
 - `linkEntitiesToDocument`: Create entity-document associations
 - `deleteDocuments`: Remove documents and associated data
 - `listDocuments`: View all stored documents
 
-### 🧠 Knowledge Graph
+### Knowledge Graph
 - `createEntities`: Create entities with observations and types
 - `createRelations`: Establish relationships between entities
 - `addObservations`: Add contextual information to entities
@@ -79,14 +86,14 @@ Your entities, relationships, documents, and chunk text are preserved. Only vect
 - `deleteObservations`: Remove specific observations
 - `embedAllEntities`: Generate embeddings for all entities
 
-### 🔍 Search & Retrieval
+### Search & Retrieval
 - `hybridSearch`: Vector similarity + graph traversal
 - `searchNodes`: Semantic entity search (multilingual)
 - `openNodes`: Retrieve specific entities
 - `readGraph`: Get complete knowledge graph
 - `getDetailedContext`: Get full context for a chunk
 
-### 📊 Analytics & Migration
+### Analytics & Migration
 - `getKnowledgeGraphStats`: Knowledge base statistics
 - `getMigrationStatus`: Check database schema version
 - `runMigrations`: Apply pending migrations
@@ -111,4 +118,4 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
-**Built with**: TypeScript, SQLite, sqlite-vec, Hugging Face Transformers (jina-embeddings-v5-text-nano-retrieval), Model Context Protocol SDK
+**Built with**: TypeScript, SQLite, sqlite-vec, Hugging Face Transformers (BGE-M3), Model Context Protocol SDK
