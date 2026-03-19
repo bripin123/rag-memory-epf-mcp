@@ -906,16 +906,16 @@ class RAGKnowledgeGraphManager {
 
       try {
         // Delete existing embedding if any
-        this.db.prepare(`DELETE FROM chunks WHERE rowid = ?`).run(rowid);
+        this.db.exec(`DELETE FROM chunks WHERE rowid = ${rowid}`);
 
-        // Insert new embedding with explicit rowid to match chunk_metadata
+        // Insert new embedding - rowid as literal integer for vec0 compatibility
         this.db.prepare(`
-          INSERT INTO chunks (rowid, embedding) VALUES (?, ?)
-        `).run(rowid, Buffer.from(embedding.buffer));
+          INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)
+        `).run(Buffer.from(embedding.buffer));
 
         embeddedCount++;
       } catch (error) {
-        const errMsg = `chunk ${chunk.chunk_id} (rowid=${rowid}): ${error instanceof Error ? error.message : String(error)}`;
+        const errMsg = `chunk ${chunk.chunk_id} (rowid=${rowid}, type=${typeof chunk.rowid}): ${error instanceof Error ? error.message : String(error)}`;
         console.error(`Failed to embed ${errMsg}`);
         errors.push(errMsg);
       }
@@ -955,11 +955,9 @@ class RAGKnowledgeGraphManager {
     
     // Delete vectors and associations
     for (const chunk of existingChunks) {
-      // Delete vector embeddings (vec0 requires Number, not BigInt)
-      const vectors = this.db.prepare(`
-        DELETE FROM chunks WHERE rowid = ?
-      `).run(Number(chunk.rowid));
-      deletedVectors += vectors.changes;
+      // Delete vector embeddings (vec0 needs literal integer, not parameterized)
+      this.db.exec(`DELETE FROM chunks WHERE rowid = ${Number(chunk.rowid)}`);
+      deletedVectors++;
 
       // Delete chunk-entity associations
       const associations = this.db.prepare(`
@@ -967,7 +965,7 @@ class RAGKnowledgeGraphManager {
       `).run(chunk.rowid);
       deletedAssociations += associations.changes;
     }
-    
+
     // Delete chunk metadata
     const metadata = this.db.prepare(`
       DELETE FROM chunk_metadata WHERE chunk_type IN ('entity', 'relationship')
@@ -1340,16 +1338,17 @@ class RAGKnowledgeGraphManager {
       // Store in vector table
       try {
         // First, delete any existing embedding for this rowid
-        this.db.prepare(`DELETE FROM chunks WHERE rowid = ?`).run(rowid);
+        this.db.exec(`DELETE FROM chunks WHERE rowid = ${rowid}`);
 
         // Insert new embedding with explicit rowid to match chunk_metadata
+        // Use parameterized only for embedding blob, rowid as literal integer
         this.db.prepare(`
-          INSERT INTO chunks (rowid, embedding) VALUES (?, ?)
-        `).run(rowid, Buffer.from(embedding.buffer));
+          INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)
+        `).run(Buffer.from(embedding.buffer));
 
         embeddedCount++;
       } catch (error) {
-        const errMsg = `chunk ${chunk.chunk_id} (rowid=${rowid}): ${error instanceof Error ? error.message : String(error)}`;
+        const errMsg = `chunk ${chunk.chunk_id} (rowid=${rowid}, type=${typeof chunk.rowid}): ${error instanceof Error ? error.message : String(error)}`;
         console.error(`Failed to embed ${errMsg}`);
         errors.push(errMsg);
       }
@@ -1453,13 +1452,11 @@ class RAGKnowledgeGraphManager {
       `).run(chunk.rowid);
       deletedAssociations += associations.changes;
 
-      // Delete vector embeddings (vec0 requires Number, not BigInt)
-      const vectors = this.db.prepare(`
-        DELETE FROM chunks WHERE rowid = ?
-      `).run(Number(chunk.rowid));
-      deletedVectors += vectors.changes;
+      // Delete vector embeddings (vec0 needs literal integer, not parameterized)
+      this.db.exec(`DELETE FROM chunks WHERE rowid = ${Number(chunk.rowid)}`);
+      deletedVectors++;
     }
-    
+
     // Delete chunk metadata
     const metadata = this.db.prepare(`
       DELETE FROM chunk_metadata WHERE document_id = ?
