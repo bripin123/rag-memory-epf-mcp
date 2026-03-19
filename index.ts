@@ -979,6 +979,58 @@ class RAGKnowledgeGraphManager {
   }
 
   // Simple configurable term extraction (replacing hardcoded patterns)
+  // Cross-lingual query translation using entity DB + domain dictionary
+  private translateQueryCrossLingual(query: string): string | null {
+    if (!this.db) return null;
+
+    // Domain-specific Korean→English dictionary
+    const domainDict: Record<string, string> = {
+      '할랄': 'halal', '인증': 'certification', '상호인정': 'mutual recognition',
+      '인정': 'accreditation', '인증기관': 'certification body',
+      '표준': 'standard', '감사': 'audit', '심사': 'audit review',
+      '도축': 'slaughter', '식품': 'food', '화장품': 'cosmetics',
+      '수출': 'export', '수입': 'import', '무역': 'trade',
+      '방문': 'visit', '협력': 'cooperation', '협약': 'agreement',
+      '제안': 'proposal', '회의': 'meeting', '이메일': 'email',
+      '보고서': 'report', '전략': 'strategy', '사업': 'business',
+      '정부': 'government', '지원': 'support', '바우처': 'voucher',
+      '창업': 'startup', '대학': 'university',
+    };
+
+    // Build entity Korean→English mapping from observations
+    try {
+      const entities = this.db.prepare(`
+        SELECT name, observations FROM entities
+      `).all() as Array<{ name: string; observations: string }>;
+
+      for (const entity of entities) {
+        try {
+          const obs = JSON.parse(entity.observations) as string[];
+          for (const o of obs) {
+            const match = o.match(/한국어명:\s*(.+)/);
+            if (match) {
+              const koreanName = match[1].trim();
+              domainDict[koreanName] = entity.name;
+            }
+          }
+        } catch {}
+      }
+    } catch {}
+
+    // Translate Korean terms in query
+    let translated = query;
+    // Sort by length descending to match longer terms first
+    const sortedTerms = Object.entries(domainDict).sort((a, b) => b[0].length - a[0].length);
+    for (const [ko, en] of sortedTerms) {
+      translated = translated.replace(new RegExp(ko, 'g'), en);
+    }
+
+    // Remove remaining Korean characters and clean up
+    translated = translated.replace(/[\uAC00-\uD7A3]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+    return translated.length > 2 ? translated : null;
+  }
+
   private extractTermsFromText(text: string, options: {
     minLength?: number;
     includeCapitalized?: boolean;
@@ -1619,48 +1671,79 @@ class RAGKnowledgeGraphManager {
     if (!this.encoding) throw new Error('Tokenizer not initialized');
     
     console.error(`🔍 Enhanced hybrid search: "${query}"`);
-    
-    // Generate query embedding
+
+    // Detect Korean in query and build cross-lingual translation
+    const hasKorean = /[\uAC00-\uD7A3]/.test(query);
+    let translatedQuery: string | null = null;
+
+    if (hasKorean) {
+      translatedQuery = this.translateQueryCrossLingual(query);
+      if (translatedQuery) {
+        console.error(`🌐 Cross-lingual: "${query}" → "${translatedQuery}"`);
+      }
+    }
+
+    // Generate query embedding(s)
     const queryEmbedding = await this.generateEmbedding(query);
-    
-    // Enhanced vector search across ALL chunk types (documents, entities, relationships)
-    const vectorResults = this.db.prepare(`
-      SELECT 
-        c.rowid,
-        m.chunk_id,
-        m.chunk_type,
-        m.document_id,
-        m.entity_id,
-        m.relationship_id,
-        m.chunk_index,
-        m.text,
-        m.start_pos,
-        m.end_pos,
-        COALESCE(m.metadata, '{}') as chunk_metadata,
-        c.distance,
-        COALESCE(d.metadata, '{}') as doc_metadata
-      FROM chunks c
-      JOIN chunk_metadata m ON c.rowid = m.rowid
-      LEFT JOIN documents d ON m.document_id = d.id
-      WHERE c.embedding MATCH ?
-        AND k = ?
-      ORDER BY c.distance
-    `).all(Buffer.from(queryEmbedding.buffer), limit * 3) as Array<{
-      rowid: number;
-      chunk_id: string;
-      chunk_type: string;
-      document_id: string | null;
-      entity_id: string | null;
-      relationship_id: string | null;
-      chunk_index: number;
-      text: string;
-      start_pos: number;
-      end_pos: number;
-      chunk_metadata: string;
-      distance: number;
-      doc_metadata: string;
-    }>;
-    
+    const translatedEmbedding = translatedQuery ? await this.generateEmbedding(translatedQuery) : null;
+
+    // Vector search helper
+    const searchChunks = (embedding: Float32Array, k: number) => {
+      return this.db!.prepare(`
+        SELECT
+          c.rowid,
+          m.chunk_id,
+          m.chunk_type,
+          m.document_id,
+          m.entity_id,
+          m.relationship_id,
+          m.chunk_index,
+          m.text,
+          m.start_pos,
+          m.end_pos,
+          COALESCE(m.metadata, '{}') as chunk_metadata,
+          c.distance,
+          COALESCE(d.metadata, '{}') as doc_metadata
+        FROM chunks c
+        JOIN chunk_metadata m ON c.rowid = m.rowid
+        LEFT JOIN documents d ON m.document_id = d.id
+        WHERE c.embedding MATCH ?
+          AND k = ?
+        ORDER BY c.distance
+      `).all(Buffer.from(embedding.buffer), k) as Array<{
+        rowid: number;
+        chunk_id: string;
+        chunk_type: string;
+        document_id: string | null;
+        entity_id: string | null;
+        relationship_id: string | null;
+        chunk_index: number;
+        text: string;
+        start_pos: number;
+        end_pos: number;
+        chunk_metadata: string;
+        distance: number;
+        doc_metadata: string;
+      }>;
+    };
+
+    // Dual search: original + translated (if available)
+    const originalResults = searchChunks(queryEmbedding, limit * 3);
+    const translatedResults = translatedEmbedding ? searchChunks(translatedEmbedding, limit * 3) : [];
+
+    // Merge and deduplicate by chunk_id, keeping best distance
+    const resultMap = new Map<string, typeof originalResults[0]>();
+    for (const r of originalResults) {
+      resultMap.set(r.chunk_id, r);
+    }
+    for (const r of translatedResults) {
+      const existing = resultMap.get(r.chunk_id);
+      if (!existing || r.distance < existing.distance) {
+        resultMap.set(r.chunk_id, r);
+      }
+    }
+    const vectorResults = Array.from(resultMap.values()).sort((a, b) => a.distance - b.distance);
+
     if (vectorResults.length === 0) {
       console.error(`ℹ️ No vector matches found for "${query}"`);
       return [];
@@ -1670,20 +1753,37 @@ class RAGKnowledgeGraphManager {
     let connectedEntities = new Set<string>();
     let queryMatchedEntities = new Set<string>();
     if (useGraph) {
-      // Vector search: find entities semantically similar to the query
+      // Vector search: find entities semantically similar to the query (dual search)
       try {
-        const similarEntities = this.db.prepare(`
-          SELECT
-            em.entity_id,
-            e.name,
-            ee.distance
-          FROM entity_embeddings ee
-          JOIN entity_embedding_metadata em ON ee.rowid = em.rowid
-          JOIN entities e ON e.id = em.entity_id
-          WHERE ee.embedding MATCH ?
-            AND k = 10
-          ORDER BY ee.distance
-        `).all(Buffer.from(queryEmbedding.buffer)) as Array<{ entity_id: string; name: string; distance: number }>;
+        const searchEntities = (embedding: Float32Array) => {
+          return this.db!.prepare(`
+            SELECT
+              em.entity_id,
+              e.name,
+              ee.distance
+            FROM entity_embeddings ee
+            JOIN entity_embedding_metadata em ON ee.rowid = em.rowid
+            JOIN entities e ON e.id = em.entity_id
+            WHERE ee.embedding MATCH ?
+              AND k = 10
+            ORDER BY ee.distance
+          `).all(Buffer.from(embedding.buffer)) as Array<{ entity_id: string; name: string; distance: number }>;
+        };
+
+        // Merge original + translated entity results
+        const entityMap = new Map<string, { entity_id: string; name: string; distance: number }>();
+        for (const e of searchEntities(queryEmbedding)) {
+          entityMap.set(e.entity_id, e);
+        }
+        if (translatedEmbedding) {
+          for (const e of searchEntities(translatedEmbedding)) {
+            const existing = entityMap.get(e.entity_id);
+            if (!existing || e.distance < existing.distance) {
+              entityMap.set(e.entity_id, e);
+            }
+          }
+        }
+        const similarEntities = Array.from(entityMap.values()).sort((a, b) => a.distance - b.distance);
 
         for (const entity of similarEntities) {
           const similarity = Math.max(0, 1 - entity.distance / 2);
