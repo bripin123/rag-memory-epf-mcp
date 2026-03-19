@@ -154,7 +154,7 @@ class RAGKnowledgeGraphManager {
 
   private async initializeEmbeddingModel() {
     try {
-      console.error('🤖 Loading embedding model: jina-embeddings-v5-text-small (768-dim, 119+ languages)...');
+      console.error('🤖 Loading embedding model: bge-m3 (1024-dim, 100+ languages)...');
 
       // Configure environment to allow remote model downloads
       env.allowRemoteModels = true;
@@ -162,14 +162,15 @@ class RAGKnowledgeGraphManager {
 
       this.embeddingModel = await pipeline(
         'feature-extraction',
-        'jinaai/jina-embeddings-v5-text-small',
+        'Xenova/bge-m3',
         {
           revision: 'main',
+          dtype: 'q8',
         }
       );
 
       this.modelInitialized = true;
-      console.error('✅ jina-embeddings-v5-text-small model loaded successfully');
+      console.error('✅ bge-m3 model loaded successfully');
       
     } catch (error) {
       console.error('❌ Failed to load embedding model:', error);
@@ -882,7 +883,7 @@ class RAGKnowledgeGraphManager {
   }
 
   // NEW: Embed knowledge graph chunks
-  async embedKnowledgeGraphChunks(): Promise<{ embeddedChunks: number }> {
+  async embedKnowledgeGraphChunks(): Promise<{ embeddedChunks: number; totalChunks: number; errors?: string[] }> {
     if (!this.db) throw new Error('Database not initialized');
     
     console.error('🔮 Embedding knowledge graph chunks...');
@@ -896,30 +897,32 @@ class RAGKnowledgeGraphManager {
     
     let embeddedCount = 0;
     
+    const errors: string[] = [];
+
     for (const chunk of chunks) {
       // Generate embedding
       const embedding = await this.generateEmbedding(chunk.text);
-      
+
       try {
         // Delete existing embedding if any
         this.db.prepare(`DELETE FROM chunks WHERE rowid = ?`).run(chunk.rowid);
-        
+
         // Insert new embedding with explicit rowid to match chunk_metadata
-        const result = this.db.prepare(`
+        this.db.prepare(`
           INSERT INTO chunks (rowid, embedding) VALUES (?, ?)
         `).run(chunk.rowid, Buffer.from(embedding.buffer));
 
-        if (result.changes > 0) {
-          embeddedCount++;
-        }
+        embeddedCount++;
       } catch (error) {
-        console.error(`Failed to embed knowledge graph chunk ${chunk.chunk_id}:`, error);
+        const errMsg = `chunk ${chunk.chunk_id} (rowid=${chunk.rowid}): ${error instanceof Error ? error.message : String(error)}`;
+        console.error(`Failed to embed ${errMsg}`);
+        errors.push(errMsg);
       }
     }
-    
-    console.error(`✅ Knowledge graph chunks embedded: ${embeddedCount} embeddings created`);
-    
-    return { embeddedChunks: embeddedCount };
+
+    console.error(`✅ Knowledge graph chunks embedded: ${embeddedCount}/${chunks.length}`);
+
+    return { embeddedChunks: embeddedCount, totalChunks: chunks.length, ...(errors.length > 0 && { errors: errors.slice(0, 5) }) };
   }
 
   // NEW: Generate textual representation for entity chunks
@@ -1039,7 +1042,7 @@ class RAGKnowledgeGraphManager {
   }
 
   // Generate embeddings using sentence transformers
-  private async generateEmbedding(text: string, dimensions = 768): Promise<Float32Array> {
+  private async generateEmbedding(text: string, dimensions = 1024): Promise<Float32Array> {
     if (this.modelInitialized && this.embeddingModel) {
       try {
         // Use the real sentence transformer model
@@ -1310,7 +1313,7 @@ class RAGKnowledgeGraphManager {
     return { documentId, chunks: resultChunks };
   }
 
-  async embedChunks(documentId: string): Promise<{ documentId: string; embeddedChunks: number }> {
+  async embedChunks(documentId: string): Promise<{ documentId: string; embeddedChunks: number; totalChunks: number; errors?: string[] }> {
     if (!this.db) throw new Error('Database not initialized');
     
     console.error(`🔮 Embedding chunks for document: ${documentId}`);
@@ -1326,31 +1329,32 @@ class RAGKnowledgeGraphManager {
     
     let embeddedCount = 0;
     
+    const errors: string[] = [];
+
     for (const chunk of chunks) {
       // Generate embedding
       const embedding = await this.generateEmbedding(chunk.text);
-      
-      // Store in vector table - the vec0 table should auto-handle rowid matching
+
+      // Store in vector table
       try {
         // First, delete any existing embedding for this rowid
         this.db.prepare(`DELETE FROM chunks WHERE rowid = ?`).run(chunk.rowid);
-        
+
         // Insert new embedding with explicit rowid to match chunk_metadata
-        const result = this.db.prepare(`
+        this.db.prepare(`
           INSERT INTO chunks (rowid, embedding) VALUES (?, ?)
         `).run(chunk.rowid, Buffer.from(embedding.buffer));
 
-        if (result.changes > 0) {
-          embeddedCount++;
-        }
+        embeddedCount++;
       } catch (error) {
-        console.error(`Failed to embed chunk ${chunk.chunk_id}:`, error);
-        // Continue with other chunks instead of failing completely
+        const errMsg = `chunk ${chunk.chunk_id} (rowid=${chunk.rowid}): ${error instanceof Error ? error.message : String(error)}`;
+        console.error(`Failed to embed ${errMsg}`);
+        errors.push(errMsg);
       }
     }
 
-    console.error(`✅ Chunks embedded: ${embeddedCount} embeddings created`);
-    return { documentId, embeddedChunks: embeddedCount };
+    console.error(`✅ Chunks embedded: ${embeddedCount}/${chunks.length}`);
+    return { documentId, embeddedChunks: embeddedCount, totalChunks: chunks.length, ...(errors.length > 0 && { errors: errors.slice(0, 5) }) };
   }
 
   async extractTerms(documentId: string, options: {

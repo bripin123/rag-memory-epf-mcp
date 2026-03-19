@@ -214,5 +214,48 @@ export const migrations: Migration[] = [
       // SQLite doesn't support DROP COLUMN easily, so this is a no-op
       // The column will remain but won't cause issues
     }
+  },
+
+  {
+    version: 5,
+    description: 'Upgrade embedding dimensions from 768 to 1024 (bge-m3)',
+    up: (db) => {
+      // Drop old 768-dim vector tables
+      db.exec(`DROP TABLE IF EXISTS chunks`);
+      db.exec(`DROP TABLE IF EXISTS entity_embeddings`);
+
+      // Recreate with 1024 dimensions
+      db.exec(`
+        CREATE VIRTUAL TABLE chunks USING vec0(
+          embedding FLOAT[1024]
+        )
+      `);
+      db.exec(`
+        CREATE VIRTUAL TABLE entity_embeddings USING vec0(
+          embedding FLOAT[1024]
+        )
+      `);
+
+      // Clear stale embedding metadata (embeddings need to be regenerated)
+      db.exec(`DELETE FROM entity_embedding_metadata`);
+    },
+    down: (db) => {
+      // Revert to 768 dimensions
+      db.exec(`DROP TABLE IF EXISTS chunks`);
+      db.exec(`DROP TABLE IF EXISTS entity_embeddings`);
+
+      db.exec(`
+        CREATE VIRTUAL TABLE chunks USING vec0(
+          embedding FLOAT[768]
+        )
+      `);
+      db.exec(`
+        CREATE VIRTUAL TABLE entity_embeddings USING vec0(
+          embedding FLOAT[768]
+        )
+      `);
+
+      db.exec(`DELETE FROM entity_embedding_metadata`);
+    }
   }
 ];
