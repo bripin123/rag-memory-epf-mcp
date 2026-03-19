@@ -1626,6 +1626,7 @@ class RAGKnowledgeGraphManager {
         m.text,
         m.start_pos,
         m.end_pos,
+        COALESCE(m.metadata, '{}') as chunk_metadata,
         c.distance,
         COALESCE(d.metadata, '{}') as doc_metadata
       FROM chunks c
@@ -1645,6 +1646,7 @@ class RAGKnowledgeGraphManager {
       text: string;
       start_pos: number;
       end_pos: number;
+      chunk_metadata: string;
       distance: number;
       doc_metadata: string;
     }>;

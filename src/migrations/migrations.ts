@@ -197,5 +197,22 @@ export const migrations: Migration[] = [
 
       db.exec(`DELETE FROM entity_embedding_metadata`);
     }
+  },
+
+  {
+    version: 4,
+    description: 'Ensure metadata column exists in chunk_metadata',
+    up: (db) => {
+      // Some databases may not have the metadata column if created by older versions
+      const columns = db.prepare(`PRAGMA table_info(chunk_metadata)`).all() as Array<{ name: string }>;
+      const hasMetadata = columns.some(col => col.name === 'metadata');
+      if (!hasMetadata) {
+        db.exec(`ALTER TABLE chunk_metadata ADD COLUMN metadata TEXT DEFAULT '{}'`);
+      }
+    },
+    down: (db) => {
+      // SQLite doesn't support DROP COLUMN easily, so this is a no-op
+      // The column will remain but won't cause issues
+    }
   }
-]; 
+];
