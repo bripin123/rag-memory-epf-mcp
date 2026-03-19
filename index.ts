@@ -1666,25 +1666,64 @@ class RAGKnowledgeGraphManager {
       return [];
     }
     
-    // Get entity information for graph enhancement
+    // Get entity information for graph enhancement via vector similarity
     let connectedEntities = new Set<string>();
+    let queryMatchedEntities = new Set<string>();
     if (useGraph) {
-      const queryEntities = this.extractTermsFromText(query);
-      
-      for (const entity of queryEntities) {
-        const connected = this.db.prepare(`
-          SELECT DISTINCT
-            CASE 
-              WHEN r.source_entity = e1.id THEN e2.name
-              ELSE e1.name
-            END as connected_name
-          FROM entities e1
-          JOIN relationships r ON (r.source_entity = e1.id OR r.target_entity = e1.id)
-          JOIN entities e2 ON (e2.id = r.source_entity OR e2.id = r.target_entity)
-          WHERE e1.name = ? AND e2.name != ?
-        `).all(entity, entity) as { connected_name: string }[];
-        
-        connected.forEach((row) => connectedEntities.add(row.connected_name));
+      // Vector search: find entities semantically similar to the query
+      try {
+        const similarEntities = this.db.prepare(`
+          SELECT
+            em.entity_id,
+            e.name,
+            ee.distance
+          FROM entity_embeddings ee
+          JOIN entity_embedding_metadata em ON ee.rowid = em.rowid
+          JOIN entities e ON e.id = em.entity_id
+          WHERE ee.embedding MATCH ?
+            AND k = 10
+          ORDER BY ee.distance
+        `).all(Buffer.from(queryEmbedding.buffer)) as Array<{ entity_id: string; name: string; distance: number }>;
+
+        for (const entity of similarEntities) {
+          const similarity = Math.max(0, 1 - entity.distance / 2);
+          if (similarity > 0.5) {
+            queryMatchedEntities.add(entity.name);
+
+            // Get connected entities via relationships
+            const connected = this.db.prepare(`
+              SELECT DISTINCT
+                CASE
+                  WHEN r.source_entity = ? THEN e2.name
+                  ELSE e1.name
+                END as connected_name
+              FROM relationships r
+              JOIN entities e1 ON e1.id = r.source_entity
+              JOIN entities e2 ON e2.id = r.target_entity
+              WHERE r.source_entity = ? OR r.target_entity = ?
+            `).all(entity.entity_id, entity.entity_id, entity.entity_id) as { connected_name: string }[];
+
+            connected.forEach((row) => connectedEntities.add(row.connected_name));
+          }
+        }
+      } catch (error) {
+        console.error('⚠️ Entity vector search for graph enhancement failed:', error);
+        // Fallback: text-based matching (original behavior)
+        const queryEntities = this.extractTermsFromText(query);
+        for (const entity of queryEntities) {
+          const connected = this.db.prepare(`
+            SELECT DISTINCT
+              CASE
+                WHEN r.source_entity = e1.id THEN e2.name
+                ELSE e1.name
+              END as connected_name
+            FROM entities e1
+            JOIN relationships r ON (r.source_entity = e1.id OR r.target_entity = e1.id)
+            JOIN entities e2 ON (e2.id = r.source_entity OR e2.id = r.target_entity)
+            WHERE e1.name = ? AND e2.name != ?
+          `).all(entity, entity) as { connected_name: string }[];
+          connected.forEach((row) => connectedEntities.add(row.connected_name));
+        }
       }
     }
     
@@ -1735,24 +1774,29 @@ class RAGKnowledgeGraphManager {
           graphBoost += 0.25; // Relationships show connections
         }
         
-        // Additional boost for entity matches (supports partial matching)
+        // Additional boost for entity matches
         const queryLower = query.toLowerCase();
         for (const entity of chunkEntities) {
           const entityLower = entity.toLowerCase();
-          // Exact match with extracted terms
-          if (queryEntities.some(qe => qe.toLowerCase() === entityLower)) {
+          // Vector-matched entity (cross-lingual: "할랄 인증" → "KMF")
+          if (queryMatchedEntities.has(entity)) {
+            graphBoost += 0.3;
+          }
+          // Exact text match with extracted terms
+          else if (queryEntities.some(qe => qe.toLowerCase() === entityLower)) {
             graphBoost += 0.3;
           }
           // Partial match: entity name appears in query or vice versa
           else if (queryLower.includes(entityLower) || entityLower.includes(queryLower)) {
             graphBoost += 0.2;
           }
-          // Word-level partial match: any word in entity name appears in query
+          // Word-level partial match
           else if (entityLower.split(/\s+/).some(word => word.length >= 3 && queryLower.includes(word))) {
             graphBoost += 0.15;
           }
+          // Connected to a vector-matched entity
           if (connectedEntities.has(entity)) {
-            graphBoost += 0.15; // Higher boost for connected entity
+            graphBoost += 0.15;
           }
         }
       }
