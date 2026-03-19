@@ -955,12 +955,12 @@ class RAGKnowledgeGraphManager {
     
     // Delete vectors and associations
     for (const chunk of existingChunks) {
-      // Delete vector embeddings
+      // Delete vector embeddings (vec0 requires Number, not BigInt)
       const vectors = this.db.prepare(`
         DELETE FROM chunks WHERE rowid = ?
-      `).run(chunk.rowid);
+      `).run(Number(chunk.rowid));
       deletedVectors += vectors.changes;
-      
+
       // Delete chunk-entity associations
       const associations = this.db.prepare(`
         DELETE FROM chunk_entities WHERE chunk_rowid = ?
@@ -1452,11 +1452,11 @@ class RAGKnowledgeGraphManager {
         DELETE FROM chunk_entities WHERE chunk_rowid = ?
       `).run(chunk.rowid);
       deletedAssociations += associations.changes;
-      
-      // Delete vector embeddings
+
+      // Delete vector embeddings (vec0 requires Number, not BigInt)
       const vectors = this.db.prepare(`
         DELETE FROM chunks WHERE rowid = ?
-      `).run(chunk.rowid);
+      `).run(Number(chunk.rowid));
       deletedVectors += vectors.changes;
     }
     
