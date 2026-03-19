@@ -987,15 +987,23 @@ class RAGKnowledgeGraphManager {
     const { minLength = 3, includeCapitalized = true, customPatterns = [] } = options;
     const terms = new Set<string>();
     
-    // Include capitalized words if requested
+    // Include capitalized words and acronyms if requested
     if (includeCapitalized) {
+      // Capitalized words (e.g., "Singapore", "Visit Proposal")
       const capitalizedWords = text.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b/g) || [];
       capitalizedWords.forEach(term => {
-        if (term.length >= minLength) {
-          terms.add(term.trim());
-        }
+        if (term.length >= minLength) terms.add(term.trim());
       });
+      // All-caps acronyms (e.g., "MUIS", "KMF", "EIAC")
+      const acronyms = text.match(/\b[A-Z]{2,}\b/g) || [];
+      acronyms.forEach(term => terms.add(term.trim()));
     }
+
+    // Extract Korean terms (consecutive Korean characters, 2+ chars)
+    const koreanTerms = text.match(/[\uAC00-\uD7A3]{2,}/g) || [];
+    koreanTerms.forEach(term => {
+      if (term.length >= 2) terms.add(term.trim());
+    });
     
     // Apply custom patterns if provided
     customPatterns.forEach(patternStr => {
@@ -1727,10 +1735,21 @@ class RAGKnowledgeGraphManager {
           graphBoost += 0.25; // Relationships show connections
         }
         
-        // Additional boost for entity matches
+        // Additional boost for entity matches (supports partial matching)
+        const queryLower = query.toLowerCase();
         for (const entity of chunkEntities) {
-          if (queryEntities.some(qe => qe.toLowerCase() === entity.toLowerCase())) {
-            graphBoost += 0.3; // Higher boost for exact entity match
+          const entityLower = entity.toLowerCase();
+          // Exact match with extracted terms
+          if (queryEntities.some(qe => qe.toLowerCase() === entityLower)) {
+            graphBoost += 0.3;
+          }
+          // Partial match: entity name appears in query or vice versa
+          else if (queryLower.includes(entityLower) || entityLower.includes(queryLower)) {
+            graphBoost += 0.2;
+          }
+          // Word-level partial match: any word in entity name appears in query
+          else if (entityLower.split(/\s+/).some(word => word.length >= 3 && queryLower.includes(word))) {
+            graphBoost += 0.15;
           }
           if (connectedEntities.has(entity)) {
             graphBoost += 0.15; // Higher boost for connected entity
