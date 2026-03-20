@@ -571,8 +571,8 @@ class RAGKnowledgeGraphManager {
 
   // Generate embedding text for an entity (combines name, type, and observations)
   private generateEntityEmbeddingText(entity: { name: string; entityType: string; observations: string[] }): string {
-    const observationsText = entity.observations.join('. ');
-    return `${entity.name}. Type: ${entity.entityType}. ${observationsText}`.trim();
+    const observationsText = entity.observations.join('\n- ');
+    return `${entity.name} [${entity.entityType}]\n- ${observationsText}`.trim();
   }
 
   // NEW: Generic semantic summary generation methods
@@ -1105,9 +1105,9 @@ class RAGKnowledgeGraphManager {
   private async generateEmbedding(text: string, dimensions = 1024, isQuery = false): Promise<Float32Array> {
     if (this.modelInitialized && this.embeddingModel) {
       try {
-        // Qwen3: add instruction prefix for queries
+        // Qwen3: add instruction prefix for queries (task-specific instruction improves accuracy)
         const inputText = isQuery
-          ? `Instruct: Find relevant information\nQuery: ${text}`
+          ? `Instruct: Given a search query, retrieve relevant entities and documents from a knowledge graph about halal certification, accreditation, and standards\nQuery: ${text}`
           : text;
         // Use the real sentence transformer model (Qwen3: last_token pooling)
         const result = await this.embeddingModel(inputText, { pooling: 'last_token', normalize: true });
