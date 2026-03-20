@@ -154,7 +154,7 @@ class RAGKnowledgeGraphManager {
 
   private async initializeEmbeddingModel() {
     try {
-      console.error('🤖 Loading embedding model: bge-m3 (1024-dim, 100+ languages)...');
+      console.error('🤖 Loading embedding model: Qwen3-Embedding-0.6B (1024-dim, 100+ languages)...');
 
       // Configure environment to allow remote model downloads
       env.allowRemoteModels = true;
@@ -162,7 +162,7 @@ class RAGKnowledgeGraphManager {
 
       this.embeddingModel = await pipeline(
         'feature-extraction',
-        'Xenova/bge-m3',
+        'onnx-community/Qwen3-Embedding-0.6B-ONNX',
         {
           revision: 'main',
           dtype: 'q8',
@@ -170,7 +170,7 @@ class RAGKnowledgeGraphManager {
       );
 
       this.modelInitialized = true;
-      console.error('✅ bge-m3 model loaded successfully');
+      console.error('✅ Qwen3-Embedding-0.6B model loaded successfully');
       
     } catch (error) {
       console.error('❌ Failed to load embedding model:', error);
@@ -468,9 +468,9 @@ class RAGKnowledgeGraphManager {
     
     console.error(`🔍 Semantic entity search: "${query}"`);
     
-    // Generate query embedding
-    const queryEmbedding = await this.generateEmbedding(query);
-    
+    // Generate query embedding (with instruction prefix for Qwen3)
+    const queryEmbedding = await this.generateEmbedding(query, 1024, true);
+
     // Perform vector similarity search on entities
     const entityResults = this.db.prepare(`
       SELECT 
@@ -1101,11 +1101,16 @@ class RAGKnowledgeGraphManager {
   }
 
   // Generate embeddings using sentence transformers
-  private async generateEmbedding(text: string, dimensions = 1024): Promise<Float32Array> {
+  // isQuery: true for search queries (adds instruction prefix), false for documents/entities
+  private async generateEmbedding(text: string, dimensions = 1024, isQuery = false): Promise<Float32Array> {
     if (this.modelInitialized && this.embeddingModel) {
       try {
-        // Use the real sentence transformer model
-        const result = await this.embeddingModel(text, { pooling: 'mean', normalize: true });
+        // Qwen3: add instruction prefix for queries
+        const inputText = isQuery
+          ? `Instruct: Find relevant information\nQuery: ${text}`
+          : text;
+        // Use the real sentence transformer model (Qwen3: last_token pooling)
+        const result = await this.embeddingModel(inputText, { pooling: 'last_token', normalize: true });
         
         // Extract the embedding array and convert to Float32Array
         const embedding = result.data;
@@ -1683,9 +1688,9 @@ class RAGKnowledgeGraphManager {
       }
     }
 
-    // Generate query embedding(s)
-    const queryEmbedding = await this.generateEmbedding(query);
-    const translatedEmbedding = translatedQuery ? await this.generateEmbedding(translatedQuery) : null;
+    // Generate query embedding(s) (with instruction prefix for Qwen3)
+    const queryEmbedding = await this.generateEmbedding(query, 1024, true);
+    const translatedEmbedding = translatedQuery ? await this.generateEmbedding(translatedQuery, 1024, true) : null;
 
     // Vector search helper
     const searchChunks = (embedding: Float32Array, k: number) => {

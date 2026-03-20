@@ -1,7 +1,7 @@
 {
   "name": "rag-memory-epf-mcp",
-  "version": "1.3.7",
-  "description": "Advanced MCP server for RAG-enabled memory with bge-m3 (1024-dim, 100+ languages, MIRACL SOTA)",
+  "version": "1.4.0",
+  "description": "Advanced MCP server for RAG-enabled memory with Qwen3-Embedding-0.6B (1024-dim, 100+ languages)",
   "license": "MIT",
   "author": "bripin123",
   "homepage": "https://github.com/heesongkoh/rag-memory-epf-mcp",
