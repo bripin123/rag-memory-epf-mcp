@@ -1,6 +1,6 @@
 {
   "name": "rag-memory-epf-mcp",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Advanced MCP server for RAG-enabled memory with Qwen3-Embedding-0.6B (1024-dim, 100+ languages)",
   "license": "MIT",
   "author": "bripin123",

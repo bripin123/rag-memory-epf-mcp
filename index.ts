@@ -165,7 +165,7 @@ class RAGKnowledgeGraphManager {
         'onnx-community/Qwen3-Embedding-0.6B-ONNX',
         {
           revision: 'main',
-          dtype: 'q8',
+          dtype: 'fp16',
         }
       );
 
@@ -1377,7 +1377,7 @@ class RAGKnowledgeGraphManager {
     return { documentId, chunks: resultChunks };
   }
 
-  async embedChunks(documentId: string): Promise<{ documentId: string; embeddedChunks: number; totalChunks: number; errors?: string[] }> {
+  async embedChunks(documentId: string): Promise<{ documentId: string; embeddedChunks: number; totalChunks: number; linkedEntities?: number; errors?: string[] }> {
     if (!this.db) throw new Error('Database not initialized');
     
     console.error(`🔮 Embedding chunks for document: ${documentId}`);
@@ -1420,7 +1420,56 @@ class RAGKnowledgeGraphManager {
     }
 
     console.error(`✅ Chunks embedded: ${embeddedCount}/${chunks.length}`);
-    return { documentId, embeddedChunks: embeddedCount, totalChunks: chunks.length, ...(errors.length > 0 && { errors: errors.slice(0, 5) }) };
+
+    // Auto-link entities to document after embedding
+    const linkedCount = await this.autoLinkEntities(documentId);
+
+    return { documentId, embeddedChunks: embeddedCount, totalChunks: chunks.length, linkedEntities: linkedCount, ...(errors.length > 0 && { errors: errors.slice(0, 5) }) };
+  }
+
+  // Automatically link entities whose names appear in document text
+  private async autoLinkEntities(documentId: string): Promise<number> {
+    if (!this.db) return 0;
+
+    try {
+      // Get all chunk text for this document
+      const chunks = this.db.prepare(
+        `SELECT rowid, text FROM chunk_metadata WHERE document_id = ?`
+      ).all(documentId) as Array<{ rowid: number; text: string }>;
+
+      if (chunks.length === 0) return 0;
+
+      const docText = chunks.map(c => c.text).join(' ').toLowerCase();
+
+      // Get all entities
+      const entities = this.db.prepare(`SELECT id, name FROM entities`).all() as Array<{ id: string; name: string }>;
+
+      let linkedCount = 0;
+      for (const entity of entities) {
+        // Skip very short names (avoid false matches like "ARA", "NC")
+        if (entity.name.length < 3) continue;
+
+        if (docText.includes(entity.name.toLowerCase())) {
+          // Link entity to all chunks of this document
+          for (const chunk of chunks) {
+            this.db.prepare(`
+              INSERT OR IGNORE INTO chunk_entities (chunk_rowid, entity_id)
+              VALUES (?, ?)
+            `).run(chunk.rowid, entity.id);
+          }
+          linkedCount++;
+        }
+      }
+
+      if (linkedCount > 0) {
+        console.error(`🔗 Auto-linked ${linkedCount} entities to document ${documentId}`);
+      }
+
+      return linkedCount;
+    } catch (error) {
+      console.error(`⚠️ Auto-link entities failed for ${documentId}:`, error instanceof Error ? error.message : error);
+      return 0;
+    }
   }
 
   async extractTerms(documentId: string, options: {
