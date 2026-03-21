@@ -1,7 +1,7 @@
 {
   "name": "rag-memory-epf-mcp",
   "version": "1.5.0",
-  "description": "Advanced MCP server for RAG-enabled memory with Qwen3-Embedding-0.6B (1024-dim, 100+ languages)",
+  "description": "MCP server for project-local RAG memory with knowledge graph and multilingual vector search",
   "license": "MIT",
   "author": "bripin123",
   "homepage": "https://github.com/heesongkoh/rag-memory-epf-mcp",
