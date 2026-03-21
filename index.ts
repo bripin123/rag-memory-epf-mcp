@@ -1427,7 +1427,29 @@ class RAGKnowledgeGraphManager {
     return { documentId, embeddedChunks: embeddedCount, totalChunks: chunks.length, linkedEntities: linkedCount, ...(errors.length > 0 && { errors: errors.slice(0, 5) }) };
   }
 
-  // Automatically link entities whose names appear in document text
+  // Check if a string contains CJK (Chinese/Japanese/Korean) characters
+  private hasCJK(text: string): boolean {
+    return /[\u3000-\u9fff\uac00-\ud7af\uff00-\uffef]/.test(text);
+  }
+
+  // Build a match pattern for an entity name — word-boundary for Latin, substring for CJK
+  private buildEntityMatcher(name: string): (text: string) => boolean {
+    const lower = name.toLowerCase();
+    if (this.hasCJK(name)) {
+      // CJK: direct substring match (word boundaries don't apply)
+      return (text: string) => text.toLowerCase().includes(lower);
+    }
+    // Latin / mixed: word-boundary regex to avoid partial-word matches
+    try {
+      const escaped = lower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(`\\b${escaped}\\b`, 'i');
+      return (text: string) => re.test(text);
+    } catch {
+      return (text: string) => text.toLowerCase().includes(lower);
+    }
+  }
+
+  // Automatically link entities to the specific chunks where they appear
   private async autoLinkEntities(documentId: string): Promise<number> {
     if (!this.db) return 0;
 
@@ -1439,30 +1461,63 @@ class RAGKnowledgeGraphManager {
 
       if (chunks.length === 0) return 0;
 
-      const docText = chunks.map(c => c.text).join(' ').toLowerCase();
+      // Get all entities with observations for richer matching
+      const entities = this.db.prepare(
+        `SELECT e.id, e.name, e.entityType,
+                GROUP_CONCAT(o.content, ' ||| ') as observations
+         FROM entities e
+         LEFT JOIN observations o ON o.entityId = e.id
+         GROUP BY e.id`
+      ).all() as Array<{ id: string; name: string; entityType: string; observations: string | null }>;
 
-      // Get all entities
-      const entities = this.db.prepare(`SELECT id, name FROM entities`).all() as Array<{ id: string; name: string }>;
+      // Minimum name length: 2 for CJK (e.g. "할랄"), 4 for Latin (avoid "API", "Bug")
+      const MIN_LEN_CJK = 2;
+      const MIN_LEN_LATIN = 4;
+
+      const insertStmt = this.db.prepare(`
+        INSERT OR IGNORE INTO chunk_entities (chunk_rowid, entity_id) VALUES (?, ?)
+      `);
 
       let linkedCount = 0;
-      for (const entity of entities) {
-        // Skip very short names (avoid false matches like "ARA", "NC")
-        if (entity.name.length < 3) continue;
 
-        if (docText.includes(entity.name.toLowerCase())) {
-          // Link entity to all chunks of this document
-          for (const chunk of chunks) {
-            this.db.prepare(`
-              INSERT OR IGNORE INTO chunk_entities (chunk_rowid, entity_id)
-              VALUES (?, ?)
-            `).run(chunk.rowid, entity.id);
+      for (const entity of entities) {
+        const minLen = this.hasCJK(entity.name) ? MIN_LEN_CJK : MIN_LEN_LATIN;
+        if (entity.name.length < minLen) continue;
+
+        const nameMatcher = this.buildEntityMatcher(entity.name);
+
+        // Also collect observation-derived aliases (short keywords from observations)
+        const aliases: ((text: string) => boolean)[] = [];
+        if (entity.observations) {
+          const obs = entity.observations.split(' ||| ');
+          for (const ob of obs) {
+            // Extract file paths or identifiers mentioned in observations (e.g. "gemini_converter.py")
+            const pathMatch = ob.match(/[\w\-]+\.\w{1,4}\b/g);
+            if (pathMatch) {
+              for (const p of pathMatch) {
+                if (p.length >= 4) {
+                  aliases.push((text: string) => text.toLowerCase().includes(p.toLowerCase()));
+                }
+              }
+            }
           }
-          linkedCount++;
         }
+
+        // Chunk-level matching: only link to chunks where entity actually appears
+        let entityLinked = false;
+        for (const chunk of chunks) {
+          const matched = nameMatcher(chunk.text) || aliases.some(fn => fn(chunk.text));
+          if (matched) {
+            insertStmt.run(chunk.rowid, entity.id);
+            entityLinked = true;
+          }
+        }
+
+        if (entityLinked) linkedCount++;
       }
 
       if (linkedCount > 0) {
-        console.error(`🔗 Auto-linked ${linkedCount} entities to document ${documentId}`);
+        console.error(`🔗 Auto-linked ${linkedCount} entities to document ${documentId} (chunk-level)`);
       }
 
       return linkedCount;
