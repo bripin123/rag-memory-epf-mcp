@@ -185,7 +185,16 @@ npm run build
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+This MCP server code is licensed under the **MIT License**. See [LICENSE](LICENSE) for details.
+
+### Third-Party Model Licenses
+
+| Component | License | Details |
+|-----------|---------|---------|
+| **Qwen3-Embedding-0.6B** | Apache 2.0 | Embedding model by Alibaba Qwen team. [Model card](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) |
+| **@huggingface/transformers** | Apache 2.0 | JS inference runtime |
+
+Apache 2.0 is compatible with MIT for downstream use. The model weights are downloaded at runtime via Hugging Face and are not bundled in this package.
 
 ---
 
