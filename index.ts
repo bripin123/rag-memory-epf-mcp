@@ -228,31 +228,62 @@ class RAGKnowledgeGraphManager {
 
   // === ORIGINAL MCP FUNCTIONALITY ===
 
+  private _timestampObservation(obs: string): string {
+    // If observation already has a date prefix like [2026-03-21], skip
+    if (/^\[\d{4}-\d{2}-\d{2}\]/.test(obs)) return obs;
+    const today = new Date().toISOString().slice(0, 10);
+    return `[${today}] ${obs}`;
+  }
+
   async createEntities(entities: Entity[]): Promise<Entity[]> {
     if (!this.db) throw new Error('Database not initialized');
-    
-    const newEntities = [];
-    const stmt = this.db.prepare(`
+
+    const result: Entity[] = [];
+    const insertStmt = this.db.prepare(`
       INSERT OR IGNORE INTO entities (id, name, entityType, observations, metadata)
       VALUES (?, ?, ?, ?, ?)
     `);
 
     for (const entity of entities) {
       const entityId = `entity_${entity.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
-      const observations = JSON.stringify(entity.observations || []);
-      const metadata = JSON.stringify({});
-      
-      const result = stmt.run(entityId, entity.name, entity.entityType, observations, metadata);
-      if (result.changes > 0) {
-        newEntities.push(entity);
-        
-        // Generate embedding for the new entity
+      const timestamped = (entity.observations || []).map(o => this._timestampObservation(o));
+
+      // Try insert first
+      const insertResult = insertStmt.run(entityId, entity.name, entity.entityType, JSON.stringify(timestamped), '{}');
+
+      if (insertResult.changes > 0) {
+        // New entity created
+        result.push({ ...entity, observations: timestamped });
         console.error(`🔮 Generating embedding for new entity: ${entity.name}`);
         await this.embedEntity(entityId);
+      } else {
+        // Entity already exists — upsert: merge observations and update entityType
+        const existing = this.db.prepare(`SELECT observations, entityType FROM entities WHERE id = ?`)
+          .get(entityId) as { observations: string; entityType: string } | undefined;
+
+        if (existing) {
+          const currentObs: string[] = JSON.parse(existing.observations);
+          // Strip date prefix for dedup comparison
+          const stripDate = (s: string) => s.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '');
+          const currentBare = new Set(currentObs.map(stripDate));
+          const newObs = timestamped.filter(o => !currentBare.has(stripDate(o)));
+          const needsTypeUpdate = entity.entityType && entity.entityType !== 'CONCEPT' && entity.entityType !== existing.entityType;
+
+          if (newObs.length > 0 || needsTypeUpdate) {
+            const mergedObs = [...currentObs, ...newObs];
+            const updatedType = needsTypeUpdate ? entity.entityType : existing.entityType;
+            this.db.prepare(`UPDATE entities SET observations = ?, entityType = ? WHERE id = ?`)
+              .run(JSON.stringify(mergedObs), updatedType, entityId);
+
+            console.error(`♻️ Upserted entity: ${entity.name} (+${newObs.length} obs${needsTypeUpdate ? ', type→' + updatedType : ''})`);
+            await this.embedEntity(entityId);
+            result.push({ ...entity, observations: mergedObs });
+          }
+        }
       }
     }
 
-    return newEntities;
+    return result;
   }
 
   async createRelations(relations: Relation[]): Promise<Relation[]> {
@@ -303,9 +334,12 @@ class RAGKnowledgeGraphManager {
         throw new Error(`Entity with name ${obs.entityName} not found`);
       }
       
-      const currentObservations = JSON.parse(entity.observations);
-      const newObservations = obs.contents.filter(content => !currentObservations.includes(content));
-      
+      const currentObservations: string[] = JSON.parse(entity.observations);
+      const stripDate = (s: string) => s.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '');
+      const currentBare = new Set(currentObservations.map(stripDate));
+      const timestamped = obs.contents.map(c => this._timestampObservation(c));
+      const newObservations = timestamped.filter(c => !currentBare.has(stripDate(c)));
+
       if (newObservations.length > 0) {
         const updatedObservations = [...currentObservations, ...newObservations];
         

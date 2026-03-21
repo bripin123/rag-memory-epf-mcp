@@ -130,6 +130,12 @@ Your entities, relationships, documents, and chunk text are preserved. Only vect
 
 ## Changelog
 
+### v1.6.0
+
+- **Entity upsert** — `createEntities` now merges new observations into existing entities instead of silently ignoring duplicates. Entity type is also updated if a more specific type is provided.
+- **Automatic observation timestamps** — all new observations are prefixed with `[YYYY-MM-DD]` for staleness tracking. Existing dated observations are preserved as-is.
+- **Dedup by content** — date prefixes are stripped when comparing observations to prevent duplicate entries with different dates.
+
 ### v1.5.0
 
 - **Improved auto entity linking** — chunk-level precision instead of linking to all chunks
