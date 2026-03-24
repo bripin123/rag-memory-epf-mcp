@@ -85,6 +85,7 @@ export const createEntitiesTool: ToolDefinition = {
   capability: createEntitiesCapability,
   description: createEntitiesDescription,
   schema: createEntitiesSchema,
+  annotations: { idempotentHint: true },
 };
 
 // === CREATE RELATIONS TOOL ===
@@ -172,6 +173,7 @@ export const createRelationsTool: ToolDefinition = {
   capability: createRelationsCapability,
   description: createRelationsDescription,
   schema: createRelationsSchema,
+  annotations: { idempotentHint: true },
 };
 
 // === ADD OBSERVATIONS TOOL ===
@@ -256,6 +258,7 @@ export const addObservationsTool: ToolDefinition = {
   capability: addObservationsCapability,
   description: addObservationsDescription,
   schema: addObservationsSchema,
+  annotations: { idempotentHint: true },
 };
 
 // === HYBRID SEARCH TOOL ===
@@ -347,6 +350,7 @@ export const hybridSearchTool: ToolDefinition = {
   capability: hybridSearchCapability,
   description: hybridSearchDescription,
   schema: hybridSearchSchema,
+  annotations: { readOnlyHint: true },
 };
 
 // === EMBED ALL ENTITIES TOOL ===
@@ -417,6 +421,7 @@ export const embedAllEntitiesTool: ToolDefinition = {
   capability: embedAllEntitiesCapability,
   description: embedAllEntitiesDescription,
   schema: embedAllEntitiesSchema,
+  annotations: { idempotentHint: true },
 };
 
 // === GET DETAILED CONTEXT TOOL ===
@@ -500,6 +505,7 @@ export const getDetailedContextTool: ToolDefinition = {
   capability: getDetailedContextCapability,
   description: getDetailedContextDescription,
   schema: getDetailedContextSchema,
+  annotations: { readOnlyHint: true },
 };
 
 // === UPDATE RELATIONS TOOL ===
@@ -566,6 +572,7 @@ export const updateRelationsTool: ToolDefinition = {
   capability: updateRelationsCapability,
   description: updateRelationsDescription,
   schema: updateRelationsSchema,
+  annotations: { idempotentHint: true },
 };
 
 // Export all knowledge graph tools

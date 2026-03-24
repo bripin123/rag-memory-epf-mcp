@@ -1,6 +1,6 @@
 {
   "name": "rag-memory-epf-mcp",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "MCP server for project-local RAG memory with knowledge graph and multilingual vector search",
   "license": "MIT",
   "author": "bripin123",
@@ -24,7 +24,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^3.5.1",
-    "@modelcontextprotocol/sdk": "1.0.1",
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "better-sqlite3": "^12.8.0",
     "sqlite-vec": "^0.1.7",
     "tiktoken": "^1.0.17",

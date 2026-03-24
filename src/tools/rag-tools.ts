@@ -67,6 +67,7 @@ export const storeDocumentTool: ToolDefinition = {
   capability: storeDocumentCapability,
   description: storeDocumentDescription,
   schema: storeDocumentSchema,
+  annotations: { idempotentHint: true },
 };
 
 // === CHUNK DOCUMENT TOOL ===
@@ -192,6 +193,7 @@ export const embedChunksTool: ToolDefinition = {
   capability: embedChunksCapability,
   description: embedChunksDescription,
   schema: embedChunksSchema,
+  annotations: { idempotentHint: true },
 };
 
 // === EXTRACT TERMS TOOL ===
@@ -332,6 +334,7 @@ export const linkEntitiesToDocumentTool: ToolDefinition = {
   capability: linkEntitiesToDocumentCapability,
   description: linkEntitiesToDocumentDescription,
   schema: linkEntitiesToDocumentSchema,
+  annotations: { idempotentHint: true },
 };
 
 // === GET KNOWLEDGE GRAPH STATS TOOL ===
@@ -401,6 +404,7 @@ export const getKnowledgeGraphStatsTool: ToolDefinition = {
   capability: getStatsCapability,
   description: getStatsDescription,
   schema: getStatsSchema,
+  annotations: { readOnlyHint: true },
 };
 
 // === DELETE DOCUMENT(S) TOOL ===
@@ -476,6 +480,7 @@ export const deleteDocumentsTool: ToolDefinition = {
   capability: deleteDocumentsCapability,
   description: deleteDocumentsDescription,
   schema: deleteDocumentsSchema,
+  annotations: { destructiveHint: true },
 };
 
 // === LIST DOCUMENTS TOOL ===
@@ -550,6 +555,7 @@ export const listDocumentsTool: ToolDefinition = {
   capability: listDocumentsCapability,
   description: listDocumentsDescription,
   schema: listDocumentsSchema,
+  annotations: { readOnlyHint: true },
 };
 
 // Export all RAG tools

@@ -48,6 +48,7 @@ export function convertToMCPTool(name: string, toolDef: ToolDefinition): MCPTool
       properties,
       required,
     },
+    ...(toolDef.annotations && { annotations: toolDef.annotations }),
   };
 }
 

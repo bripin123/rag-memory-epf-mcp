@@ -68,6 +68,7 @@ export const readGraphTool: ToolDefinition = {
   capability: readGraphCapability,
   description: readGraphDescription,
   schema: readGraphSchema,
+  annotations: { readOnlyHint: true },
 };
 
 // === SEARCH NODES TOOL ===
@@ -165,6 +166,7 @@ export const searchNodesTool: ToolDefinition = {
   capability: searchNodesCapability,
   description: searchNodesDescription,
   schema: searchNodesSchema,
+  annotations: { readOnlyHint: true },
 };
 
 // === OPEN NODES TOOL ===
@@ -242,6 +244,7 @@ export const openNodesTool: ToolDefinition = {
   capability: openNodesCapability,
   description: openNodesDescription,
   schema: openNodesSchema,
+  annotations: { readOnlyHint: true },
 };
 
 // === DELETE ENTITIES TOOL ===
@@ -318,6 +321,7 @@ export const deleteEntitiesTool: ToolDefinition = {
   capability: deleteEntitiesCapability,
   description: deleteEntitiesDescription,
   schema: deleteEntitiesSchema,
+  annotations: { destructiveHint: true },
 };
 
 // === DELETE RELATIONS TOOL ===
@@ -401,6 +405,7 @@ export const deleteRelationsTool: ToolDefinition = {
   capability: deleteRelationsCapability,
   description: deleteRelationsDescription,
   schema: deleteRelationsSchema,
+  annotations: { destructiveHint: true },
 };
 
 // === DELETE OBSERVATIONS TOOL ===
@@ -482,6 +487,7 @@ export const deleteObservationsTool: ToolDefinition = {
   capability: deleteObservationsCapability,
   description: deleteObservationsDescription,
   schema: deleteObservationsSchema,
+  annotations: { destructiveHint: true },
 };
 
 // === EXPORT GRAPH TOOL ===
@@ -546,6 +552,7 @@ export const exportGraphTool: ToolDefinition = {
   capability: exportGraphCapability,
   description: exportGraphDescription,
   schema: exportGraphSchema,
+  annotations: { readOnlyHint: true },
 };
 
 // === IMPORT GRAPH TOOL ===
@@ -633,6 +640,7 @@ export const importGraphTool: ToolDefinition = {
   capability: importGraphCapability,
   description: importGraphDescription,
   schema: importGraphSchema,
+  annotations: { destructiveHint: true },
 };
 
 // Export all graph query tools

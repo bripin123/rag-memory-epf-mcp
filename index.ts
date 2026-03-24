@@ -2625,7 +2625,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 // Enhanced tool call handler with validation
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
   const { name, arguments: args } = request.params;
 
   if (!args) {
@@ -2724,12 +2724,14 @@ async function main() {
     await server.connect(transport);
     console.error("🚀 Enhanced RAG Knowledge Graph MCP Server running on stdio");
     
-    // Cleanup on exit
-    process.on('SIGINT', () => {
+    // Cleanup on exit — avoid process.exit() to prevent ONNX runtime mutex crash
+    const shutdown = () => {
       console.error('\n🧹 Cleaning up...');
-      ragKgManager.cleanup();
-      process.exit(0);
-    });
+      try { ragKgManager.cleanup(); } catch {}
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+    process.on('exit', shutdown);
     
   } catch (error) {
     console.error("Failed to initialize server:", error);

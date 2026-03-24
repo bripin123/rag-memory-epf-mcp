@@ -11,6 +11,7 @@ export const migrationTools: Record<string, ToolDefinition> = {
         required: [],
       },
     },
+    annotations: { readOnlyHint: true },
     description: (settings) => `
 **Get Database Migration Status**
 
@@ -64,6 +65,7 @@ Shows the current database schema version and lists all available migrations wit
         required: [],
       },
     },
+    annotations: { idempotentHint: true },
     description: (settings) => `
 **Run Database Migrations**
 
@@ -124,6 +126,7 @@ Applies all pending database migrations to bring the schema up to the latest ver
         required: ['targetVersion'],
       },
     },
+    annotations: { destructiveHint: true },
     description: (settings) => `
 **Rollback Database Migration**
 
