@@ -502,12 +502,79 @@ export const getDetailedContextTool: ToolDefinition = {
   schema: getDetailedContextSchema,
 };
 
+// === UPDATE RELATIONS TOOL ===
+
+const updateRelationsCapability: ToolCapabilityInfo = {
+  description: 'Update existing relationships in the knowledge graph (confidence, metadata)',
+  parameters: {
+    type: 'object',
+    properties: {
+      updates: {
+        type: 'array',
+        description: 'Array of relation updates',
+        items: {
+          type: 'object'
+        }
+      }
+    },
+    required: ['updates'],
+  },
+};
+
+const updateRelationsDescription: ToolRegistrationDescription = () => `<description>
+Update existing relationships in the knowledge graph — change confidence scores or metadata without deleting and recreating.
+**Enables fine-grained relationship management without data loss.**
+</description>
+
+<importantNotes>
+- (!important!) **Relationship must exist** — identified by from + to + relationType
+- (!important!) Only specified fields are updated — unspecified fields remain unchanged
+- (!important!) Confidence scores range from 0.0 to 1.0
+</importantNotes>
+
+<whenToUseThisTool>
+- When adjusting relationship strength/confidence based on new evidence
+- When adding metadata to existing relationships
+- When refining knowledge graph quality without destructive operations
+</whenToUseThisTool>
+
+<parameters>
+- updates: Array of update objects, each containing:
+  - from: Source entity name (string, required)
+  - to: Target entity name (string, required)
+  - relationType: Type of the relationship to update (string, required)
+  - confidence: New confidence score 0.0-1.0 (number, optional)
+  - metadata: New metadata object (object, optional)
+</parameters>
+
+<examples>
+- Adjust confidence: {"updates": [{"from": "React", "to": "JavaScript", "relationType": "USES", "confidence": 0.95}]}
+- Add metadata: {"updates": [{"from": "Einstein", "to": "Relativity", "relationType": "DEVELOPED", "metadata": {"year": 1905, "verified": true}}]}
+</examples>`;
+
+const updateRelationsSchema: z.ZodRawShape = {
+  updates: z.array(z.object({
+    from: z.string().describe('Name of the source entity'),
+    to: z.string().describe('Name of the target entity'),
+    relationType: z.string().describe('Type of the relationship to update'),
+    confidence: z.number().min(0).max(1).optional().describe('New confidence score (0.0-1.0)'),
+    metadata: z.record(z.any()).optional().describe('New metadata object'),
+  })).describe('Array of relationship updates'),
+};
+
+export const updateRelationsTool: ToolDefinition = {
+  capability: updateRelationsCapability,
+  description: updateRelationsDescription,
+  schema: updateRelationsSchema,
+};
+
 // Export all knowledge graph tools
 export const knowledgeGraphTools = {
   createEntities: createEntitiesTool,
   createRelations: createRelationsTool,
   addObservations: addObservationsTool,
+  updateRelations: updateRelationsTool,
   hybridSearch: hybridSearchTool,
   embedAllEntities: embedAllEntitiesTool,
   getDetailedContext: getDetailedContextTool,
-}; 
+};

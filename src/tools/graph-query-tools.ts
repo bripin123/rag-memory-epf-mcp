@@ -73,7 +73,7 @@ export const readGraphTool: ToolDefinition = {
 // === SEARCH NODES TOOL ===
 
 const searchNodesCapability: ToolCapabilityInfo = {
-  description: 'Search for entities in the knowledge graph using semantic vector similarity',
+  description: 'Search for entities in the knowledge graph using semantic vector similarity with optional temporal filtering',
   parameters: {
     type: 'object',
     properties: {
@@ -85,6 +85,14 @@ const searchNodesCapability: ToolCapabilityInfo = {
         type: 'number',
         description: 'Maximum number of results to return',
         default: 10
+      },
+      since: {
+        type: 'string',
+        description: 'Filter entities created on or after this date/time (ISO 8601)'
+      },
+      until: {
+        type: 'string',
+        description: 'Filter entities created on or before this date/time (ISO 8601)'
       }
     },
     required: ['query'],
@@ -134,6 +142,8 @@ Uses semantic embeddings to find conceptually similar entities, even without exa
 <parameters>
 - query: Natural language search query for semantic entity discovery (string, required)
 - limit: Maximum number of similar entities to return, default 10 (number, optional)
+- since: Filter entities created on or after this date/time in ISO 8601 format (string, optional)
+- until: Filter entities created on or before this date/time in ISO 8601 format (string, optional)
 </parameters>
 
 <examples>
@@ -147,6 +157,8 @@ Uses semantic embeddings to find conceptually similar entities, even without exa
 const searchNodesSchema: z.ZodRawShape = {
   query: z.string().describe('Natural language search query for semantic entity discovery'),
   limit: z.number().optional().default(10).describe('Maximum number of similar entities to return'),
+  since: z.string().optional().describe('Filter entities created on or after this date/time (ISO 8601 format, e.g. "2025-01-01")'),
+  until: z.string().optional().describe('Filter entities created on or before this date/time (ISO 8601 format, e.g. "2025-12-31")'),
 };
 
 export const searchNodesTool: ToolDefinition = {
@@ -472,6 +484,157 @@ export const deleteObservationsTool: ToolDefinition = {
   schema: deleteObservationsSchema,
 };
 
+// === EXPORT GRAPH TOOL ===
+
+const exportGraphCapability: ToolCapabilityInfo = {
+  description: 'Export the entire knowledge graph including entities, relations, and documents',
+  parameters: {
+    type: 'object',
+    properties: {},
+    required: [],
+  },
+};
+
+const exportGraphDescription: ToolRegistrationDescription = () => `<description>
+Export the complete knowledge graph including all entities, relationships, and documents with full metadata.
+**Creates a portable snapshot of your entire knowledge base for backup or transfer.**
+Returns structured data suitable for importing into another instance.
+</description>
+
+<importantNotes>
+- (!important!) **Exports all data** - entities, relations, and documents with full details
+- (!important!) Includes metadata summary with counts and export timestamp
+- (!important!) Output can be used directly with importGraph for restoration
+- (!important!) Does NOT include vector embeddings - re-embed after import
+</importantNotes>
+
+<whenToUseThisTool>
+- When creating backups of your knowledge graph
+- Before major restructuring or migration operations
+- When transferring knowledge between instances
+- For version control of knowledge graph state
+- When sharing knowledge bases between projects
+</whenToUseThisTool>
+
+<features>
+- Complete entity export with observations and metadata
+- Full relationship export with confidence scores
+- Document export with content and metadata
+- Export metadata with timestamp and counts
+- Structured JSON output for easy processing
+</features>
+
+<bestPractices>
+- Export before making destructive changes
+- Store exports in version control for history tracking
+- Use for periodic backup snapshots
+- Verify export completeness using metadata counts
+</bestPractices>
+
+<parameters>
+- None required - exports complete knowledge graph
+</parameters>
+
+<examples>
+- Full export: {} (no parameters needed)
+- Backup snapshot: {} (capture current state)
+</examples>`;
+
+const exportGraphSchema: z.ZodRawShape = {};
+
+export const exportGraphTool: ToolDefinition = {
+  capability: exportGraphCapability,
+  description: exportGraphDescription,
+  schema: exportGraphSchema,
+};
+
+// === IMPORT GRAPH TOOL ===
+
+const importGraphCapability: ToolCapabilityInfo = {
+  description: 'Import entities, relations, and documents into the knowledge graph',
+  parameters: {
+    type: 'object',
+    properties: {
+      data: {
+        type: 'object',
+        description: 'Object containing entities, relations, and/or documents arrays to import'
+      },
+      merge: {
+        type: 'boolean',
+        description: 'If true (default), merge with existing data. If false, clear existing data first.',
+        default: true
+      }
+    },
+    required: ['data'],
+  },
+};
+
+const importGraphDescription: ToolRegistrationDescription = () => `<description>
+Import entities, relationships, and documents into the knowledge graph from exported data.
+**Restores or merges knowledge graph data from a previous export or external source.**
+Supports both merge (additive) and replace (clear + import) modes.
+</description>
+
+<importantNotes>
+- (!important!) **merge=true (default)**: adds new data, skips duplicates (INSERT OR IGNORE for entities/relations)
+- (!important!) **merge=false**: clears ALL existing data before importing
+- (!important!) Documents use INSERT OR REPLACE - existing documents with same ID will be overwritten
+- (!important!) **Re-embed after import** - vector embeddings are not included in exports
+</importantNotes>
+
+<whenToUseThisTool>
+- When restoring from a backup export
+- When merging knowledge from another instance
+- When bootstrapping a new knowledge graph with existing data
+- When migrating between database versions
+- For batch loading pre-structured knowledge
+</whenToUseThisTool>
+
+<features>
+- Merge mode preserves existing data while adding new entries
+- Replace mode provides clean import without conflicts
+- Handles partial imports (entities only, relations only, etc.)
+- Reports imported and skipped counts for verification
+- Supports full export format from exportGraph
+</features>
+
+<bestPractices>
+- Always export current data before importing with merge=false
+- Verify import counts match expected data
+- Run embedAllEntities after import to generate embeddings
+- Use merge=true for incremental knowledge addition
+- Use merge=false only for full restoration from backup
+</bestPractices>
+
+<parameters>
+- data: Object containing arrays to import (object, required):
+  - entities: Array of entity objects with id, name, entityType, observations, metadata, created_at
+  - relations: Array of relation objects with id, source_entity, target_entity, relationType, confidence, metadata, created_at
+  - documents: Array of document objects with id, content, metadata, created_at
+- merge: If true (default), merge with existing data. If false, clear existing data first (boolean, optional)
+</parameters>
+
+<examples>
+- Merge import: {"data": {"entities": [...], "relations": [...]}, "merge": true}
+- Full replace: {"data": {"entities": [...], "relations": [...], "documents": [...]}, "merge": false}
+- Entities only: {"data": {"entities": [{"id": "abc", "name": "Test", "entityType": "CONCEPT", "observations": ["fact1"]}]}}
+</examples>`;
+
+const importGraphSchema: z.ZodRawShape = {
+  data: z.object({
+    entities: z.array(z.any()).optional().describe('Array of entity objects to import'),
+    relations: z.array(z.any()).optional().describe('Array of relation objects to import'),
+    documents: z.array(z.any()).optional().describe('Array of document objects to import'),
+  }).describe('Object containing entities, relations, and/or documents arrays to import'),
+  merge: z.boolean().optional().default(true).describe('If true (default), merge with existing data. If false, clear existing data first.'),
+};
+
+export const importGraphTool: ToolDefinition = {
+  capability: importGraphCapability,
+  description: importGraphDescription,
+  schema: importGraphSchema,
+};
+
 // Export all graph query tools
 export const graphQueryTools = {
   readGraph: readGraphTool,
@@ -480,4 +643,6 @@ export const graphQueryTools = {
   deleteEntities: deleteEntitiesTool,
   deleteRelations: deleteRelationsTool,
   deleteObservations: deleteObservationsTool,
+  exportGraph: exportGraphTool,
+  importGraph: importGraphTool,
 }; 

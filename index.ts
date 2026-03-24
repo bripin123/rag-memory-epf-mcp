@@ -100,6 +100,7 @@ interface EnhancedSearchResult {
   entities: string[];
   vector_similarity: number;
   graph_boost?: number;
+  fts_boost?: number;
   full_context_available: boolean;
   chunk_type: 'document' | 'entity' | 'relationship'; // NEW: Indicates the source type
   source_id?: string; // NEW: ID of the source entity/relationship if applicable
@@ -120,6 +121,15 @@ interface DetailedContext {
   metadata: Record<string, any>;
 }
 
+// Safe rowid for vec0 virtual tables (require literal integer, not parameterized)
+function safeRowid(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(`Invalid rowid: ${value}`);
+  }
+  return n;
+}
+
 // Enhanced RAG-enabled Knowledge Graph Manager
 class RAGKnowledgeGraphManager {
   private db: Database.Database | null = null;
@@ -129,22 +139,31 @@ class RAGKnowledgeGraphManager {
 
   async initialize() {
     console.error('🚀 Initializing RAG Knowledge Graph MCP Server...');
-    
+
     // Initialize database
     this.db = new Database(DB_FILE_PATH);
-    
+
     // Load sqlite-vec extension
     sqliteVec.load(this.db);
-    
+
+    // SQLite performance & safety optimizations
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('synchronous = NORMAL');
+    this.db.pragma('busy_timeout = 5000');
+    this.db.pragma('cache_size = -32000');
+    this.db.pragma('temp_store = MEMORY');
+    this.db.pragma('mmap_size = 268435456');
+    this.db.pragma('foreign_keys = ON');
+
     // Initialize tiktoken
     this.encoding = get_encoding("cl100k_base");
-    
+
     // Initialize embedding model
     await this.initializeEmbeddingModel();
-    
+
     // Run database migrations
     await this.runMigrations();
-    
+
     console.error('✅ RAG-enabled knowledge graph initialized');
     
     // Log system info
@@ -457,16 +476,64 @@ class RAGKnowledgeGraphManager {
 
   async deleteRelations(relations: Relation[]): Promise<void> {
     if (!this.db) throw new Error('Database not initialized');
-    
+
     for (const relation of relations) {
       const sourceId = `entity_${relation.from.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
       const targetId = `entity_${relation.to.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
-      
+
       this.db.prepare(`
-        DELETE FROM relationships 
+        DELETE FROM relationships
         WHERE source_entity = ? AND target_entity = ? AND relationType = ?
       `).run(sourceId, targetId, relation.relationType);
     }
+  }
+
+  async updateRelations(updates: { from: string; to: string; relationType: string; confidence?: number; metadata?: Record<string, any> }[]): Promise<{ updated: number; notFound: number }> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    let updated = 0;
+    let notFound = 0;
+
+    for (const update of updates) {
+      const sourceId = `entity_${update.from.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const targetId = `entity_${update.to.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const relationId = `rel_${sourceId}_${update.relationType}_${targetId}`.toLowerCase();
+
+      // Check if relation exists
+      const existing = this.db.prepare(`
+        SELECT id FROM relationships WHERE id = ?
+      `).get(relationId) as { id: string } | undefined;
+
+      if (!existing) {
+        notFound++;
+        continue;
+      }
+
+      // Build dynamic update
+      const setClauses: string[] = [];
+      const values: any[] = [];
+
+      if (update.confidence !== undefined) {
+        setClauses.push('confidence = ?');
+        values.push(update.confidence);
+      }
+      if (update.metadata !== undefined) {
+        setClauses.push('metadata = ?');
+        values.push(JSON.stringify(update.metadata));
+      }
+
+      if (setClauses.length === 0) {
+        continue;
+      }
+
+      values.push(relationId);
+      this.db.prepare(`
+        UPDATE relationships SET ${setClauses.join(', ')} WHERE id = ?
+      `).run(...values);
+      updated++;
+    }
+
+    return { updated, notFound };
   }
 
   async readGraph(): Promise<KnowledgeGraph> {
@@ -497,7 +564,7 @@ class RAGKnowledgeGraphManager {
     return { entities, relations };
   }
 
-  async searchNodes(query: string, limit = 10): Promise<KnowledgeGraph> {
+  async searchNodes(query: string, limit = 10, since?: string, until?: string): Promise<KnowledgeGraph> {
     if (!this.db) throw new Error('Database not initialized');
     
     console.error(`🔍 Semantic entity search: "${query}"`);
@@ -531,12 +598,24 @@ class RAGKnowledgeGraphManager {
       observations: string;
     }>;
     
-    if (entityResults.length === 0) {
+    // Filter by temporal range if specified
+    let filteredResults = entityResults;
+    if (since || until) {
+      filteredResults = entityResults.filter(r => {
+        const entity = this.db!.prepare('SELECT created_at FROM entities WHERE id = ?').get(r.entity_id) as { created_at: string } | undefined;
+        if (!entity) return false;
+        if (since && entity.created_at < since) return false;
+        if (until && entity.created_at > until) return false;
+        return true;
+      });
+    }
+
+    if (filteredResults.length === 0) {
       console.error(`ℹ️ No semantic matches found for "${query}"`);
       return { entities: [], relations: [] };
     }
-    
-    const entities = entityResults.map(result => ({
+
+    const entities = filteredResults.map(result => ({
       name: result.name,
       entityType: result.entityType,
       observations: JSON.parse(result.observations),
@@ -822,12 +901,12 @@ class RAGKnowledgeGraphManager {
     `).all() as Array<{ id: string }>;
     
     let embeddedCount = 0;
-    
-    for (const entity of entities) {
-      const success = await this.embedEntity(entity.id);
-      if (success) {
-        embeddedCount++;
-      }
+
+    const batchSize = 32;
+    for (let i = 0; i < entities.length; i += batchSize) {
+      const batch = entities.slice(i, i + batchSize);
+      const results = await Promise.all(batch.map(e => this.embedEntity(e.id)));
+      embeddedCount += results.filter(Boolean).length;
     }
     
     console.error(`✅ Entity embeddings completed: ${embeddedCount}/${entities.length} entities embedded`);
@@ -936,7 +1015,7 @@ class RAGKnowledgeGraphManager {
     for (const chunk of chunks) {
       // Generate embedding
       const embedding = await this.generateEmbedding(chunk.text);
-      const rowid = Number(chunk.rowid);
+      const rowid = safeRowid(chunk.rowid);
 
       try {
         // Delete existing embedding if any
@@ -990,7 +1069,7 @@ class RAGKnowledgeGraphManager {
     // Delete vectors and associations
     for (const chunk of existingChunks) {
       // Delete vector embeddings (vec0 needs literal integer, not parameterized)
-      this.db.exec(`DELETE FROM chunks WHERE rowid = ${Number(chunk.rowid)}`);
+      this.db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(chunk.rowid)}`);
       deletedVectors++;
 
       // Delete chunk-entity associations
@@ -1437,7 +1516,7 @@ class RAGKnowledgeGraphManager {
       // Store in vector table
       try {
         // First, delete any existing embedding for this rowid
-        this.db.exec(`DELETE FROM chunks WHERE rowid = ${rowid}`);
+        this.db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(rowid)}`);
 
         // Insert new embedding with explicit rowid to match chunk_metadata
         // Use parameterized only for embedding blob, rowid as literal integer
@@ -1656,7 +1735,7 @@ class RAGKnowledgeGraphManager {
       deletedAssociations += associations.changes;
 
       // Delete vector embeddings (vec0 needs literal integer, not parameterized)
-      this.db.exec(`DELETE FROM chunks WHERE rowid = ${Number(chunk.rowid)}`);
+      this.db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(chunk.rowid)}`);
       deletedVectors++;
     }
 
@@ -1809,6 +1888,148 @@ class RAGKnowledgeGraphManager {
     return { documents };
   }
 
+  async exportGraph(): Promise<{ entities: any[]; relations: any[]; documents: any[]; metadata: { exportedAt: string; version: string; entityCount: number; relationCount: number; documentCount: number } }> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    console.error('📦 Exporting knowledge graph...');
+
+    const entities = this.db.prepare(`
+      SELECT id, name, entityType, observations, metadata, created_at FROM entities
+    `).all().map((row: any) => ({
+      id: row.id,
+      name: row.name,
+      entityType: row.entityType,
+      observations: JSON.parse(row.observations),
+      metadata: JSON.parse(row.metadata || '{}'),
+      created_at: row.created_at
+    }));
+
+    const relations = this.db.prepare(`
+      SELECT id, source_entity, target_entity, relationType, confidence, metadata, created_at FROM relationships
+    `).all().map((row: any) => ({
+      id: row.id,
+      source_entity: row.source_entity,
+      target_entity: row.target_entity,
+      relationType: row.relationType,
+      confidence: row.confidence,
+      metadata: JSON.parse(row.metadata || '{}'),
+      created_at: row.created_at
+    }));
+
+    const documents = this.db.prepare(`
+      SELECT id, content, metadata, created_at FROM documents
+    `).all().map((row: any) => ({
+      id: row.id,
+      content: row.content,
+      metadata: JSON.parse(row.metadata || '{}'),
+      created_at: row.created_at
+    }));
+
+    console.error(`✅ Export completed: ${entities.length} entities, ${relations.length} relations, ${documents.length} documents`);
+
+    return {
+      entities,
+      relations,
+      documents,
+      metadata: {
+        exportedAt: new Date().toISOString(),
+        version: '1.0.0',
+        entityCount: entities.length,
+        relationCount: relations.length,
+        documentCount: documents.length
+      }
+    };
+  }
+
+  async importGraph(data: { entities?: any[]; relations?: any[]; documents?: any[] }, options: { merge?: boolean } = { merge: true }): Promise<{ imported: { entities: number; relations: number; documents: number }; skipped: { entities: number; relations: number; documents: number } }> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    console.error(`📥 Importing knowledge graph (merge: ${options.merge !== false})...`);
+
+    const imported = { entities: 0, relations: 0, documents: 0 };
+    const skipped = { entities: 0, relations: 0, documents: 0 };
+
+    // If merge=false, clear existing data first
+    if (options.merge === false) {
+      this.db.exec(`DELETE FROM relationships`);
+      this.db.exec(`DELETE FROM entities`);
+      this.db.exec(`DELETE FROM documents`);
+      console.error('🗑️ Cleared existing data for full import');
+    }
+
+    // Import entities using INSERT OR IGNORE
+    if (data.entities && Array.isArray(data.entities)) {
+      const stmt = this.db.prepare(`
+        INSERT OR IGNORE INTO entities (id, name, entityType, observations, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      for (const entity of data.entities) {
+        const result = stmt.run(
+          entity.id,
+          entity.name,
+          entity.entityType || 'CONCEPT',
+          JSON.stringify(entity.observations || []),
+          JSON.stringify(entity.metadata || {}),
+          entity.created_at || new Date().toISOString()
+        );
+        if (result.changes > 0) {
+          imported.entities++;
+        } else {
+          skipped.entities++;
+        }
+      }
+    }
+
+    // Import relations using INSERT OR IGNORE
+    if (data.relations && Array.isArray(data.relations)) {
+      const stmt = this.db.prepare(`
+        INSERT OR IGNORE INTO relationships (id, source_entity, target_entity, relationType, confidence, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const relation of data.relations) {
+        const result = stmt.run(
+          relation.id,
+          relation.source_entity,
+          relation.target_entity,
+          relation.relationType,
+          relation.confidence ?? 1.0,
+          JSON.stringify(relation.metadata || {}),
+          relation.created_at || new Date().toISOString()
+        );
+        if (result.changes > 0) {
+          imported.relations++;
+        } else {
+          skipped.relations++;
+        }
+      }
+    }
+
+    // Import documents using INSERT OR REPLACE
+    if (data.documents && Array.isArray(data.documents)) {
+      const stmt = this.db.prepare(`
+        INSERT OR REPLACE INTO documents (id, content, metadata, created_at)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const doc of data.documents) {
+        const result = stmt.run(
+          doc.id,
+          doc.content,
+          JSON.stringify(doc.metadata || {}),
+          doc.created_at || new Date().toISOString()
+        );
+        if (result.changes > 0) {
+          imported.documents++;
+        } else {
+          skipped.documents++;
+        }
+      }
+    }
+
+    console.error(`✅ Import completed: ${imported.entities} entities, ${imported.relations} relations, ${imported.documents} documents imported`);
+
+    return { imported, skipped };
+  }
+
   async hybridSearch(query: string, limit = 5, useGraph = true): Promise<EnhancedSearchResult[]> {
     if (!this.db) throw new Error('Database not initialized');
     if (!this.encoding) throw new Error('Tokenizer not initialized');
@@ -1887,11 +2108,100 @@ class RAGKnowledgeGraphManager {
     }
     const vectorResults = Array.from(resultMap.values()).sort((a, b) => a.distance - b.distance);
 
+    // FTS5 full-text search as additional signal (Reciprocal Rank Fusion)
+    const ftsBoostMap = new Map<string, number>();
+    try {
+      const ftsSearchQuery = (q: string) => {
+        // Escape FTS5 special characters and build a query with OR between terms
+        const sanitized = q.replace(/["\*\(\)\-]/g, ' ').trim();
+        if (!sanitized) return [];
+        const terms = sanitized.split(/\s+/).filter(t => t.length > 0);
+        if (terms.length === 0) return [];
+        const ftsExpr = terms.map(t => `"${t}"`).join(' OR ');
+        return this.db!.prepare(`
+          SELECT cm.rowid, cm.chunk_id, bm25(chunks_fts) as fts_score
+          FROM chunks_fts
+          JOIN chunk_metadata cm ON chunks_fts.rowid = cm.rowid
+          WHERE chunks_fts MATCH ?
+          ORDER BY bm25(chunks_fts)
+          LIMIT ?
+        `).all(ftsExpr, limit * 3) as Array<{
+          rowid: number;
+          chunk_id: string;
+          fts_score: number;
+        }>;
+      };
+
+      const ftsOriginal = ftsSearchQuery(query);
+      const ftsTranslated = translatedQuery ? ftsSearchQuery(translatedQuery) : [];
+
+      // Merge FTS5 results, keeping best score per chunk_id
+      const ftsResultMap = new Map<string, { chunk_id: string; fts_score: number; rank: number }>();
+      let rank = 1;
+      for (const r of ftsOriginal) {
+        ftsResultMap.set(r.chunk_id, { chunk_id: r.chunk_id, fts_score: r.fts_score, rank });
+        rank++;
+      }
+      for (const r of ftsTranslated) {
+        if (!ftsResultMap.has(r.chunk_id)) {
+          ftsResultMap.set(r.chunk_id, { chunk_id: r.chunk_id, fts_score: r.fts_score, rank });
+          rank++;
+        }
+      }
+
+      // Build vector rank map for RRF
+      const vectorRankMap = new Map<string, number>();
+      vectorResults.forEach((r, idx) => vectorRankMap.set(r.chunk_id, idx + 1));
+
+      // Calculate RRF-based FTS5 boost (k=60)
+      const k = 60;
+      for (const [chunkId, ftsResult] of ftsResultMap) {
+        const ftsComponent = 1 / (k + ftsResult.rank);
+        ftsBoostMap.set(chunkId, ftsComponent);
+      }
+
+      // Add FTS5-only results to the vector result pool
+      for (const [chunkId] of ftsResultMap) {
+        if (!resultMap.has(chunkId)) {
+          const chunkRow = this.db!.prepare(`
+            SELECT
+              cm.rowid,
+              cm.chunk_id,
+              cm.chunk_type,
+              cm.document_id,
+              cm.entity_id,
+              cm.relationship_id,
+              cm.chunk_index,
+              cm.text,
+              cm.start_pos,
+              cm.end_pos,
+              COALESCE(cm.metadata, '{}') as chunk_metadata,
+              COALESCE(d.metadata, '{}') as doc_metadata
+            FROM chunk_metadata cm
+            LEFT JOIN documents d ON cm.document_id = d.id
+            WHERE cm.chunk_id = ?
+          `).get(chunkId) as any;
+          if (chunkRow) {
+            vectorResults.push({
+              ...chunkRow,
+              distance: 2.0
+            });
+          }
+        }
+      }
+
+      const ftsCount = ftsResultMap.size;
+      const ftsOnlyCount = [...ftsResultMap.keys()].filter(id => !vectorRankMap.has(id)).length;
+      console.error(`📝 FTS5 search: ${ftsCount} matches (${ftsOnlyCount} FTS5-only), ${ftsBoostMap.size} boosted`);
+    } catch (ftsError) {
+      console.error(`⚠️ FTS5 search unavailable (graceful degradation):`, ftsError instanceof Error ? ftsError.message : ftsError);
+    }
+
     if (vectorResults.length === 0) {
-      console.error(`ℹ️ No vector matches found for "${query}"`);
+      console.error(`ℹ️ No vector or FTS5 matches found for "${query}"`);
       return [];
     }
-    
+
     // Get entity information for graph enhancement via vector similarity
     let connectedEntities = new Set<string>();
     let queryMatchedEntities = new Set<string>();
@@ -2053,7 +2363,8 @@ class RAGKnowledgeGraphManager {
       );
       
       const vectorSimilarity = Math.max(0, 1 - result.distance / 2);
-      const finalScore = Math.max(vectorSimilarity, relevanceScore) + graphBoost;
+      const ftsBoost = ftsBoostMap.get(result.chunk_id) || 0;
+      const finalScore = Math.max(vectorSimilarity, relevanceScore) + graphBoost + ftsBoost;
       
       // Determine document title and source ID
       let documentTitle: string;
@@ -2083,6 +2394,7 @@ class RAGKnowledgeGraphManager {
         entities: chunkEntities,
         vector_similarity: vectorSimilarity,
         graph_boost: useGraph ? graphBoost : undefined,
+        fts_boost: ftsBoost > 0 ? ftsBoost : undefined,
         full_context_available: true,
         chunk_type: result.chunk_type as 'document' | 'entity' | 'relationship',
         source_id: sourceId
@@ -2341,10 +2653,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "deleteRelations":
         await ragKgManager.deleteRelations((validatedArgs as any).relations as Relation[]);
         return { content: [{ type: "text", text: "Relations deleted successfully" }] };
+      case "updateRelations":
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.updateRelations((validatedArgs as any).updates), null, 2) }] };
       case "readGraph":
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.readGraph(), null, 2) }] };
       case "searchNodes":
-        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.searchNodes((validatedArgs as any).query as string, (validatedArgs as any).limit || 10), null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.searchNodes((validatedArgs as any).query as string, (validatedArgs as any).limit || 10, (validatedArgs as any).since, (validatedArgs as any).until), null, 2) }] };
       case "openNodes":
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.openNodes((validatedArgs as any).names as string[]), null, 2) }] };
       
@@ -2375,7 +2689,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       // NEW: Entity embedding tools
       case "embedAllEntities":
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.embedAllEntities(), null, 2) }] };
-      
+
+      // NEW: Export/Import tools
+      case "exportGraph":
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.exportGraph(), null, 2) }] };
+      case "importGraph":
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.importGraph((validatedArgs as any).data, { merge: (validatedArgs as any).merge !== false }), null, 2) }] };
+
       // NEW: Migration tools
       case "getMigrationStatus":
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.getMigrationStatus(), null, 2) }] };

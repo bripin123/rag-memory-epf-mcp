@@ -257,5 +257,122 @@ export const migrations: Migration[] = [
 
       db.exec(`DELETE FROM entity_embedding_metadata`);
     }
+  },
+
+  {
+    version: 6,
+    description: 'Add missing indexes for entityType, relationType, and chunk lookups',
+    up: (db) => {
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entityType);
+        CREATE INDEX IF NOT EXISTS idx_relationships_type ON relationships(relationType);
+        CREATE INDEX IF NOT EXISTS idx_chunk_entities_chunk ON chunk_entities(chunk_rowid);
+        CREATE INDEX IF NOT EXISTS idx_chunk_metadata_chunk_id ON chunk_metadata(chunk_id);
+      `);
+    },
+    down: (db) => {
+      db.exec(`
+        DROP INDEX IF EXISTS idx_entities_type;
+        DROP INDEX IF EXISTS idx_relationships_type;
+        DROP INDEX IF EXISTS idx_chunk_entities_chunk;
+        DROP INDEX IF EXISTS idx_chunk_metadata_chunk_id;
+      `);
+    }
+  },
+
+  {
+    version: 7,
+    description: 'Add FTS5 full-text search tables and sync triggers for entities and chunks',
+    up: (db) => {
+      // Create FTS5 virtual table for entities
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
+          name, observations, entityType,
+          content='entities', content_rowid='rowid',
+          tokenize='unicode61'
+        )
+      `);
+
+      // Create FTS5 virtual table for chunk_metadata
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+          text, chunk_id,
+          content='chunk_metadata', content_rowid='rowid',
+          tokenize='unicode61'
+        )
+      `);
+
+      // Populate FTS5 tables from existing data
+      db.exec(`
+        INSERT INTO entities_fts(rowid, name, observations, entityType)
+          SELECT rowid, name, observations, entityType FROM entities
+      `);
+
+      db.exec(`
+        INSERT INTO chunks_fts(rowid, text, chunk_id)
+          SELECT rowid, text, chunk_id FROM chunk_metadata
+      `);
+
+      // Triggers for automatic FTS5 sync on entities
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS entities_fts_insert AFTER INSERT ON entities BEGIN
+          INSERT INTO entities_fts(rowid, name, observations, entityType)
+            VALUES (new.rowid, new.name, new.observations, new.entityType);
+        END
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS entities_fts_delete AFTER DELETE ON entities BEGIN
+          INSERT INTO entities_fts(entities_fts, rowid, name, observations, entityType)
+            VALUES ('delete', old.rowid, old.name, old.observations, old.entityType);
+        END
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS entities_fts_update AFTER UPDATE ON entities BEGIN
+          INSERT INTO entities_fts(entities_fts, rowid, name, observations, entityType)
+            VALUES ('delete', old.rowid, old.name, old.observations, old.entityType);
+          INSERT INTO entities_fts(rowid, name, observations, entityType)
+            VALUES (new.rowid, new.name, new.observations, new.entityType);
+        END
+      `);
+
+      // Triggers for automatic FTS5 sync on chunk_metadata
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS chunks_fts_insert AFTER INSERT ON chunk_metadata BEGIN
+          INSERT INTO chunks_fts(rowid, text, chunk_id)
+            VALUES (new.rowid, new.text, new.chunk_id);
+        END
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunk_metadata BEGIN
+          INSERT INTO chunks_fts(chunks_fts, rowid, text, chunk_id)
+            VALUES ('delete', old.rowid, old.text, old.chunk_id);
+        END
+      `);
+
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS chunks_fts_update AFTER UPDATE ON chunk_metadata BEGIN
+          INSERT INTO chunks_fts(chunks_fts, rowid, text, chunk_id)
+            VALUES ('delete', old.rowid, old.text, old.chunk_id);
+          INSERT INTO chunks_fts(rowid, text, chunk_id)
+            VALUES (new.rowid, new.text, new.chunk_id);
+        END
+      `);
+    },
+    down: (db) => {
+      // Drop triggers first
+      db.exec(`DROP TRIGGER IF EXISTS entities_fts_insert`);
+      db.exec(`DROP TRIGGER IF EXISTS entities_fts_delete`);
+      db.exec(`DROP TRIGGER IF EXISTS entities_fts_update`);
+      db.exec(`DROP TRIGGER IF EXISTS chunks_fts_insert`);
+      db.exec(`DROP TRIGGER IF EXISTS chunks_fts_delete`);
+      db.exec(`DROP TRIGGER IF EXISTS chunks_fts_update`);
+
+      // Drop FTS5 virtual tables
+      db.exec(`DROP TABLE IF EXISTS entities_fts`);
+      db.exec(`DROP TABLE IF EXISTS chunks_fts`);
+    }
   }
 ];
