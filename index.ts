@@ -10,6 +10,7 @@ import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { get_encoding } from 'tiktoken';
 import { promises as fs } from 'fs';
+import fsSync from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { pipeline, env } from '@huggingface/transformers';
@@ -140,6 +141,7 @@ class RAGKnowledgeGraphManager {
   private modelInitialized: boolean = false;
   private embeddingCache: Map<string, Float32Array> = new Map();
   private readonly EMBEDDING_CACHE_MAX = 500;
+  private dictionaryCache: { nativeToEn: Record<string, string>; enToNative: Record<string, string> } | null = null;
 
   async initialize() {
     console.error('🚀 Initializing RAG Knowledge Graph MCP Server...');
@@ -1238,6 +1240,32 @@ class RAGKnowledgeGraphManager {
       console.error(`  ├─ Deleted ${deletedVectors} vector embeddings`);
       console.error(`  ├─ Deleted ${deletedAssociations} entity associations`);
       console.error(`  └─ Deleted ${metadata.changes} chunk metadata records`);
+    }
+  }
+
+  private loadDictionary(): { nativeToEn: Record<string, string>; enToNative: Record<string, string> } {
+    if (this.dictionaryCache) return this.dictionaryCache;
+
+    const empty = { nativeToEn: {}, enToNative: {} };
+
+    try {
+      const dictPath = path.join(path.dirname(DB_FILE_PATH), 'dictionary.json');
+      const raw = fsSync.readFileSync(dictPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+
+      this.dictionaryCache = {
+        nativeToEn: parsed['native-en'] && typeof parsed['native-en'] === 'object' ? parsed['native-en'] : {},
+        enToNative: parsed['en-native'] && typeof parsed['en-native'] === 'object' ? parsed['en-native'] : {},
+      };
+
+      console.error(`📖 Dictionary loaded: ${Object.keys(this.dictionaryCache.nativeToEn).length} native→en, ${Object.keys(this.dictionaryCache.enToNative).length} en→native`);
+      return this.dictionaryCache;
+    } catch (err: any) {
+      if (err.code !== 'ENOENT') {
+        console.error(`⚠️ Dictionary load warning: ${err.message}`);
+      }
+      this.dictionaryCache = empty;
+      return empty;
     }
   }
 
