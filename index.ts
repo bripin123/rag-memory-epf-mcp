@@ -1274,19 +1274,9 @@ class RAGKnowledgeGraphManager {
   private translateQueryCrossLingual(query: string): string | null {
     if (!this.db) return null;
 
-    // Domain-specific Korean→English dictionary
-    const domainDict: Record<string, string> = {
-      '할랄': 'halal', '인증': 'certification', '상호인정': 'mutual recognition',
-      '인정': 'accreditation', '인증기관': 'certification body',
-      '표준': 'standard', '감사': 'audit', '심사': 'audit review',
-      '도축': 'slaughter', '식품': 'food', '화장품': 'cosmetics',
-      '수출': 'export', '수입': 'import', '무역': 'trade',
-      '방문': 'visit', '협력': 'cooperation', '협약': 'agreement',
-      '제안': 'proposal', '회의': 'meeting', '이메일': 'email',
-      '보고서': 'report', '전략': 'strategy', '사업': 'business',
-      '정부': 'government', '지원': 'support', '바우처': 'voucher',
-      '창업': 'startup', '대학': 'university',
-    };
+    // Load external dictionary and use as domain dictionary
+    const { nativeToEn } = this.loadDictionary();
+    const domainDict: Record<string, string> = { ...nativeToEn };
 
     // Build entity Korean→English mapping from observations
     try {
@@ -1316,8 +1306,8 @@ class RAGKnowledgeGraphManager {
       translated = translated.replace(new RegExp(ko, 'g'), en);
     }
 
-    // Remove remaining Korean characters and clean up
-    translated = translated.replace(/[\uAC00-\uD7A3]+/g, ' ').replace(/\s+/g, ' ').trim();
+    // Remove remaining non-ASCII characters and clean up
+    translated = translated.replace(/[^\x00-\x7F]+/g, ' ').replace(/\s+/g, ' ').trim();
 
     return translated.length > 2 ? translated : null;
   }
