@@ -643,14 +643,107 @@ export const importGraphTool: ToolDefinition = {
   annotations: { destructiveHint: true },
 };
 
+// === GET NEIGHBORS TOOL ===
+
+const getNeighborsCapability: ToolCapabilityInfo = {
+  description: 'Multi-hop graph traversal from seed entities with cycle detection and path tracking',
+  parameters: {
+    type: 'object',
+    properties: {
+      entityNames: {
+        type: 'array',
+        description: 'Array of entity names to start traversal from'
+      },
+      depth: {
+        type: 'number',
+        description: 'Maximum traversal depth (1-5)',
+        default: 1
+      },
+      relationType: {
+        type: 'string',
+        description: 'Optional relationship type filter'
+      }
+    },
+    required: ['entityNames'],
+  },
+};
+
+const getNeighborsDescription: ToolRegistrationDescription = () => `<description>
+Perform multi-hop graph traversal starting from one or more seed entities.
+**Discovers connected entities, relationships, and shortest paths up to a configurable depth.**
+Uses recursive CTE with cycle detection for efficient and safe graph exploration.
+</description>
+
+<importantNotes>
+- (!important!) **Multi-hop traversal** - follows relationships bidirectionally up to the specified depth
+- (!important!) **Cycle detection** built-in - will not revisit entities already in the traversal path
+- (!important!) **Depth capped at 5** to prevent runaway queries on large graphs
+- (!important!) Returns entities with discovery depth, relations with depth, and shortest paths
+</importantNotes>
+
+<whenToUseThisTool>
+- When exploring the neighborhood around specific entities
+- **For discovering indirect connections** between entities (2+ hops away)
+- When building local subgraphs for context around known entities
+- For finding shortest paths between related concepts
+- When analyzing relationship chains and dependency graphs
+- For impact analysis - understanding what entities are connected within N hops
+</whenToUseThisTool>
+
+<features>
+- Bidirectional relationship traversal (follows both incoming and outgoing edges)
+- Configurable traversal depth (1-5 hops)
+- Optional relationship type filtering for focused traversal
+- Cycle detection prevents infinite loops
+- Returns discovery depth for each entity and relation
+- Shortest path tracking from seed entities to discovered entities
+- Efficient recursive CTE-based implementation
+</features>
+
+<bestPractices>
+- Start with depth=1 and increase if more context is needed
+- Use relationType filter to follow only specific relationship types
+- Combine with openNodes for detailed information on discovered entities
+- Use for impact analysis before making changes to key entities
+- Review paths to understand how distant entities are connected
+- For large graphs, keep depth low (1-2) to limit result size
+</bestPractices>
+
+<parameters>
+- entityNames: Array of entity names to start traversal from (string[], required)
+- depth: Maximum traversal depth, 1-5, default 1 (number, optional)
+- relationType: Filter to only follow relationships of this type (string, optional)
+</parameters>
+
+<examples>
+- Direct neighbors: {"entityNames": ["Machine Learning"], "depth": 1}
+- Extended network: {"entityNames": ["React", "Vue"], "depth": 2}
+- Filtered traversal: {"entityNames": ["Database"], "depth": 3, "relationType": "depends_on"}
+- Multi-seed: {"entityNames": ["Entity A", "Entity B", "Entity C"], "depth": 2}
+</examples>`;
+
+const getNeighborsSchema: z.ZodRawShape = {
+  entityNames: z.array(z.string()).describe('Array of entity names to start traversal from'),
+  depth: z.number().optional().default(1).describe('Maximum traversal depth (1-5, default 1)'),
+  relationType: z.string().optional().describe('Optional relationship type filter - only follow relationships of this type'),
+};
+
+export const getNeighborsTool: ToolDefinition = {
+  capability: getNeighborsCapability,
+  description: getNeighborsDescription,
+  schema: getNeighborsSchema,
+  annotations: { readOnlyHint: true },
+};
+
 // Export all graph query tools
 export const graphQueryTools = {
   readGraph: readGraphTool,
   searchNodes: searchNodesTool,
   openNodes: openNodesTool,
+  getNeighbors: getNeighborsTool,
   deleteEntities: deleteEntitiesTool,
   deleteRelations: deleteRelationsTool,
   deleteObservations: deleteObservationsTool,
   exportGraph: exportGraphTool,
   importGraph: importGraphTool,
-}; 
+};

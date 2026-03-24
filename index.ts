@@ -34,6 +34,8 @@ const DB_FILE_PATH = process.env.DB_FILE_PATH
     : path.join(path.dirname(fileURLToPath(import.meta.url)), process.env.DB_FILE_PATH)
   : defaultDbPath;
 
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'onnx-community/Qwen3-Embedding-0.6B-ONNX';
+
 // Original MCP interfaces
 interface Entity {
   name: string;
@@ -136,6 +138,8 @@ class RAGKnowledgeGraphManager {
   private encoding: any = null;
   private embeddingModel: any = null;
   private modelInitialized: boolean = false;
+  private embeddingCache: Map<string, Float32Array> = new Map();
+  private readonly EMBEDDING_CACHE_MAX = 500;
 
   async initialize() {
     console.error('🚀 Initializing RAG Knowledge Graph MCP Server...');
@@ -173,7 +177,7 @@ class RAGKnowledgeGraphManager {
 
   private async initializeEmbeddingModel() {
     try {
-      console.error('🤖 Loading embedding model: Qwen3-Embedding-0.6B (1024-dim, 100+ languages)...');
+      console.error(`🤖 Loading embedding model: ${EMBEDDING_MODEL} (1024-dim, 100+ languages)...`);
 
       // Configure environment to allow remote model downloads
       env.allowRemoteModels = true;
@@ -181,7 +185,7 @@ class RAGKnowledgeGraphManager {
 
       this.embeddingModel = await pipeline(
         'feature-extraction',
-        'onnx-community/Qwen3-Embedding-0.6B-ONNX',
+        EMBEDDING_MODEL,
         {
           revision: 'main',
           dtype: 'fp16',
@@ -189,7 +193,7 @@ class RAGKnowledgeGraphManager {
       );
 
       this.modelInitialized = true;
-      console.error('✅ Qwen3-Embedding-0.6B model loaded successfully');
+      console.error(`✅ ${EMBEDDING_MODEL} model loaded successfully`);
       
     } catch (error) {
       console.error('❌ Failed to load embedding model:', error);
@@ -239,6 +243,7 @@ class RAGKnowledgeGraphManager {
       this.embeddingModel = null;
       this.modelInitialized = false;
     }
+    this.embeddingCache.clear();
     if (this.db) {
       this.db.close();
       this.db = null;
@@ -564,9 +569,154 @@ class RAGKnowledgeGraphManager {
     return { entities, relations };
   }
 
+  async getNeighbors(entityNames: string[], depth: number = 1, relationType?: string): Promise<{
+    entities: Array<{ name: string; entityType: string; observations: string[]; depth: number }>;
+    relations: Array<{ from: string; to: string; relationType: string; depth: number }>;
+    paths: Array<{ from: string; to: string; path: string[] }>;
+  }> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    // Cap depth at 5 to prevent runaway queries
+    const effectiveDepth = Math.min(Math.max(depth, 1), 5);
+
+    // Convert entity names to IDs
+    const seedIds = entityNames.map(name => `entity_${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`);
+
+    // Build dynamic placeholders for the seed IDs
+    const seedPlaceholders = seedIds.map(() => '?').join(',');
+
+    // Build the recursive CTE query
+    const relationFilter = relationType
+      ? `AND r.relationType = ?`
+      : '';
+
+    const cteQuery = `
+      WITH RECURSIVE traversal(entity_id, depth, path) AS (
+        -- Base case: seed entities
+        SELECT id, 0, id FROM entities WHERE id IN (${seedPlaceholders})
+        UNION ALL
+        -- Recursive: follow relationships up to max depth
+        SELECT
+          CASE WHEN r.source_entity = t.entity_id THEN r.target_entity ELSE r.source_entity END,
+          t.depth + 1,
+          t.path || ',' || CASE WHEN r.source_entity = t.entity_id THEN r.target_entity ELSE r.source_entity END
+        FROM traversal t
+        JOIN relationships r ON (r.source_entity = t.entity_id OR r.target_entity = t.entity_id)
+        WHERE t.depth < ?
+          ${relationFilter}
+          -- Cycle detection: don't revisit entities already in path
+          AND instr(t.path, CASE WHEN r.source_entity = t.entity_id THEN r.target_entity ELSE r.source_entity END) = 0
+      )
+      SELECT DISTINCT entity_id, MIN(depth) as min_depth, path
+      FROM traversal
+      GROUP BY entity_id
+    `;
+
+    // Build parameters
+    const params: any[] = [...seedIds, effectiveDepth];
+    if (relationType) {
+      params.push(relationType);
+    }
+
+    const traversalResults = this.db.prepare(cteQuery).all(...params) as Array<{
+      entity_id: string;
+      min_depth: number;
+      path: string;
+    }>;
+
+    if (traversalResults.length === 0) {
+      return { entities: [], relations: [], paths: [] };
+    }
+
+    // Collect all discovered entity IDs
+    const discoveredIds = traversalResults.map(r => r.entity_id);
+    const idPlaceholders = discoveredIds.map(() => '?').join(',');
+
+    // Fetch entity details
+    const entityRows = this.db.prepare(`
+      SELECT id, name, entityType, observations FROM entities WHERE id IN (${idPlaceholders})
+    `).all(...discoveredIds) as Array<{
+      id: string;
+      name: string;
+      entityType: string;
+      observations: string;
+    }>;
+
+    // Build id-to-depth and id-to-name maps
+    const idToDepth = new Map<string, number>();
+    for (const r of traversalResults) {
+      idToDepth.set(r.entity_id, r.min_depth);
+    }
+    const idToName = new Map<string, string>();
+    for (const row of entityRows) {
+      idToName.set(row.id, row.name);
+    }
+
+    const entities = entityRows.map(row => ({
+      name: row.name,
+      entityType: row.entityType,
+      observations: JSON.parse(row.observations),
+      depth: idToDepth.get(row.id) ?? 0,
+    }));
+
+    // Fetch relations between all discovered entities
+    let relQuery = `
+      SELECT
+        r.source_entity,
+        r.target_entity,
+        e1.name as from_name,
+        e2.name as to_name,
+        r.relationType
+      FROM relationships r
+      JOIN entities e1 ON r.source_entity = e1.id
+      JOIN entities e2 ON r.target_entity = e2.id
+      WHERE r.source_entity IN (${idPlaceholders})
+        AND r.target_entity IN (${idPlaceholders})
+    `;
+    const relParams: any[] = [...discoveredIds, ...discoveredIds];
+    if (relationType) {
+      relQuery += ` AND r.relationType = ?`;
+      relParams.push(relationType);
+    }
+
+    const relationRows = this.db.prepare(relQuery).all(...relParams) as Array<{
+      source_entity: string;
+      target_entity: string;
+      from_name: string;
+      to_name: string;
+      relationType: string;
+    }>;
+
+    const relations = relationRows.map(row => ({
+      from: row.from_name,
+      to: row.to_name,
+      relationType: row.relationType,
+      depth: Math.max(idToDepth.get(row.source_entity) ?? 0, idToDepth.get(row.target_entity) ?? 0),
+    }));
+
+    // Build shortest paths from seed entities to all discovered entities
+    const paths: Array<{ from: string; to: string; path: string[] }> = [];
+    for (const result of traversalResults) {
+      if (result.min_depth === 0) continue; // Skip seed entities themselves
+      const pathIds = result.path.split(',');
+      const pathNames = pathIds.map(id => idToName.get(id) || id).filter(Boolean);
+      if (pathNames.length >= 2) {
+        paths.push({
+          from: pathNames[0],
+          to: pathNames[pathNames.length - 1],
+          path: pathNames,
+        });
+      }
+    }
+
+    console.error(`✅ getNeighbors: Found ${entities.length} entities, ${relations.length} relations, ${paths.length} paths (depth=${effectiveDepth})`);
+
+    return { entities, relations, paths };
+  }
+
   async searchNodes(query: string, limit = 10, since?: string, until?: string): Promise<KnowledgeGraph> {
     if (!this.db) throw new Error('Database not initialized');
-    
+
     console.error(`🔍 Semantic entity search: "${query}"`);
     
     // Generate query embedding (with instruction prefix for Qwen3)
@@ -1216,6 +1366,11 @@ class RAGKnowledgeGraphManager {
   // Generate embeddings using sentence transformers
   // isQuery: true for search queries (adds instruction prefix), false for documents/entities
   private async generateEmbedding(text: string, dimensions = 1024, isQuery = false): Promise<Float32Array> {
+    // Check cache first
+    const cacheKey = `${text.length > 100 ? text.substring(0, 100) : text}_${dimensions}_${isQuery}`;
+    const cached = this.embeddingCache.get(cacheKey);
+    if (cached) return cached;
+
     if (this.modelInitialized && this.embeddingModel) {
       try {
         // Qwen3: add instruction prefix for queries (task-specific instruction improves accuracy)
@@ -1227,7 +1382,14 @@ class RAGKnowledgeGraphManager {
         
         // Extract the embedding array and convert to Float32Array
         const embedding = result.data;
-        return new Float32Array(embedding.slice(0, dimensions));
+        const modelResult = new Float32Array(embedding.slice(0, dimensions));
+        // Cache the result (LRU: evict oldest if full)
+        if (this.embeddingCache.size >= this.EMBEDDING_CACHE_MAX) {
+          const firstKey = this.embeddingCache.keys().next().value;
+          if (firstKey) this.embeddingCache.delete(firstKey);
+        }
+        this.embeddingCache.set(cacheKey, modelResult);
+        return modelResult;
         
       } catch (error) {
         console.error(`⚠️ Embedding model failed for text "${text.slice(0, 50)}...":`, error instanceof Error ? error.message : error);
@@ -1243,7 +1405,14 @@ class RAGKnowledgeGraphManager {
     const words = normalizedText.split(' ').filter(word => word.length > 1);
     
     if (words.length === 0) {
-      return new Float32Array(embedding);
+      const emptyResult = new Float32Array(embedding);
+      // Cache the result (LRU: evict oldest if full)
+      if (this.embeddingCache.size >= this.EMBEDDING_CACHE_MAX) {
+        const firstKey = this.embeddingCache.keys().next().value;
+        if (firstKey) this.embeddingCache.delete(firstKey);
+      }
+      this.embeddingCache.set(cacheKey, emptyResult);
+      return emptyResult;
     }
     
     // Enhanced word importance calculation
@@ -1397,8 +1566,15 @@ class RAGKnowledgeGraphManager {
     // L2 normalization for cosine similarity
     const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
     const normalizedEmbedding = magnitude > 0 ? embedding.map(val => val / magnitude) : embedding;
-    
-    return new Float32Array(normalizedEmbedding);
+
+    const fallbackResult = new Float32Array(normalizedEmbedding);
+    // Cache the result (LRU: evict oldest if full)
+    if (this.embeddingCache.size >= this.EMBEDDING_CACHE_MAX) {
+      const firstKey = this.embeddingCache.keys().next().value;
+      if (firstKey) this.embeddingCache.delete(firstKey);
+    }
+    this.embeddingCache.set(cacheKey, fallbackResult);
+    return fallbackResult;
   }
   
   // Calculate position-based importance weight
@@ -2661,7 +2837,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.searchNodes((validatedArgs as any).query as string, (validatedArgs as any).limit || 10, (validatedArgs as any).since, (validatedArgs as any).until), null, 2) }] };
       case "openNodes":
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.openNodes((validatedArgs as any).names as string[]), null, 2) }] };
-      
+      case "getNeighbors":
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.getNeighbors(
+          (validatedArgs as any).entityNames as string[],
+          (validatedArgs as any).depth || 1,
+          (validatedArgs as any).relationType
+        ), null, 2) }] };
+
       // New RAG tools
       case "storeDocument":
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.storeDocument((validatedArgs as any).id as string, (validatedArgs as any).content as string, (validatedArgs as any).metadata || {}), null, 2) }] };
