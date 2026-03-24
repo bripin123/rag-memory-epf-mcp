@@ -5,38 +5,19 @@
 [![GitHub license](https://img.shields.io/github/license/heesongkoh/rag-memory-epf-mcp)](https://github.com/heesongkoh/rag-memory-epf-mcp/blob/main/LICENSE)
 [![Platforms](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](https://github.com/heesongkoh/rag-memory-epf-mcp)
 
-An advanced MCP server for **project-local RAG memory** through a knowledge graph with **multilingual vector search** capabilities.
+A **project-local RAG memory** MCP server — knowledge graph + multilingual vector search + FTS5 full-text search, all in a single SQLite file per project.
 
-**Each project folder gets its own isolated memory database** — set `DB_FILE_PATH` to a project-local `.memory/rag-memory.db` so every project maintains its own entities, relations, and documents independently. Multiple projects can run simultaneously without interference since they read/write to separate SQLite databases while sharing the same server binary.
+## Key Features
 
-**Fork of:** [rag-memory-mcp](https://github.com/ttommyth/rag-memory-mcp) — upgraded with **Qwen3-Embedding-0.6B** (1024-dim, 100+ languages) for significantly better multilingual semantic search.
-
-## What's Different
-
-| | rag-memory-mcp (original) | rag-memory-epf-mcp (this fork) |
-|---|---|---|
-| **Embedding Model** | all-MiniLM-L12-v2 | **Qwen3-Embedding-0.6B** |
-| **Dimensions** | 384 | **1024** |
-| **Languages** | English only | **100+ (Korean, Chinese, Japanese, Arabic, etc.)** |
-| **MTEB Score** | ~49 | **63.0+** |
-| **Max Tokens** | 256 | **8192** |
-| **Unicode Support** | ASCII only fallback | **Full Unicode (CJK, Arabic, Cyrillic, etc.)** |
-| **Auto Entity Linking** | None | **Chunk-level with word boundary + CJK support** |
+- **Project-local isolation** — each project gets its own `.memory/rag-memory.db`. Multiple projects run simultaneously without interference.
+- **3-signal hybrid search** — vector similarity (Qwen3-Embedding-0.6B, 1024-dim) + FTS5 BM25 keyword matching + knowledge graph re-ranking, combined via Reciprocal Rank Fusion
+- **100+ languages** — Korean, Chinese, Japanese, Arabic, and more. Cross-lingual search works out of the box.
+- **27 MCP tools** — entity/relation CRUD, document pipeline, multi-hop graph traversal, export/import, temporal queries
+- **SQLite optimized** — WAL mode, 32MB cache, 256MB mmap, FTS5 triggers, 7 indexes
+- **MCP SDK 1.27.1** — Tool Annotations (readOnly/destructive/idempotent), latest protocol 2025-11-25
 
 ## Quick Start
 
-```json
-{
-  "mcpServers": {
-    "rag-memory": {
-      "command": "npx",
-      "args": ["-y", "rag-memory-epf-mcp@latest"]
-    }
-  }
-}
-```
-
-**Project-local memory (recommended):**
 ```json
 {
   "mcpServers": {
@@ -51,154 +32,137 @@ An advanced MCP server for **project-local RAG memory** through a knowledge grap
 }
 ```
 
-Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each project maintains completely isolated memory — entities, relations, and documents are never mixed between projects.
+Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each project maintains completely isolated memory.
+
+## Tools (27)
+
+### Knowledge Graph (7)
+| Tool | Description | Annotation |
+|------|------------|------------|
+| `createEntities` | Create entities with observations and types (upsert) | idempotent |
+| `createRelations` | Establish relationships between entities | idempotent |
+| `addObservations` | Add contextual information to entities (dedup) | idempotent |
+| `updateRelations` | Update relationship confidence and metadata | idempotent |
+| `deleteEntities` | Remove entities and relationships | destructive |
+| `deleteRelations` | Remove specific relationships | destructive |
+| `deleteObservations` | Remove specific observations | destructive |
+
+### Document Pipeline (8)
+| Tool | Description | Annotation |
+|------|------------|------------|
+| `storeDocument` | Store documents with metadata | idempotent |
+| `chunkDocument` | Create text chunks with configurable parameters | — |
+| `embedChunks` | Generate 1024-dim embeddings + auto-link entities | idempotent |
+| `embedAllEntities` | Batch embed all entities (32 parallel) | idempotent |
+| `extractTerms` | Extract potential entity terms | — |
+| `linkEntitiesToDocument` | Manually link entities to document chunks | idempotent |
+| `deleteDocuments` | Remove documents and associated data | destructive |
+| `listDocuments` | View all stored documents | readOnly |
+
+### Search & Retrieval (9)
+| Tool | Description | Annotation |
+|------|------------|------------|
+| `hybridSearch` | Vector + FTS5 BM25 + graph traversal (3-signal) | readOnly |
+| `searchNodes` | Semantic entity search with `since`/`until` temporal filtering | readOnly |
+| `openNodes` | Retrieve specific entities by name | readOnly |
+| `readGraph` | Get complete knowledge graph | readOnly |
+| `getNeighbors` | Multi-hop graph traversal (depth 1-5, cycle detection) | readOnly |
+| `getDetailedContext` | Get full context for a chunk | readOnly |
+| `exportGraph` | Export full graph as JSON (backup) | readOnly |
+| `importGraph` | Import graph from JSON (merge or replace) | destructive |
+| `getKnowledgeGraphStats` | Knowledge base statistics | readOnly |
+
+### Migration (3)
+| Tool | Description | Annotation |
+|------|------------|------------|
+| `getMigrationStatus` | Check database schema version | readOnly |
+| `runMigrations` | Apply pending migrations | idempotent |
+| `rollbackMigration` | Revert to a previous schema version | destructive |
 
 ## Document Processing Pipeline
 
-`embedChunks` automatically links entities to the specific chunks where they appear:
-
 ```
 storeDocument(id, content, metadata)
-  |
-chunkDocument(documentId, maxTokens, overlap)
-  |
-embedChunks(documentId)
-  |-- generates vector embeddings for each chunk
-  |-- auto-links entities to chunks where they appear (chunk-level precision)
-  +-- returns { embeddedChunks, linkedEntities }
-
-linkEntitiesToDocument(documentId, entityNames)
-  +-- [optional] manually link additional entities that auto-linking missed
+  → chunkDocument(documentId, maxTokens, overlap)
+    → embedChunks(documentId)
+       ├── generates vector embeddings for each chunk
+       ├── auto-links entities to chunks (word boundary + CJK aware)
+       └── returns { embeddedChunks, linkedEntities }
 ```
 
-### Auto Entity Linking (v1.5.0+)
+## Architecture
 
-When `embedChunks` runs, it automatically:
-
-- **Chunk-level matching** — entities are linked only to chunks where they actually appear, not all chunks
-- **Word boundary matching** — for Latin text, prevents partial-word false matches (e.g. "Phase" won't match "multiphase")
-- **CJK-aware matching** — Korean/Chinese/Japanese entity names use substring matching (word boundaries don't apply)
-- **Observation-derived aliases** — file paths and identifiers from entity observations are also matched
-- **Smart length thresholds** — min 2 chars for CJK entities, min 4 chars for Latin entities
-
-## Migration
-
-### From rag-memory-mcp (original)
-
-1. Replace `rag-memory-mcp` with `rag-memory-epf-mcp@latest` in your config
-2. Migrations run automatically (384 -> 1024 dimensions)
-3. Re-embed your data:
-   - `embedAllEntities()` — re-embeds all entities
-   - `embedChunks(documentId)` — re-embeds each document's chunks
-
-### From rag-memory-epf-mcp v1.2.x (jina-v5-nano)
-
-1. Update to `rag-memory-epf-mcp@latest`
-2. Migration v5 runs automatically (768 -> 1024 dimensions)
-3. Re-embed your data (same commands as above)
-
-Your entities, relationships, documents, and chunk text are preserved. Only vector embeddings are regenerated.
-
-## Tools
-
-### Document Management
-- `storeDocument`: Store documents with metadata
-- `chunkDocument`: Create text chunks with configurable parameters
-- `embedChunks`: Generate 1024-dim vector embeddings + auto-link entities (chunk-level)
-- `extractTerms`: Extract potential entity terms
-- `linkEntitiesToDocument`: Manually create entity-document associations
-- `deleteDocuments`: Remove documents and associated data
-- `listDocuments`: View all stored documents
-
-### Knowledge Graph
-- `createEntities`: Create entities with observations and types
-- `createRelations`: Establish relationships between entities
-- `addObservations`: Add contextual information to entities
-- `updateRelations`: Update relationship confidence and metadata
-- `deleteEntities`: Remove entities and relationships
-- `deleteRelations`: Remove specific relationships
-- `deleteObservations`: Remove specific observations
-- `embedAllEntities`: Generate embeddings for all entities (batch 32 parallel)
-
-### Search & Retrieval
-- `hybridSearch`: Vector + FTS5 BM25 + graph traversal (3-signal hybrid)
-- `searchNodes`: Semantic entity search (multilingual, with since/until temporal filtering)
-- `openNodes`: Retrieve specific entities
-- `readGraph`: Get complete knowledge graph
-- `getDetailedContext`: Get full context for a chunk
-
-### Backup & Migration
-- `exportGraph`: Export full knowledge graph as JSON (entities, relations, documents)
-- `importGraph`: Import knowledge graph from JSON (merge or replace mode)
-- `getKnowledgeGraphStats`: Knowledge base statistics
-- `getMigrationStatus`: Check database schema version
-- `runMigrations`: Apply pending migrations
-- `rollbackMigration`: Revert to a previous schema version
-
-## Changelog
-
-### v1.7.0
-
-- **SQLite optimization** — WAL mode, 32MB cache, 256MB mmap, busy_timeout for concurrent access
-- **FTS5 full-text search** — keyword-exact matching via BM25, combined with vector search using Reciprocal Rank Fusion (RRF, k=60)
-- **updateRelations** — update relationship confidence scores and metadata without delete+recreate
-- **exportGraph / importGraph** — JSON backup and restore with merge or replace mode
-- **Batch embedding** — `embedAllEntities` processes 32 entities in parallel instead of sequential
-- **Temporal filtering** — `searchNodes` supports `since` and `until` (ISO 8601) date filters
-- **better-sqlite3 12.x** — SQLite 3.51.3 with query planner improvements
-- **sqlite-vec 0.1.7** — DELETE space reclaim, KNN distance constraints
-- **Missing indexes** — entityType, relationType, chunk lookups for faster queries
-- **SQL safety** — `safeRowid()` validation for vec0 virtual table operations
-
-### v1.6.0
-
-- **Entity upsert** — `createEntities` now merges new observations into existing entities instead of silently ignoring duplicates. Entity type is also updated if a more specific type is provided.
-- **Automatic observation timestamps** — all new observations are prefixed with `[YYYY-MM-DD]` for staleness tracking. Existing dated observations are preserved as-is.
-- **Dedup by content** — date prefixes are stripped when comparing observations to prevent duplicate entries with different dates.
-
-### v1.5.0
-
-- **Improved auto entity linking** — chunk-level precision instead of linking to all chunks
-- **Word boundary matching** — Latin entity names use regex word boundaries to prevent partial matches
-- **CJK-aware matching** — Korean/Chinese/Japanese names use substring matching with lower min-length threshold (2 chars vs 4)
-- **Observation-derived aliases** — file paths from entity observations are matched against chunk text
-- **README overhaul** — added pipeline diagram, auto-linking docs, changelog section
-
-### v1.4.2
-
-- fp16 quantization for embeddings
-- Auto-link entities after `embedChunks` (document-level, basic substring match)
-
-### v1.4.1
-
-- Qwen3 instruction prefix optimization
-- Entity embedding text format improvements
-
-### v1.4.0
-
-- Switched embedding model to **Qwen3-Embedding-0.6B** (1024-dim, 100+ languages)
-- Replaced BGE-M3 for better multilingual performance
-
-### v1.3.x
-
-- Cross-lingual graph boost via entity vector search
-- Korean + acronym + partial matching improvements
-- Unicode/Korean fallback embedding fixes
-
-### v1.2.x
-
-- jina-v5-nano embedding model (768-dim)
-- Initial multilingual support
-
-### v1.0.0
-
-- Initial fork from rag-memory-mcp
-- BGE-M3 embedding model (1024-dim)
-- sqlite-vec vector search
+```
+┌─────────────────────────────────────────────┐
+│  MCP Client (Claude Code, Gemini CLI, etc)  │
+└──────────────────┬──────────────────────────┘
+                   │ stdio (MCP SDK 1.27.1)
+┌──────────────────▼──────────────────────────┐
+│  rag-memory-epf-mcp                         │
+│  ┌────────────┐ ┌─────────────┐ ┌────────┐  │
+│  │ Knowledge  │ │ RAG Document│ │ Search │  │
+│  │ Graph CRUD │ │ Pipeline    │ │ Engine │  │
+│  └─────┬──────┘ └──────┬──────┘ └───┬────┘  │
+│        │               │            │        │
+│  ┌─────▼───────────────▼────────────▼─────┐  │
+│  │  SQLite (WAL mode, per-project file)   │  │
+│  │  ├── entities + relationships          │  │
+│  │  ├── documents + chunk_metadata        │  │
+│  │  ├── chunks (sqlite-vec, 1024-dim)     │  │
+│  │  ├── entity_embeddings (sqlite-vec)    │  │
+│  │  ├── entities_fts + chunks_fts (FTS5)  │  │
+│  │  └── 7 migrations (auto-applied)       │  │
+│  └────────────────────────────────────────┘  │
+│                                              │
+│  Qwen3-Embedding-0.6B (ONNX, 100+ langs)    │
+└──────────────────────────────────────────────┘
+```
 
 ## Environment Variables
 
-- `DB_FILE_PATH`: Path to the SQLite database file (default: `rag-memory.db` in the server directory)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_FILE_PATH` | `rag-memory.db` (server dir) | Path to project-local SQLite database |
+| `EMBEDDING_MODEL` | `onnx-community/Qwen3-Embedding-0.6B-ONNX` | HuggingFace model ID for embeddings |
+
+## Changelog
+
+### v1.9.0
+- **Multi-hop graph traversal** — `getNeighbors` tool with `WITH RECURSIVE` CTE, depth 1-5, cycle detection, bidirectional
+- **Embedding LRU cache** — 500-entry in-memory cache, skips redundant re-computation
+- **Configurable model** — `EMBEDDING_MODEL` env var to use alternative embedding models
+- 27 tools total
+
+### v1.8.0
+- **MCP SDK 1.27.1** — protocol 2025-11-25, security fix GHSA-345p-7cg4-v4c7 (CVSS 7.1)
+- **Tool Annotations** — all 27 tools annotated (readOnlyHint, destructiveHint, idempotentHint)
+- **SIGTERM graceful shutdown** — clean exit without ONNX mutex crash
+
+### v1.7.0
+- **SQLite optimization** — WAL mode, 32MB cache, 256MB mmap, busy_timeout
+- **FTS5 full-text search** — BM25 keyword matching + Reciprocal Rank Fusion with vector search
+- **updateRelations** — update confidence scores and metadata without delete+recreate
+- **exportGraph / importGraph** — JSON backup and restore (merge or replace)
+- **Batch embedding** — `embedAllEntities` processes 32 entities in parallel
+- **Temporal filtering** — `searchNodes` with `since`/`until` ISO 8601 date filters
+- **better-sqlite3 12.x** — SQLite 3.51.3 with query planner improvements
+- **sqlite-vec 0.1.7** — DELETE space reclaim, KNN distance constraints
+- **DB indexes** — entityType, relationType, chunk lookups
+- **SQL safety** — `safeRowid()` validation for vec0 operations
+
+### v1.6.0
+- **Entity upsert** — merges new observations into existing entities instead of ignoring duplicates
+- **Observation timestamps** — auto `[YYYY-MM-DD]` prefix for staleness tracking
+- **Dedup by content** — date-stripped comparison prevents duplicate observations
+
+### v1.5.0
+- **Chunk-level entity linking** — precision linking to specific chunks, not all chunks
+- **Word boundary + CJK matching** — Latin word boundaries, CJK substring matching
+- **Observation-derived aliases** — file paths from observations matched against chunks
+
+### v1.4.x
+- Switched to **Qwen3-Embedding-0.6B** (1024-dim, 100+ languages, MTEB 63.0+)
+- fp16 quantization, instruction prefix optimization
 
 ## Development
 
@@ -211,17 +175,17 @@ npm run build
 
 ## License
 
-This MCP server code is licensed under the **MIT License**. See [LICENSE](LICENSE) for details.
+MIT License. See [LICENSE](LICENSE).
 
 ### Third-Party Model Licenses
 
 | Component | License | Details |
 |-----------|---------|---------|
-| **Qwen3-Embedding-0.6B** | Apache 2.0 | Embedding model by Alibaba Qwen team. [Model card](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) |
+| **Qwen3-Embedding-0.6B** | Apache 2.0 | [Model card](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) |
 | **@huggingface/transformers** | Apache 2.0 | JS inference runtime |
 
-Apache 2.0 is compatible with MIT for downstream use. The model weights are downloaded at runtime via Hugging Face and are not bundled in this package.
+Model weights are downloaded at runtime and not bundled in this package.
 
 ---
 
-**Built with**: TypeScript, SQLite, sqlite-vec, Hugging Face Transformers (Qwen3-Embedding-0.6B), Model Context Protocol SDK
+**Built with**: TypeScript, SQLite (WAL + FTS5 + sqlite-vec), Qwen3-Embedding-0.6B, MCP SDK 1.27.1
