@@ -5,7 +5,9 @@
 [![GitHub license](https://img.shields.io/github/license/heesongkoh/rag-memory-epf-mcp)](https://github.com/heesongkoh/rag-memory-epf-mcp/blob/main/LICENSE)
 [![Platforms](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](https://github.com/heesongkoh/rag-memory-epf-mcp)
 
-An advanced MCP server for **RAG-enabled memory** through a knowledge graph with **multilingual vector search** capabilities.
+An advanced MCP server for **project-local RAG memory** through a knowledge graph with **multilingual vector search** capabilities.
+
+**Each project folder gets its own isolated memory database** — set `DB_FILE_PATH` to a project-local `.memory/rag-memory.db` so every project maintains its own entities, relations, and documents independently. Multiple projects can run simultaneously without interference since they read/write to separate SQLite databases while sharing the same server binary.
 
 **Fork of:** [rag-memory-mcp](https://github.com/ttommyth/rag-memory-mcp) — upgraded with **Qwen3-Embedding-0.6B** (1024-dim, 100+ languages) for significantly better multilingual semantic search.
 
@@ -34,7 +36,7 @@ An advanced MCP server for **RAG-enabled memory** through a knowledge graph with
 }
 ```
 
-**With custom database path:**
+**Project-local memory (recommended):**
 ```json
 {
   "mcpServers": {
@@ -42,12 +44,14 @@ An advanced MCP server for **RAG-enabled memory** through a knowledge graph with
       "command": "npx",
       "args": ["-y", "rag-memory-epf-mcp@latest"],
       "env": {
-        "DB_FILE_PATH": "/path/to/your/rag-memory.db"
+        "DB_FILE_PATH": "/path/to/your-project/.memory/rag-memory.db"
       }
     }
   }
 }
 ```
+
+Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each project maintains completely isolated memory — entities, relations, and documents are never mixed between projects.
 
 ## Document Processing Pipeline
 
@@ -110,25 +114,41 @@ Your entities, relationships, documents, and chunk text are preserved. Only vect
 - `createEntities`: Create entities with observations and types
 - `createRelations`: Establish relationships between entities
 - `addObservations`: Add contextual information to entities
+- `updateRelations`: Update relationship confidence and metadata
 - `deleteEntities`: Remove entities and relationships
 - `deleteRelations`: Remove specific relationships
 - `deleteObservations`: Remove specific observations
-- `embedAllEntities`: Generate embeddings for all entities
+- `embedAllEntities`: Generate embeddings for all entities (batch 32 parallel)
 
 ### Search & Retrieval
-- `hybridSearch`: Vector similarity + graph traversal
-- `searchNodes`: Semantic entity search (multilingual)
+- `hybridSearch`: Vector + FTS5 BM25 + graph traversal (3-signal hybrid)
+- `searchNodes`: Semantic entity search (multilingual, with since/until temporal filtering)
 - `openNodes`: Retrieve specific entities
 - `readGraph`: Get complete knowledge graph
 - `getDetailedContext`: Get full context for a chunk
 
-### Analytics & Migration
+### Backup & Migration
+- `exportGraph`: Export full knowledge graph as JSON (entities, relations, documents)
+- `importGraph`: Import knowledge graph from JSON (merge or replace mode)
 - `getKnowledgeGraphStats`: Knowledge base statistics
 - `getMigrationStatus`: Check database schema version
 - `runMigrations`: Apply pending migrations
 - `rollbackMigration`: Revert to a previous schema version
 
 ## Changelog
+
+### v1.7.0
+
+- **SQLite optimization** — WAL mode, 32MB cache, 256MB mmap, busy_timeout for concurrent access
+- **FTS5 full-text search** — keyword-exact matching via BM25, combined with vector search using Reciprocal Rank Fusion (RRF, k=60)
+- **updateRelations** — update relationship confidence scores and metadata without delete+recreate
+- **exportGraph / importGraph** — JSON backup and restore with merge or replace mode
+- **Batch embedding** — `embedAllEntities` processes 32 entities in parallel instead of sequential
+- **Temporal filtering** — `searchNodes` supports `since` and `until` (ISO 8601) date filters
+- **better-sqlite3 12.x** — SQLite 3.51.3 with query planner improvements
+- **sqlite-vec 0.1.7** — DELETE space reclaim, KNN distance constraints
+- **Missing indexes** — entityType, relationType, chunk lookups for faster queries
+- **SQL safety** — `safeRowid()` validation for vec0 virtual table operations
 
 ### v1.6.0
 
