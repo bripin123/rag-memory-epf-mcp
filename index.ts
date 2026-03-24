@@ -2230,11 +2230,11 @@ class RAGKnowledgeGraphManager {
     
     console.error(`🔍 Enhanced hybrid search: "${query}"`);
 
-    // Detect Korean in query and build cross-lingual translation
-    const hasKorean = /[\uAC00-\uD7A3]/.test(query);
+    // Detect non-English in query and build cross-lingual translation
+    const hasNonEnglish = /[^\x00-\x7F]/.test(query);
     let translatedQuery: string | null = null;
 
-    if (hasKorean) {
+    if (hasNonEnglish) {
       translatedQuery = this.translateQueryCrossLingual(query);
       if (translatedQuery) {
         console.error(`🌐 Cross-lingual: "${query}" → "${translatedQuery}"`);
