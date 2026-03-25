@@ -198,21 +198,10 @@ class RAGKnowledgeGraphManager {
       console.error(`✅ ${EMBEDDING_MODEL} model loaded successfully (fp16)`);
 
     } catch (error) {
-      console.error('❌ Failed to load embedding model (fp16):', error instanceof Error ? error.message : error);
-      const FALLBACK_MODEL = 'Xenova/all-MiniLM-L6-v2';
-      console.error(`🔄 Falling back to ${FALLBACK_MODEL}...`);
-      try {
-        this.embeddingModel = await pipeline(
-          'feature-extraction',
-          FALLBACK_MODEL,
-          { revision: 'main' }
-        );
-        this.modelInitialized = true;
-        console.error(`✅ ${FALLBACK_MODEL} loaded (fallback — 384-dim, English-focused)`);
-      } catch (retryError) {
-        console.error('❌ All embedding models failed to load. Search will not work.', retryError instanceof Error ? retryError.message : retryError);
-        this.modelInitialized = false;
-      }
+      console.error('❌ Failed to load embedding model:', error instanceof Error ? error.message : error);
+      console.error('⚠️  Semantic search will be unavailable. Other tools (CRUD, graph queries) still work.');
+      console.error('💡 Fix: Ensure ONNX model cache is accessible. Try: rm -rf ~/.npm/_onnx_models && restart.');
+      this.modelInitialized = false;
     }
   }
 
