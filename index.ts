@@ -35,7 +35,7 @@ const DB_FILE_PATH = process.env.DB_FILE_PATH
     : path.join(path.dirname(fileURLToPath(import.meta.url)), process.env.DB_FILE_PATH)
   : defaultDbPath;
 
-const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'onnx-community/Qwen3-Embedding-0.6B-ONNX';
+const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/bge-m3';
 
 // Original MCP interfaces
 interface Entity {
@@ -720,27 +720,40 @@ class RAGKnowledgeGraphManager {
     if (!this.db) throw new Error('Database not initialized');
 
     console.error(`🔍 Semantic entity search: "${query}"`);
-    
-    // Generate query embedding (with instruction prefix for Qwen3)
-    const queryEmbedding = await this.generateEmbedding(query, 1024, true);
 
-    // Perform vector similarity search on entities
-    const entityResults = this.db.prepare(`
-      SELECT 
-        ee.rowid,
-        eem.entity_id,
-        eem.embedding_text,
-        ee.distance,
-        e.name,
-        e.entityType,
-        e.observations
-      FROM entity_embeddings ee
-      JOIN entity_embedding_metadata eem ON ee.rowid = eem.rowid
-      JOIN entities e ON eem.entity_id = e.id
-      WHERE ee.embedding MATCH ?
-        AND k = ?
-      ORDER BY ee.distance
-    `).all(Buffer.from(queryEmbedding.buffer), limit) as Array<{
+    const queryVariants = this.buildCrossLingualVariants(query);
+    if (queryVariants.length > 1) {
+      console.error(`🌐 searchNodes variants: ${queryVariants.slice(1).join(' | ')}`);
+    }
+
+    const searchEntities = (embedding: Float32Array, k: number) => {
+      return this.db!.prepare(`
+        SELECT
+          ee.rowid,
+          eem.entity_id,
+          eem.embedding_text,
+          ee.distance,
+          e.name,
+          e.entityType,
+          e.observations
+        FROM entity_embeddings ee
+        JOIN entity_embedding_metadata eem ON ee.rowid = eem.rowid
+        JOIN entities e ON eem.entity_id = e.id
+        WHERE ee.embedding MATCH ?
+          AND k = ?
+        ORDER BY ee.distance
+      `).all(Buffer.from(embedding.buffer), k) as Array<{
+        rowid: number;
+        entity_id: string;
+        embedding_text: string;
+        distance: number;
+        name: string;
+        entityType: string;
+        observations: string;
+      }>;
+    };
+
+    const resultMap = new Map<string, {
       rowid: number;
       entity_id: string;
       embedding_text: string;
@@ -748,8 +761,21 @@ class RAGKnowledgeGraphManager {
       name: string;
       entityType: string;
       observations: string;
-    }>;
-    
+    }>();
+
+    for (const variant of queryVariants) {
+      const embedding = await this.generateEmbedding(variant, 1024, true);
+      const variantResults = searchEntities(embedding, limit * 2);
+      for (const result of variantResults) {
+        const existing = resultMap.get(result.entity_id);
+        if (!existing || result.distance < existing.distance) {
+          resultMap.set(result.entity_id, result);
+        }
+      }
+    }
+
+    const entityResults = Array.from(resultMap.values()).sort((a, b) => a.distance - b.distance).slice(0, limit);
+
     // Filter by temporal range if specified
     let filteredResults = entityResults;
     if (since || until) {
@@ -1269,16 +1295,30 @@ class RAGKnowledgeGraphManager {
     }
   }
 
-  // Simple configurable term extraction (replacing hardcoded patterns)
-  // Cross-lingual query translation using entity DB + domain dictionary
-  private translateQueryCrossLingual(query: string): string | null {
-    if (!this.db) return null;
+  private hasKorean(text: string): boolean {
+    return /[\uac00-\ud7af]/.test(text);
+  }
 
-    // Load external dictionary and use as domain dictionary
-    const { nativeToEn } = this.loadDictionary();
-    const domainDict: Record<string, string> = { ...nativeToEn };
+  private isLikelyEnglish(text: string): boolean {
+    return /[A-Za-z]/.test(text) && !/[^\x00-\x7F]/.test(text);
+  }
 
-    // Build entity Korean→English mapping from observations
+  private normalizeQueryText(text: string, keepAsciiOnly = false): string {
+    const normalized = keepAsciiOnly
+      ? text.replace(/[^\x00-\x7F]+/g, ' ')
+      : text;
+    return normalized.replace(/\s+/g, ' ').trim();
+  }
+
+  private buildCrossLingualDictionary(): { nativeToEn: Record<string, string>; enToNative: Record<string, string> } {
+    const { nativeToEn, enToNative } = this.loadDictionary();
+    const forward: Record<string, string> = { ...nativeToEn };
+    const reverse: Record<string, string> = { ...enToNative };
+
+    if (!this.db) {
+      return { nativeToEn: forward, enToNative: reverse };
+    }
+
     try {
       const entities = this.db.prepare(`
         SELECT name, observations FROM entities
@@ -1289,27 +1329,69 @@ class RAGKnowledgeGraphManager {
           const obs = JSON.parse(entity.observations) as string[];
           for (const o of obs) {
             const match = o.match(/한국어명:\s*(.+)/);
-            if (match) {
-              const koreanName = match[1].trim();
-              domainDict[koreanName] = entity.name;
+            if (!match) continue;
+            const koreanName = match[1].trim();
+            if (!koreanName) continue;
+            forward[koreanName] = entity.name;
+            if (!reverse[entity.name]) {
+              reverse[entity.name] = koreanName;
             }
           }
         } catch {}
       }
     } catch {}
 
-    // Translate Korean terms in query
+    return { nativeToEn: forward, enToNative: reverse };
+  }
+
+  private translateQueryWithMap(
+    query: string,
+    dictionary: Record<string, string>,
+    options: { keepAsciiOnly?: boolean } = {}
+  ): string | null {
     let translated = query;
-    // Sort by length descending to match longer terms first
-    const sortedTerms = Object.entries(domainDict).sort((a, b) => b[0].length - a[0].length);
-    for (const [ko, en] of sortedTerms) {
-      translated = translated.replace(new RegExp(ko, 'g'), en);
+    let changed = false;
+
+    const sortedTerms = Object.entries(dictionary).sort((a, b) => b[0].length - a[0].length);
+    for (const [source, target] of sortedTerms) {
+      const escaped = source.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const next = translated.replace(new RegExp(escaped, 'g'), target);
+      if (next !== translated) {
+        changed = true;
+        translated = next;
+      }
     }
 
-    // Remove remaining non-ASCII characters and clean up
-    translated = translated.replace(/[^\x00-\x7F]+/g, ' ').replace(/\s+/g, ' ').trim();
+    translated = this.normalizeQueryText(translated, options.keepAsciiOnly ?? false);
+    if (!changed || translated.length <= 2 || translated === query) {
+      return null;
+    }
 
-    return translated.length > 2 ? translated : null;
+    return translated;
+  }
+
+  // Cross-lingual query expansion using entity DB + domain dictionary
+  private buildCrossLingualVariants(query: string): string[] {
+    const variants = [this.normalizeQueryText(query)];
+    const { nativeToEn, enToNative } = this.buildCrossLingualDictionary();
+
+    if (this.hasKorean(query)) {
+      const koToEn = this.translateQueryWithMap(query, nativeToEn, { keepAsciiOnly: true });
+      if (koToEn) variants.push(koToEn);
+      return Array.from(new Set(variants));
+    }
+
+    if (this.isLikelyEnglish(query)) {
+      const enToKo = this.translateQueryWithMap(query, enToNative);
+      if (enToKo) variants.push(enToKo);
+      return Array.from(new Set(variants));
+    }
+
+    // Conservative fallback for other non-English queries: try native->English only.
+    const nativeToEnglish = this.translateQueryWithMap(query, nativeToEn, { keepAsciiOnly: true });
+    if (nativeToEnglish) variants.push(nativeToEnglish);
+
+    return Array.from(new Set(variants));
   }
 
   private extractTermsFromText(text: string, options: {
@@ -1357,7 +1439,7 @@ class RAGKnowledgeGraphManager {
   }
 
   // Tokenize and chunk text
-  private chunkText(text: string, maxTokens = 200, overlap = 20): Chunk[] {
+  private chunkText(text: string, maxTokens = 800, overlap = 160): Chunk[] {
     if (!this.encoding) throw new Error('Tokenizer not initialized');
     
     const tokens = this.encoding.encode(text);
@@ -1391,12 +1473,9 @@ class RAGKnowledgeGraphManager {
 
     if (this.modelInitialized && this.embeddingModel) {
       try {
-        // Qwen3: add instruction prefix for queries (task-specific instruction improves accuracy)
-        const inputText = isQuery
-          ? `Instruct: Given a search query, retrieve relevant entities and documents from a knowledge graph about halal certification, accreditation, and standards\nQuery: ${text}`
-          : text;
-        // Use the real sentence transformer model (Qwen3: last_token pooling)
-        const result = await this.embeddingModel(inputText, { pooling: 'last_token', normalize: true });
+        // BGE-M3: no instruction prefix needed, cls pooling
+        const inputText = text;
+        const result = await this.embeddingModel(inputText, { pooling: 'cls', normalize: true });
         
         // Extract the embedding array and convert to Float32Array
         const embedding = result.data;
@@ -1651,7 +1730,7 @@ class RAGKnowledgeGraphManager {
       throw new Error(`Document with ID ${documentId} not found`);
     }
     
-    const { maxTokens = 200, overlap = 20 } = options;
+    const { maxTokens = 800, overlap = 160 } = options;
     
     console.error(`🔪 Chunking document: ${documentId} (maxTokens: ${maxTokens}, overlap: ${overlap})`);
     
@@ -2229,21 +2308,11 @@ class RAGKnowledgeGraphManager {
     if (!this.encoding) throw new Error('Tokenizer not initialized');
     
     console.error(`🔍 Enhanced hybrid search: "${query}"`);
-
-    // Detect non-English in query and build cross-lingual translation
-    const hasNonEnglish = /[^\x00-\x7F]/.test(query);
-    let translatedQuery: string | null = null;
-
-    if (hasNonEnglish) {
-      translatedQuery = this.translateQueryCrossLingual(query);
-      if (translatedQuery) {
-        console.error(`🌐 Cross-lingual: "${query}" → "${translatedQuery}"`);
-      }
+    const queryVariants = this.buildCrossLingualVariants(query);
+    if (queryVariants.length > 1) {
+      console.error(`🌐 Cross-lingual variants: ${queryVariants.slice(1).join(' | ')}`);
     }
-
-    // Generate query embedding(s) (with instruction prefix for Qwen3)
-    const queryEmbedding = await this.generateEmbedding(query, 1024, true);
-    const translatedEmbedding = translatedQuery ? await this.generateEmbedding(translatedQuery, 1024, true) : null;
+    const primaryQueryEmbedding = await this.generateEmbedding(queryVariants[0], 1024, true);
 
     // Vector search helper
     const searchChunks = (embedding: Float32Array, k: number) => {
@@ -2285,19 +2354,18 @@ class RAGKnowledgeGraphManager {
       }>;
     };
 
-    // Dual search: original + translated (if available)
-    const originalResults = searchChunks(queryEmbedding, limit * 3);
-    const translatedResults = translatedEmbedding ? searchChunks(translatedEmbedding, limit * 3) : [];
+    type ChunkSearchResult = ReturnType<typeof searchChunks>[number];
 
-    // Merge and deduplicate by chunk_id, keeping best distance
-    const resultMap = new Map<string, typeof originalResults[0]>();
-    for (const r of originalResults) {
-      resultMap.set(r.chunk_id, r);
-    }
-    for (const r of translatedResults) {
-      const existing = resultMap.get(r.chunk_id);
-      if (!existing || r.distance < existing.distance) {
-        resultMap.set(r.chunk_id, r);
+    // Search original query plus cross-lingual expansions and keep best match per chunk.
+    const resultMap = new Map<string, ChunkSearchResult>();
+    for (const variant of queryVariants) {
+      const embedding = await this.generateEmbedding(variant, 1024, true);
+      const variantResults = searchChunks(embedding, limit * 3);
+      for (const r of variantResults) {
+        const existing = resultMap.get(r.chunk_id);
+        if (!existing || r.distance < existing.distance) {
+          resultMap.set(r.chunk_id, r);
+        }
       }
     }
     const vectorResults = Array.from(resultMap.values()).sort((a, b) => a.distance - b.distance);
@@ -2326,18 +2394,12 @@ class RAGKnowledgeGraphManager {
         }>;
       };
 
-      const ftsOriginal = ftsSearchQuery(query);
-      const ftsTranslated = translatedQuery ? ftsSearchQuery(translatedQuery) : [];
-
-      // Merge FTS5 results, keeping best score per chunk_id
+      // Merge FTS5 results from all query variants, keeping first-seen rank.
       const ftsResultMap = new Map<string, { chunk_id: string; fts_score: number; rank: number }>();
       let rank = 1;
-      for (const r of ftsOriginal) {
-        ftsResultMap.set(r.chunk_id, { chunk_id: r.chunk_id, fts_score: r.fts_score, rank });
-        rank++;
-      }
-      for (const r of ftsTranslated) {
-        if (!ftsResultMap.has(r.chunk_id)) {
+      for (const variant of queryVariants) {
+        for (const r of ftsSearchQuery(variant)) {
+          if (ftsResultMap.has(r.chunk_id)) continue;
           ftsResultMap.set(r.chunk_id, { chunk_id: r.chunk_id, fts_score: r.fts_score, rank });
           rank++;
         }
@@ -2417,13 +2479,11 @@ class RAGKnowledgeGraphManager {
           `).all(Buffer.from(embedding.buffer)) as Array<{ entity_id: string; name: string; distance: number }>;
         };
 
-        // Merge original + translated entity results
+        // Merge all query variant entity results
         const entityMap = new Map<string, { entity_id: string; name: string; distance: number }>();
-        for (const e of searchEntities(queryEmbedding)) {
-          entityMap.set(e.entity_id, e);
-        }
-        if (translatedEmbedding) {
-          for (const e of searchEntities(translatedEmbedding)) {
+        for (const variant of queryVariants) {
+          const embedding = await this.generateEmbedding(variant, 1024, true);
+          for (const e of searchEntities(embedding)) {
             const existing = entityMap.get(e.entity_id);
             if (!existing || e.distance < existing.distance) {
               entityMap.set(e.entity_id, e);
@@ -2551,7 +2611,7 @@ class RAGKnowledgeGraphManager {
       // Generate semantic summary
       const { summary, keyHighlight, relevanceScore } = await this.generateContentSummary(
         result.text,
-        queryEmbedding,
+        primaryQueryEmbedding,
         chunkEntities,
         result.chunk_type === 'relationship' ? 1 : 2 // Shorter summary for relationships
       );

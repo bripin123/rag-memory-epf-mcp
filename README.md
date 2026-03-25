@@ -10,7 +10,7 @@ A **project-local RAG memory** MCP server — knowledge graph + multilingual vec
 ## Key Features
 
 - **Project-local isolation** — each project gets its own `.memory/rag-memory.db`. Multiple projects run simultaneously without interference.
-- **3-signal hybrid search** — vector similarity (Qwen3-Embedding-0.6B, 1024-dim) + FTS5 BM25 keyword matching + knowledge graph re-ranking, combined via Reciprocal Rank Fusion
+- **3-signal hybrid search** — vector similarity (bge-m3, 1024-dim) + FTS5 BM25 keyword matching + knowledge graph re-ranking, combined via Reciprocal Rank Fusion
 - **100+ languages** — Korean, Chinese, Japanese, Arabic, and more. Cross-lingual search works out of the box.
 - **27 MCP tools** — entity/relation CRUD, document pipeline, multi-hop graph traversal, export/import, temporal queries
 - **SQLite optimized** — WAL mode, 32MB cache, 256MB mmap, FTS5 triggers, 7 indexes
@@ -114,7 +114,7 @@ storeDocument(id, content, metadata)
 │  │  └── 7 migrations (auto-applied)       │  │
 │  └────────────────────────────────────────┘  │
 │                                              │
-│  Qwen3-Embedding-0.6B (ONNX, 100+ langs)    │
+│  bge-m3 (ONNX, 100+ langs)                   │
 └──────────────────────────────────────────────┘
 ```
 
@@ -123,7 +123,7 @@ storeDocument(id, content, metadata)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DB_FILE_PATH` | `rag-memory.db` (server dir) | Path to project-local SQLite database |
-| `EMBEDDING_MODEL` | `onnx-community/Qwen3-Embedding-0.6B-ONNX` | HuggingFace model ID for embeddings |
+| `EMBEDDING_MODEL` | `Xenova/bge-m3` | HuggingFace model ID for embeddings |
 
 ## Changelog
 
@@ -161,7 +161,7 @@ storeDocument(id, content, metadata)
 - **Observation-derived aliases** — file paths from observations matched against chunks
 
 ### v1.4.x
-- Switched to **Qwen3-Embedding-0.6B** (1024-dim, 100+ languages, MTEB 63.0+)
+- Switched to **bge-m3** (1024-dim, 100+ languages)
 - fp16 quantization, instruction prefix optimization
 
 ## Development
@@ -181,11 +181,11 @@ MIT License. See [LICENSE](LICENSE).
 
 | Component | License | Details |
 |-----------|---------|---------|
-| **Qwen3-Embedding-0.6B** | Apache 2.0 | [Model card](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) |
+| **bge-m3** | MIT | [Model card](https://huggingface.co/BAAI/bge-m3) |
 | **@huggingface/transformers** | Apache 2.0 | JS inference runtime |
 
 Model weights are downloaded at runtime and not bundled in this package.
 
 ---
 
-**Built with**: TypeScript, SQLite (WAL + FTS5 + sqlite-vec), Qwen3-Embedding-0.6B, MCP SDK 1.27.1
+**Built with**: TypeScript, SQLite (WAL + FTS5 + sqlite-vec), bge-m3, MCP SDK 1.27.1
