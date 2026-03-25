@@ -191,25 +191,26 @@ class RAGKnowledgeGraphManager {
       this.embeddingModel = await pipeline(
         'feature-extraction',
         EMBEDDING_MODEL,
-        { revision: 'main' }
+        { revision: 'main', dtype: 'fp16' }
       );
 
       this.modelInitialized = true;
-      console.error(`✅ ${EMBEDDING_MODEL} model loaded successfully (fp32)`);
+      console.error(`✅ ${EMBEDDING_MODEL} model loaded successfully (fp16)`);
 
     } catch (error) {
-      console.error('❌ Failed to load embedding model (fp32):', error instanceof Error ? error.message : error);
-      console.error('🔄 Retrying with fp16...');
+      console.error('❌ Failed to load embedding model (fp16):', error instanceof Error ? error.message : error);
+      const FALLBACK_MODEL = 'Xenova/all-MiniLM-L6-v2';
+      console.error(`🔄 Falling back to ${FALLBACK_MODEL}...`);
       try {
         this.embeddingModel = await pipeline(
           'feature-extraction',
-          EMBEDDING_MODEL,
-          { revision: 'main', dtype: 'fp16' }
+          FALLBACK_MODEL,
+          { revision: 'main' }
         );
         this.modelInitialized = true;
-        console.error(`✅ ${EMBEDDING_MODEL} model loaded successfully (fp16 fallback)`);
+        console.error(`✅ ${FALLBACK_MODEL} loaded (fallback — 384-dim, English-focused)`);
       } catch (retryError) {
-        console.error('❌ Embedding model failed to load. Search will not work.', retryError instanceof Error ? retryError.message : retryError);
+        console.error('❌ All embedding models failed to load. Search will not work.', retryError instanceof Error ? retryError.message : retryError);
         this.modelInitialized = false;
       }
     }
