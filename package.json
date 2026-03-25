@@ -1,6 +1,6 @@
 {
   "name": "rag-memory-epf-mcp",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "MCP server for project-local RAG memory with knowledge graph and multilingual vector search",
   "license": "MIT",
   "author": "bripin123",
