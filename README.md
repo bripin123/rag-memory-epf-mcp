@@ -127,6 +127,15 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### v3.0.0
+- **Back to self-contained embeddings** — reverted from Ollama dependency (v2.x) to built-in `@huggingface/transformers` with bge-m3 (1024-dim). No external services required.
+- **Cross-lingual search** — auto-detects non-English queries and performs dual-language search
+- **External dictionary** — optional `.memory/dictionary.json` for custom translation pairs
+- **Modular tool system** — tools extracted into `src/tools/` with structured registry
+- **Migration system** — extracted into `src/migrations/` with versioned schema upgrades
+- **Dynamic version reporting** — MCP server version now reads from package.json
+- **MIT LICENSE file** — included in published package
+
 ### v1.9.0
 - **Multi-hop graph traversal** — `getNeighbors` tool with `WITH RECURSIVE` CTE, depth 1-5, cycle detection, bidirectional
 - **Embedding LRU cache** — 500-entry in-memory cache, skips redundant re-computation

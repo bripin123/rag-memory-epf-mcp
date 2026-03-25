@@ -1,7 +1,7 @@
 # Database files
-*.db
-*.sqlite
-*.sqlite3
+**/*.db
+**/*.sqlite
+**/*.sqlite3
 
 # Source files
 src/
@@ -28,6 +28,9 @@ tests/
 .vscode/
 .idea/
 
+# Specs
+specs/
+
 # OS files
 .DS_Store
-Thumbs.db 
+Thumbs.db

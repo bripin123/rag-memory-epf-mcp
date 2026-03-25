@@ -1,6 +1,6 @@
 {
   "name": "rag-memory-epf-mcp",
-  "version": "2.2.1",
+  "version": "3.0.0",
   "description": "MCP server for project-local RAG memory with knowledge graph and multilingual vector search",
   "license": "MIT",
   "author": "bripin123",
@@ -11,6 +11,7 @@
     "url": "git+https://github.com/heesongkoh/rag-memory-epf-mcp.git"
   },
   "type": "module",
+  "main": "dist/index.js",
   "bin": {
     "rag-memory-mcp": "dist/index.js"
   },

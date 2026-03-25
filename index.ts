@@ -9,7 +9,6 @@ import {
 import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { get_encoding } from 'tiktoken';
-import { promises as fs } from 'fs';
 import fsSync from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -21,6 +20,9 @@ import { getAllMCPTools, validateToolArgs, getSystemInfo } from './src/tools/too
 // Import migration system
 import { MigrationManager } from './src/migrations/migration-manager.js';
 import { migrations } from './src/migrations/migrations.js';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const PKG_VERSION: string = require('./package.json').version;
 
 // Configure Hugging Face transformers for better compatibility
 if (env.backends?.onnx?.wasm) {
@@ -2206,7 +2208,7 @@ class RAGKnowledgeGraphManager {
       documents,
       metadata: {
         exportedAt: new Date().toISOString(),
-        version: '1.0.0',
+        version: PKG_VERSION,
         entityCount: entities.length,
         relationCount: relations.length,
         documentCount: documents.length
@@ -2864,7 +2866,7 @@ const ragKgManager = new RAGKnowledgeGraphManager();
 // MCP Server setup
 const server = new Server({
   name: "rag-memory-server",
-  version: "1.0.0",
+  version: PKG_VERSION,
 }, {
     capabilities: {
       tools: {},

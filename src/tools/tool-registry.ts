@@ -16,7 +16,7 @@ export const allTools = {
 
 // Global settings for tool descriptions
 export const globalSettings = {
-  version: '1.0.0',
+  version: '3.0.0',
   systemName: 'RAG Knowledge Graph MCP Server',
   defaultTimeout: 60,
 };
