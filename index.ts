@@ -22,7 +22,7 @@ import { MigrationManager } from './src/migrations/migration-manager.js';
 import { migrations } from './src/migrations/migrations.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-const PKG_VERSION: string = require('./package.json').version;
+const PKG_VERSION: string = require('../package.json').version;
 
 // Configure Hugging Face transformers for better compatibility
 if (env.backends?.onnx?.wasm) {
