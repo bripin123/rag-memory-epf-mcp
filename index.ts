@@ -20,6 +20,7 @@ import { getAllMCPTools, validateToolArgs, getSystemInfo } from './src/tools/too
 // Import migration system
 import { MigrationManager } from './src/migrations/migration-manager.js';
 import { migrations } from './src/migrations/migrations.js';
+import { createHash } from 'crypto';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const PKG_VERSION: string = require('../package.json').version;
@@ -864,8 +865,10 @@ class RAGKnowledgeGraphManager {
 
   // Generate embedding text for an entity (combines name, type, and observations)
   private generateEntityEmbeddingText(entity: { name: string; entityType: string; observations: string[] }): string {
-    const observationsText = entity.observations.join('\n- ');
-    return `${entity.name} [${entity.entityType}]\n- ${observationsText}`.trim();
+    const observationsText = entity.observations
+      .filter(o => !o.startsWith('Source:') && !o.startsWith('Created:') && !o.startsWith('Type:') && !o.startsWith('Tags:') && !o.startsWith('Content length:'))
+      .join('. ');
+    return `${entity.entityType}: ${entity.name}. ${observationsText}`.trim();
   }
 
   // NEW: Generic semantic summary generation methods
@@ -1468,17 +1471,19 @@ class RAGKnowledgeGraphManager {
   // Generate embeddings using sentence transformers
   // isQuery: true for search queries (adds instruction prefix), false for documents/entities
   private async generateEmbedding(text: string, dimensions = 1024, isQuery = false): Promise<Float32Array> {
-    // Check cache first
-    const cacheKey = `${text.length > 100 ? text.substring(0, 100) : text}_${dimensions}_${isQuery}`;
+    // Check cache first (hash-based key to avoid collisions on long texts)
+    const cacheKey = createHash('md5').update(`${text}_${dimensions}_${isQuery}`).digest('hex');
     const cached = this.embeddingCache.get(cacheKey);
     if (cached) return cached;
 
     if (this.modelInitialized && this.embeddingModel) {
       try {
-        // BGE-M3: no instruction prefix needed, cls pooling
-        const inputText = text;
+        // BGE-M3: instruction prefix improves retrieval quality for queries
+        const inputText = isQuery
+          ? `Represent this sentence for searching relevant passages: ${text}`
+          : text;
         const result = await this.embeddingModel(inputText, { pooling: 'cls', normalize: true });
-        
+
         // Extract the embedding array and convert to Float32Array
         const embedding = result.data;
         const modelResult = new Float32Array(embedding.slice(0, dimensions));
@@ -1489,215 +1494,14 @@ class RAGKnowledgeGraphManager {
         }
         this.embeddingCache.set(cacheKey, modelResult);
         return modelResult;
-        
+
       } catch (error) {
         console.error(`⚠️ Embedding model failed for text "${text.slice(0, 50)}...":`, error instanceof Error ? error.message : error);
-        // Fall through to enhanced general implementation
+        throw new Error(`Embedding model not available. Ensure the model is loaded. Original error: ${error instanceof Error ? error.message : error}`);
       }
     }
-    
-    // Enhanced general-purpose semantic embedding
-    const embedding = new Array(dimensions).fill(0);
-    
-    // Normalize and tokenize text (preserve Unicode letters including Korean, Arabic, etc.)
-    const normalizedText = text.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
-    const words = normalizedText.split(' ').filter(word => word.length > 1);
-    
-    if (words.length === 0) {
-      const emptyResult = new Float32Array(embedding);
-      // Cache the result (LRU: evict oldest if full)
-      if (this.embeddingCache.size >= this.EMBEDDING_CACHE_MAX) {
-        const firstKey = this.embeddingCache.keys().next().value;
-        if (firstKey) this.embeddingCache.delete(firstKey);
-      }
-      this.embeddingCache.set(cacheKey, emptyResult);
-      return emptyResult;
-    }
-    
-    // Enhanced word importance calculation
-    const wordFreq = new Map<string, number>();
-    const wordPositions = new Map<string, number[]>();
-    
-    words.forEach((word, position) => {
-      wordFreq.set(word, (wordFreq.get(word) || 0) + 1);
-      if (!wordPositions.has(word)) {
-        wordPositions.set(word, []);
-      }
-      wordPositions.get(word)!.push(position);
-    });
-    
-    const totalWords = words.length;
-    const uniqueWords = wordFreq.size;
-    const vocabulary = Array.from(wordFreq.keys());
-    
-    // Create enhanced semantic features for each unique word
-    vocabulary.forEach(word => {
-      const freq = wordFreq.get(word) || 1;
-      const positions = wordPositions.get(word) || [];
-      
-      // Enhanced TF-IDF calculation
-      const tf = freq / totalWords;
-      const idf = Math.log(totalWords / freq); // More aggressive IDF for rare words
-      const tfidf = tf * idf;
-      
-      // Multi-position importance (average of all positions)
-      const avgPosition = positions.reduce((sum, pos) => sum + pos, 0) / positions.length;
-      const positionWeight = this.calculatePositionWeight(avgPosition, totalWords);
-      
-      // Word characteristics for semantic diversity
-      const wordLength = word.length;
-      const vowelCount = (word.match(/[aeiou]/g) || []).length;
-      const consonantCount = wordLength - vowelCount;
-      const vowelRatio = vowelCount / wordLength;
-      const hasCapitals = /[A-Z]/.test(word);
-      const hasNumbers = /\d/.test(word);
-      
-      // Word complexity indicators
-      const isLongWord = wordLength > 6;
-      const isRareWord = freq === 1 && wordLength > 4;
-      const isCompoundWord = word.includes('_') || word.includes('-');
-      
-      // Multiple hash functions for better semantic distribution
-      const hash1 = this.semanticHash(word, 1);
-      const hash2 = this.semanticHash(word, 2);
-      const hash3 = this.semanticHash(word, 3);
-      const hash4 = this.semanticHash(word + '_semantic', 1);
-      
-      // Enhanced base weight with word importance
-      let baseWeight = tfidf * positionWeight;
-      
-      // Boost important words
-      if (isLongWord) baseWeight *= 1.3;
-      if (isRareWord) baseWeight *= 1.5;
-      if (isCompoundWord) baseWeight *= 1.2;
-      if (hasCapitals) baseWeight *= 1.1;
-      
-      // Primary word representation with enhanced distribution
-      embedding[hash1 % dimensions] += baseWeight * 1.2;
-      embedding[hash2 % dimensions] += baseWeight * 1.0;
-      embedding[hash3 % dimensions] += baseWeight * 0.8;
-      
-      // Character-level features
-      embedding[hash4 % dimensions] += vowelRatio * baseWeight * 0.5;
-      embedding[(hash1 + wordLength) % dimensions] += (wordLength / 15.0) * baseWeight * 0.4;
-      
-      // Structural and linguistic features
-      if (hasCapitals) {
-        embedding[(hash2 + 7) % dimensions] += baseWeight * 0.6;
-      }
-      if (hasNumbers) {
-        embedding[(hash3 + 11) % dimensions] += baseWeight * 0.6;
-      }
-      if (wordLength > 8) {  // Complex words get special treatment
-        embedding[(hash1 + 13) % dimensions] += baseWeight * 0.7;
-      }
-      
-      // Enhanced n-gram features with better context
-      positions.forEach(position => {
-        // Bigram features
-        if (position > 0) {
-          const bigram = words[position - 1] + '_' + word;
-          const bigramHash = this.semanticHash(bigram, 4);
-          embedding[bigramHash % dimensions] += baseWeight * 0.5;
-        }
-        
-        if (position < words.length - 1) {
-          const nextBigram = word + '_' + words[position + 1];
-          const nextBigramHash = this.semanticHash(nextBigram, 5);
-          embedding[nextBigramHash % dimensions] += baseWeight * 0.5;
-        }
-        
-        // Trigram features for important words
-        if (isLongWord || isRareWord) {
-          if (position > 0 && position < words.length - 1) {
-            const trigram = words[position - 1] + '_' + word + '_' + words[position + 1];
-            const trigramHash = this.semanticHash(trigram, 6);
-            embedding[trigramHash % dimensions] += baseWeight * 0.3;
-          }
-        }
-      });
-      
-      // Enhanced prefix/suffix features for morphological richness
-      if (wordLength >= 3) {
-        const prefix2 = word.substring(0, Math.min(2, wordLength));
-        const prefix3 = word.substring(0, Math.min(3, wordLength));
-        const suffix2 = word.substring(Math.max(0, wordLength - 2));
-        const suffix3 = word.substring(Math.max(0, wordLength - 3));
-        
-        const prefix2Hash = this.semanticHash(prefix2 + '_pre2', 7);
-        const prefix3Hash = this.semanticHash(prefix3 + '_pre3', 8);
-        const suffix2Hash = this.semanticHash(suffix2 + '_suf2', 9);
-        const suffix3Hash = this.semanticHash(suffix3 + '_suf3', 10);
-        
-        embedding[prefix2Hash % dimensions] += baseWeight * 0.3;
-        embedding[prefix3Hash % dimensions] += baseWeight * 0.4;
-        embedding[suffix2Hash % dimensions] += baseWeight * 0.3;
-        embedding[suffix3Hash % dimensions] += baseWeight * 0.4;
-      }
-    });
-    
-    // Enhanced global text features
-    const avgWordLength = words.reduce((sum, word) => sum + word.length, 0) / words.length;
-    const maxWordLength = Math.max(...words.map(w => w.length));
-    const textComplexity = uniqueWords / totalWords;
-    const textDensity = Math.log(1 + totalWords);
-    const lexicalDiversity = uniqueWords / Math.sqrt(totalWords); // Better diversity measure
-    
-    // Distribute enhanced global features
-    const globalHash1 = this.semanticHash('_global_complexity_', 11);
-    const globalHash2 = this.semanticHash('_global_density_', 12);
-    const globalHash3 = this.semanticHash('_global_length_', 13);
-    const globalHash4 = this.semanticHash('_global_diversity_', 14);
-    const globalHash5 = this.semanticHash('_global_max_word_', 15);
-    
-    embedding[globalHash1 % dimensions] += textComplexity * 0.6;
-    embedding[globalHash2 % dimensions] += textDensity / 8.0;
-    embedding[globalHash3 % dimensions] += avgWordLength / 12.0;
-    embedding[globalHash4 % dimensions] += lexicalDiversity * 0.5;
-    embedding[globalHash5 % dimensions] += maxWordLength / 15.0;
-    
-    // Enhanced document length normalization
-    const docLengthNorm = Math.log(1 + totalWords);
-    for (let i = 0; i < dimensions; i++) {
-      embedding[i] = embedding[i] / Math.max(docLengthNorm, 1.0);
-    }
-    
-    // L2 normalization for cosine similarity
-    const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
-    const normalizedEmbedding = magnitude > 0 ? embedding.map(val => val / magnitude) : embedding;
 
-    const fallbackResult = new Float32Array(normalizedEmbedding);
-    // Cache the result (LRU: evict oldest if full)
-    if (this.embeddingCache.size >= this.EMBEDDING_CACHE_MAX) {
-      const firstKey = this.embeddingCache.keys().next().value;
-      if (firstKey) this.embeddingCache.delete(firstKey);
-    }
-    this.embeddingCache.set(cacheKey, fallbackResult);
-    return fallbackResult;
-  }
-  
-  // Calculate position-based importance weight
-  private calculatePositionWeight(position: number, totalWords: number): number {
-    if (totalWords === 1) return 1.0;
-    
-    // Higher weight for beginning and end, lower for middle
-    const relativePos = position / (totalWords - 1);
-    
-    // U-shaped curve: higher at start (0) and end (1), lower in middle (0.5)
-    const positionWeight = 1.0 - 0.3 * Math.sin(relativePos * Math.PI);
-    
-    return positionWeight;
-  }
-  
-  // General-purpose semantic hash function
-  private semanticHash(str: string, seed: number): number {
-    let hash = seed;
-    for (let i = 0; i < str.length; i++) {
-      const char = str.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash; // Convert to 32-bit integer
-    }
-    return Math.abs(hash);
+    throw new Error('Embedding model not initialized. The server may still be loading the model — retry in a few seconds.');
   }
 
   // === NEW SEPARATE TOOLS ===

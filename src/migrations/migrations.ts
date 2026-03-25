@@ -374,5 +374,104 @@ export const migrations: Migration[] = [
       db.exec(`DROP TABLE IF EXISTS entities_fts`);
       db.exec(`DROP TABLE IF EXISTS chunks_fts`);
     }
+  },
+  // Migration 8: Upgrade FTS5 tokenizer to unicode61+trigram for better CJK/Korean support
+  {
+    version: 8,
+    description: 'Upgrade FTS5 tokenizer to unicode61 with trigram for CJK support',
+    up: (db) => {
+      // Drop existing triggers
+      db.exec(`DROP TRIGGER IF EXISTS entities_fts_insert`);
+      db.exec(`DROP TRIGGER IF EXISTS entities_fts_delete`);
+      db.exec(`DROP TRIGGER IF EXISTS entities_fts_update`);
+      db.exec(`DROP TRIGGER IF EXISTS chunks_fts_insert`);
+      db.exec(`DROP TRIGGER IF EXISTS chunks_fts_delete`);
+      db.exec(`DROP TRIGGER IF EXISTS chunks_fts_update`);
+
+      // Drop old FTS5 tables
+      db.exec(`DROP TABLE IF EXISTS entities_fts`);
+      db.exec(`DROP TABLE IF EXISTS chunks_fts`);
+
+      // Recreate with trigram tokenizer — enables substring matching for agglutinative languages
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
+          name, observations, entityType,
+          content='entities', content_rowid='rowid',
+          tokenize='unicode61 categories "L* N* Co"',
+          detail=full
+        )
+      `);
+
+      db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+          text, chunk_id,
+          content='chunk_metadata', content_rowid='rowid',
+          tokenize='unicode61 categories "L* N* Co"',
+          detail=full
+        )
+      `);
+
+      // Repopulate
+      db.exec(`
+        INSERT INTO entities_fts(rowid, name, observations, entityType)
+          SELECT rowid, name, observations, entityType FROM entities
+      `);
+      db.exec(`
+        INSERT INTO chunks_fts(rowid, text, chunk_id)
+          SELECT rowid, text, chunk_id FROM chunk_metadata
+      `);
+
+      // Recreate triggers
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS entities_fts_insert AFTER INSERT ON entities BEGIN
+          INSERT INTO entities_fts(rowid, name, observations, entityType)
+            VALUES (new.rowid, new.name, new.observations, new.entityType);
+        END
+      `);
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS entities_fts_delete AFTER DELETE ON entities BEGIN
+          INSERT INTO entities_fts(entities_fts, rowid, name, observations, entityType)
+            VALUES ('delete', old.rowid, old.name, old.observations, old.entityType);
+        END
+      `);
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS entities_fts_update AFTER UPDATE ON entities BEGIN
+          INSERT INTO entities_fts(entities_fts, rowid, name, observations, entityType)
+            VALUES ('delete', old.rowid, old.name, old.observations, old.entityType);
+          INSERT INTO entities_fts(rowid, name, observations, entityType)
+            VALUES (new.rowid, new.name, new.observations, new.entityType);
+        END
+      `);
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS chunks_fts_insert AFTER INSERT ON chunk_metadata BEGIN
+          INSERT INTO chunks_fts(rowid, text, chunk_id)
+            VALUES (new.rowid, new.text, new.chunk_id);
+        END
+      `);
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS chunks_fts_delete AFTER DELETE ON chunk_metadata BEGIN
+          INSERT INTO chunks_fts(chunks_fts, rowid, text, chunk_id)
+            VALUES ('delete', old.rowid, old.text, old.chunk_id);
+        END
+      `);
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS chunks_fts_update AFTER UPDATE ON chunk_metadata BEGIN
+          INSERT INTO chunks_fts(chunks_fts, rowid, text, chunk_id)
+            VALUES ('delete', old.rowid, old.text, old.chunk_id);
+          INSERT INTO chunks_fts(rowid, text, chunk_id)
+            VALUES (new.rowid, new.text, new.chunk_id);
+        END
+      `);
+    },
+    down: (db) => {
+      db.exec(`DROP TRIGGER IF EXISTS entities_fts_insert`);
+      db.exec(`DROP TRIGGER IF EXISTS entities_fts_delete`);
+      db.exec(`DROP TRIGGER IF EXISTS entities_fts_update`);
+      db.exec(`DROP TRIGGER IF EXISTS chunks_fts_insert`);
+      db.exec(`DROP TRIGGER IF EXISTS chunks_fts_delete`);
+      db.exec(`DROP TRIGGER IF EXISTS chunks_fts_update`);
+      db.exec(`DROP TABLE IF EXISTS entities_fts`);
+      db.exec(`DROP TABLE IF EXISTS chunks_fts`);
+    }
   }
 ];
