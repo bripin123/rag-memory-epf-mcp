@@ -2,8 +2,8 @@
 
 [![npm version](https://img.shields.io/npm/v/rag-memory-epf-mcp)](https://www.npmjs.com/package/rag-memory-epf-mcp)
 [![npm downloads](https://img.shields.io/npm/dm/rag-memory-epf-mcp)](https://www.npmjs.com/package/rag-memory-epf-mcp)
-[![GitHub license](https://img.shields.io/github/license/heesongkoh/rag-memory-epf-mcp)](https://github.com/heesongkoh/rag-memory-epf-mcp/blob/main/LICENSE)
-[![Platforms](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](https://github.com/heesongkoh/rag-memory-epf-mcp)
+[![GitHub license](https://img.shields.io/github/license/bripin123/rag-memory-epf-mcp)](https://github.com/bripin123/rag-memory-epf-mcp/blob/main/LICENSE)
+[![Platforms](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](https://github.com/bripin123/rag-memory-epf-mcp)
 
 A **project-local RAG memory** MCP server — knowledge graph + multilingual vector search + FTS5 full-text search, all in a single SQLite file per project.
 
@@ -176,7 +176,7 @@ storeDocument(id, content, metadata)
 ## Development
 
 ```bash
-git clone https://github.com/heesongkoh/rag-memory-epf-mcp.git
+git clone https://github.com/bripin123/rag-memory-epf-mcp.git
 cd rag-memory-epf-mcp
 npm install
 npm run build
