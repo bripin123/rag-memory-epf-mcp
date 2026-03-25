@@ -375,10 +375,10 @@ export const migrations: Migration[] = [
       db.exec(`DROP TABLE IF EXISTS chunks_fts`);
     }
   },
-  // Migration 8: Upgrade FTS5 tokenizer to unicode61+trigram for better CJK/Korean support
+  // Migration 8: Rebuild FTS5 with remove_diacritics for better multilingual matching
   {
     version: 8,
-    description: 'Upgrade FTS5 tokenizer to unicode61 with trigram for CJK support',
+    description: 'Rebuild FTS5 with unicode61 remove_diacritics for multilingual support',
     up: (db) => {
       // Drop existing triggers
       db.exec(`DROP TRIGGER IF EXISTS entities_fts_insert`);
@@ -392,13 +392,12 @@ export const migrations: Migration[] = [
       db.exec(`DROP TABLE IF EXISTS entities_fts`);
       db.exec(`DROP TABLE IF EXISTS chunks_fts`);
 
-      // Recreate with trigram tokenizer — enables substring matching for agglutinative languages
+      // Recreate with remove_diacritics=2 for better multilingual matching
       db.exec(`
         CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
           name, observations, entityType,
           content='entities', content_rowid='rowid',
-          tokenize='unicode61 categories "L* N* Co"',
-          detail=full
+          tokenize='unicode61 remove_diacritics 2'
         )
       `);
 
@@ -406,8 +405,7 @@ export const migrations: Migration[] = [
         CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
           text, chunk_id,
           content='chunk_metadata', content_rowid='rowid',
-          tokenize='unicode61 categories "L* N* Co"',
-          detail=full
+          tokenize='unicode61 remove_diacritics 2'
         )
       `);
 

@@ -199,11 +199,22 @@ class RAGKnowledgeGraphManager {
 
       this.modelInitialized = true;
       console.error(`✅ ${EMBEDDING_MODEL} model loaded successfully`);
-      
+
     } catch (error) {
-      console.error('❌ Failed to load embedding model:', error);
-      console.error('📋 Falling back to simple embedding generation');
-      this.modelInitialized = false;
+      console.error('❌ Failed to load embedding model (fp16):', error instanceof Error ? error.message : error);
+      console.error('🔄 Retrying with fp32 (no quantization)...');
+      try {
+        this.embeddingModel = await pipeline(
+          'feature-extraction',
+          EMBEDDING_MODEL,
+          { revision: 'main' }
+        );
+        this.modelInitialized = true;
+        console.error(`✅ ${EMBEDDING_MODEL} model loaded successfully (fp32 fallback)`);
+      } catch (retryError) {
+        console.error('❌ Embedding model failed to load. Search will not work.', retryError instanceof Error ? retryError.message : retryError);
+        this.modelInitialized = false;
+      }
     }
   }
 
