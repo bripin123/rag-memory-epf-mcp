@@ -2309,7 +2309,7 @@ class RAGKnowledgeGraphManager {
 
         for (const entity of similarEntities) {
           const similarity = Math.max(0, 1 - entity.distance / 2);
-          if (similarity > 0.5) {
+          if (similarity > 0.4) {
             queryMatchedEntities.add(entity.name);
 
             // Get connected entities via relationships
