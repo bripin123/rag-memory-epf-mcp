@@ -191,26 +191,23 @@ class RAGKnowledgeGraphManager {
       this.embeddingModel = await pipeline(
         'feature-extraction',
         EMBEDDING_MODEL,
-        {
-          revision: 'main',
-          dtype: 'fp16',
-        }
+        { revision: 'main' }
       );
 
       this.modelInitialized = true;
-      console.error(`✅ ${EMBEDDING_MODEL} model loaded successfully`);
+      console.error(`✅ ${EMBEDDING_MODEL} model loaded successfully (fp32)`);
 
     } catch (error) {
-      console.error('❌ Failed to load embedding model (fp16):', error instanceof Error ? error.message : error);
-      console.error('🔄 Retrying with fp32 (no quantization)...');
+      console.error('❌ Failed to load embedding model (fp32):', error instanceof Error ? error.message : error);
+      console.error('🔄 Retrying with fp16...');
       try {
         this.embeddingModel = await pipeline(
           'feature-extraction',
           EMBEDDING_MODEL,
-          { revision: 'main' }
+          { revision: 'main', dtype: 'fp16' }
         );
         this.modelInitialized = true;
-        console.error(`✅ ${EMBEDDING_MODEL} model loaded successfully (fp32 fallback)`);
+        console.error(`✅ ${EMBEDDING_MODEL} model loaded successfully (fp16 fallback)`);
       } catch (retryError) {
         console.error('❌ Embedding model failed to load. Search will not work.', retryError instanceof Error ? retryError.message : retryError);
         this.modelInitialized = false;
