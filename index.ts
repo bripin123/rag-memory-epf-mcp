@@ -1653,11 +1653,7 @@ class RAGKnowledgeGraphManager {
 
       // Get all entities with observations for richer matching
       const entities = this.db.prepare(
-        `SELECT e.id, e.name, e.entityType,
-                GROUP_CONCAT(o.content, ' ||| ') as observations
-         FROM entities e
-         LEFT JOIN observations o ON o.entityId = e.id
-         GROUP BY e.id`
+        `SELECT id, name, entityType, observations FROM entities`
       ).all() as Array<{ id: string; name: string; entityType: string; observations: string | null }>;
 
       // Minimum name length: 2 for CJK (e.g. "할랄"), 4 for Latin (avoid "API", "Bug")
@@ -1679,7 +1675,8 @@ class RAGKnowledgeGraphManager {
         // Also collect observation-derived aliases (short keywords from observations)
         const aliases: ((text: string) => boolean)[] = [];
         if (entity.observations) {
-          const obs = entity.observations.split(' ||| ');
+          let obs: string[];
+          try { obs = JSON.parse(entity.observations); } catch { obs = []; }
           for (const ob of obs) {
             // Extract file paths or identifiers mentioned in observations (e.g. "gemini_converter.py")
             const pathMatch = ob.match(/[\w\-]+\.\w{1,4}\b/g);
