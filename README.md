@@ -12,6 +12,7 @@ A **project-local RAG memory** MCP server — knowledge graph + multilingual vec
 - **Project-local isolation** — each project gets its own `.memory/rag-memory.db`. Multiple projects run simultaneously without interference.
 - **3-signal hybrid search** — vector similarity (bge-m3, 1024-dim) + FTS5 BM25 keyword matching + knowledge graph re-ranking, combined via Reciprocal Rank Fusion
 - **100+ languages** — Korean, Chinese, Japanese, Arabic, and more. Cross-lingual search works out of the box.
+- **Graph-aware scoring** — per-entity geometric decay (0.5^i) with hard cap prevents any single document from dominating results
 - **27 MCP tools** — entity/relation CRUD, document pipeline, multi-hop graph traversal, export/import, temporal queries
 - **SQLite optimized** — WAL mode, 32MB cache, 256MB mmap, FTS5 triggers, 7 indexes
 - **MCP SDK 1.27.1** — Tool Annotations (readOnly/destructive/idempotent), latest protocol 2025-11-25
@@ -55,7 +56,7 @@ Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each 
 | `embedChunks` | Generate 1024-dim embeddings + auto-link entities | idempotent |
 | `embedAllEntities` | Batch embed all entities (32 parallel) | idempotent |
 | `extractTerms` | Extract potential entity terms | — |
-| `linkEntitiesToDocument` | Manually link entities to document chunks | idempotent |
+| `linkEntitiesToDocument` | Link entities to chunks where they actually appear (text-matched) | idempotent |
 | `deleteDocuments` | Remove documents and associated data | destructive |
 | `listDocuments` | View all stored documents | readOnly |
 
@@ -126,6 +127,10 @@ storeDocument(id, content, metadata)
 | `EMBEDDING_MODEL` | `Xenova/bge-m3` | HuggingFace model ID for embeddings |
 
 ## Changelog
+
+### v3.2.0
+- **Chunk-level entity linking in `linkEntitiesToDocument`** — entities are now linked only to chunks where they actually appear (using `buildEntityMatcher` word-boundary/CJK matching), instead of blanket-linking to all chunks. Fixes search result domination by heavily-linked documents.
+- **Graph boost decay + hard cap** — per-entity scores are sorted descending and decayed geometrically (0.5^i): 1st entity 100%, 2nd 50%, 3rd 25%, etc. Hard cap at 0.4 prevents graph signal from overwhelming vector similarity.
 
 ### v3.0.0
 - **Back to self-contained embeddings** — reverted from Ollama dependency (v2.x) to built-in `@huggingface/transformers` with bge-m3 (1024-dim). No external services required.

@@ -1755,35 +1755,41 @@ class RAGKnowledgeGraphManager {
       throw new Error(`Document with ID ${documentId} not found`);
     }
     
-    // Get chunks for this document
+    // Get chunks for this document (with text for chunk-level matching)
     const chunks = this.db.prepare(`
-      SELECT rowid FROM chunk_metadata WHERE document_id = ?
-    `).all(documentId) as Array<{ rowid: number }>;
-    
+      SELECT rowid, text FROM chunk_metadata WHERE document_id = ?
+    `).all(documentId) as Array<{ rowid: number; text: string }>;
+
     let linkedCount = 0;
-    
+
+    const insertStmt = this.db.prepare(`
+      INSERT OR IGNORE INTO chunk_entities (chunk_rowid, entity_id) VALUES (?, ?)
+    `);
+
     for (const entityName of entityNames) {
       const entityId = `entity_${entityName.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
-      
+
       // Verify entity exists
       const entity = this.db.prepare(`
         SELECT id FROM entities WHERE id = ?
       `).get(entityId);
-      
+
       if (!entity) {
         console.warn(`Entity ${entityName} not found, skipping`);
         continue;
       }
-      
-      // Link entity to all chunks of the document
+
+      // Chunk-level filtering: only link to chunks where entity actually appears
+      const nameMatcher = this.buildEntityMatcher(entityName);
+      let entityLinked = false;
       for (const chunk of chunks) {
-        this.db.prepare(`
-          INSERT OR IGNORE INTO chunk_entities (chunk_rowid, entity_id)
-          VALUES (?, ?)
-        `).run(chunk.rowid, entityId);
+        if (nameMatcher(chunk.text)) {
+          insertStmt.run(chunk.rowid, entityId);
+          entityLinked = true;
+        }
       }
-      
-      linkedCount++;
+
+      if (entityLinked) linkedCount++;
     }
     
     console.error(`✅ Entities linked: ${linkedCount} entities linked to document`);
@@ -2373,43 +2379,55 @@ class RAGKnowledgeGraphManager {
         }
       }
       
-      // Enhanced graph boost calculation
+      // Enhanced graph boost calculation with decay + cap
       let graphBoost = 0;
       if (useGraph) {
         const queryEntities = this.extractTermsFromText(query);
-        
+
         // Base boost for knowledge graph chunks
         if (result.chunk_type === 'entity') {
-          graphBoost += 0.15; // Entities are inherently valuable
+          graphBoost += 0.15;
         } else if (result.chunk_type === 'relationship') {
-          graphBoost += 0.25; // Relationships show connections
+          graphBoost += 0.25;
         }
-        
-        // Additional boost for entity matches
+
+        // Collect per-entity scores (instead of blind accumulation)
+        const entityScores: number[] = [];
         const queryLower = query.toLowerCase();
         for (const entity of chunkEntities) {
+          let score = 0;
           const entityLower = entity.toLowerCase();
           // Vector-matched entity (cross-lingual: "할랄 인증" → "KMF")
           if (queryMatchedEntities.has(entity)) {
-            graphBoost += 0.3;
+            score = 0.3;
           }
           // Exact text match with extracted terms
           else if (queryEntities.some(qe => qe.toLowerCase() === entityLower)) {
-            graphBoost += 0.3;
+            score = 0.3;
           }
           // Partial match: entity name appears in query or vice versa
           else if (queryLower.includes(entityLower) || entityLower.includes(queryLower)) {
-            graphBoost += 0.2;
+            score = 0.2;
           }
           // Word-level partial match
           else if (entityLower.split(/\s+/).some(word => word.length >= 3 && queryLower.includes(word))) {
-            graphBoost += 0.15;
+            score = 0.15;
           }
-          // Connected to a vector-matched entity
+          // Connected to a vector-matched entity (additive, independent)
           if (connectedEntities.has(entity)) {
-            graphBoost += 0.15;
+            score += 0.15;
           }
+          if (score > 0) entityScores.push(score);
         }
+
+        // Geometric decay: sort descending, apply 0.5^i decay per entity
+        entityScores.sort((a, b) => b - a);
+        let entityBoost = 0;
+        for (let i = 0; i < entityScores.length; i++) {
+          entityBoost += entityScores[i] * Math.pow(0.5, i);
+        }
+        // Hard cap to prevent graph domination
+        graphBoost += Math.min(entityBoost, 0.4);
       }
       
       // Generate semantic summary
