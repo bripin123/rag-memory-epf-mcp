@@ -128,6 +128,9 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### v3.2.1
+- **Fix: `autoLinkEntities` silent failure** — was JOINing a non-existent `observations` table (observations are stored as JSON array column in `entities`). Changed to direct column select + `JSON.parse()`.
+
 ### v3.2.0
 - **Chunk-level entity linking in `linkEntitiesToDocument`** — entities are now linked only to chunks where they actually appear (using `buildEntityMatcher` word-boundary/CJK matching), instead of blanket-linking to all chunks. Fixes search result domination by heavily-linked documents.
 - **Graph boost decay + hard cap** — per-entity scores are sorted descending and decayed geometrically (0.5^i): 1st entity 100%, 2nd 50%, 3rd 25%, etc. Hard cap at 0.4 prevents graph signal from overwhelming vector similarity.
