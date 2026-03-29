@@ -14,6 +14,15 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { pipeline, env } from '@huggingface/transformers';
 
+// Import graphology for graph analytics
+import Graph from 'graphology';
+import louvain from 'graphology-communities-louvain';
+import degree from 'graphology-metrics/centrality/degree.js';
+import betweennessCentrality from 'graphology-metrics/centrality/betweenness.js';
+import closenessCentrality from 'graphology-metrics/centrality/closeness.js';
+import pagerank from 'graphology-metrics/centrality/pagerank.js';
+import modularity from 'graphology-metrics/graph/modularity.js';
+
 // Import our new structured tool system
 import { getAllMCPTools, validateToolArgs, getSystemInfo } from './src/tools/tool-registry.js';
 
@@ -2615,6 +2624,271 @@ class RAGKnowledgeGraphManager {
     };
   }
 
+  // === GRAPH ANALYTICS TOOLS (graphology) ===
+
+  private _buildGraphologyGraph(): { graph: Graph; entities: any[] } {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const graph = new Graph({ type: 'undirected', allowSelfLoops: false });
+
+    // Load entities as nodes
+    const entities = this.db.prepare('SELECT id, name, entityType FROM entities').all() as any[];
+    for (const entity of entities) {
+      graph.addNode(entity.id, { name: entity.name, entityType: entity.entityType });
+    }
+
+    // Load relationships as edges
+    const relations = this.db.prepare('SELECT id, source_entity, target_entity, relationType FROM relationships').all() as any[];
+    for (const rel of relations) {
+      if (graph.hasNode(rel.source_entity) && graph.hasNode(rel.target_entity)) {
+        try {
+          graph.addEdge(rel.source_entity, rel.target_entity, {
+            relationType: rel.relationType,
+            id: rel.id,
+          });
+        } catch (e) {
+          // Skip duplicate edges (graphology undirected merges A→B and B→A)
+        }
+      }
+    }
+
+    return { graph, entities };
+  }
+
+  async getGraphMetrics(
+    entityNames?: string[],
+    metrics?: string[],
+    limit: number = 10
+  ): Promise<any> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const { graph } = this._buildGraphologyGraph();
+    if (graph.order === 0) {
+      return { metrics: {}, message: 'Knowledge graph is empty' };
+    }
+
+    const allMetrics = metrics || ['degree', 'betweenness', 'closeness', 'pagerank'];
+    const result: Record<string, Record<string, number>> = {};
+
+    if (allMetrics.includes('degree')) {
+      result.degree = degree.degreeCentrality(graph);
+    }
+    if (allMetrics.includes('betweenness')) {
+      result.betweenness = betweennessCentrality(graph);
+    }
+    if (allMetrics.includes('closeness')) {
+      result.closeness = closenessCentrality(graph);
+    }
+    if (allMetrics.includes('pagerank')) {
+      result.pagerank = pagerank(graph);
+    }
+
+    // Build id→name map
+    const idToName = new Map<string, string>();
+    graph.forEachNode((id: string, attrs: any) => {
+      idToName.set(id, attrs.name);
+    });
+
+    // If specific entities requested, filter to those
+    if (entityNames && entityNames.length > 0) {
+      const targetIds = new Set<string>();
+      for (const name of entityNames) {
+        const id = `entity_${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+        if (graph.hasNode(id)) targetIds.add(id);
+      }
+
+      const filtered: Record<string, Record<string, number | null>> = {};
+      for (const [metricName, scores] of Object.entries(result)) {
+        filtered[metricName] = {};
+        for (const id of targetIds) {
+          const name = idToName.get(id) || id;
+          filtered[metricName][name] = scores[id] ?? null;
+        }
+      }
+      return { metrics: filtered, entityCount: graph.order, edgeCount: graph.size };
+    }
+
+    // Otherwise return top-N per metric
+    const topResults: Record<string, Array<{ name: string; score: number }>> = {};
+    for (const [metricName, scores] of Object.entries(result)) {
+      const sorted = Object.entries(scores)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, limit)
+        .map(([id, score]) => ({
+          name: idToName.get(id) || id,
+          score: Math.round(score * 10000) / 10000,
+        }));
+      topResults[metricName] = sorted;
+    }
+    return { metrics: topResults, entityCount: graph.order, edgeCount: graph.size };
+  }
+
+  async detectCommunities(resolution: number = 1.0): Promise<any> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const { graph } = this._buildGraphologyGraph();
+    if (graph.order === 0) {
+      return { communities: [], modularity: 0, message: 'Knowledge graph is empty' };
+    }
+
+    // Run Louvain community detection — assign to node attributes
+    louvain.assign(graph, { resolution });
+
+    // Assign isolated nodes (Louvain skips degree-0 nodes)
+    let maxCommunityId = -1;
+    graph.forEachNode((id: string, attrs: any) => {
+      if (typeof attrs.community === 'number' && attrs.community > maxCommunityId) {
+        maxCommunityId = attrs.community;
+      }
+    });
+    graph.forEachNode((id: string, attrs: any) => {
+      if (attrs.community === undefined) {
+        graph.setNodeAttribute(id, 'community', ++maxCommunityId);
+      }
+    });
+
+    // Build id→name map
+    const idToName = new Map<string, string>();
+    graph.forEachNode((id: string, attrs: any) => {
+      idToName.set(id, attrs.name);
+    });
+
+    // Group entities by community
+    const communityMap = new Map<number, Array<{ name: string; entityType: string }>>();
+    graph.forEachNode((nodeId: string, attrs: any) => {
+      const communityId = attrs.community as number;
+      if (!communityMap.has(communityId)) {
+        communityMap.set(communityId, []);
+      }
+      communityMap.get(communityId)!.push({
+        name: idToName.get(nodeId) || nodeId,
+        entityType: attrs.entityType,
+      });
+    });
+
+    // Sort communities by size (largest first)
+    const sortedCommunities = [...communityMap.entries()]
+      .sort((a, b) => b[1].length - a[1].length)
+      .map(([_id, members], index) => ({
+        communityId: index,
+        size: members.length,
+        members: members.sort((a, b) => a.name.localeCompare(b.name)),
+      }));
+
+    // Calculate modularity (reads 'community' attribute from nodes)
+    const modularityScore = modularity(graph);
+
+    // Cross-community edges
+    let crossEdges = 0;
+    graph.forEachEdge((_edge: string, _attrs: any, source: string, target: string) => {
+      const srcCommunity = graph.getNodeAttribute(source, 'community');
+      const tgtCommunity = graph.getNodeAttribute(target, 'community');
+      if (srcCommunity !== tgtCommunity) crossEdges++;
+    });
+
+    return {
+      communities: sortedCommunities,
+      totalCommunities: sortedCommunities.length,
+      modularity: Math.round(modularityScore * 10000) / 10000,
+      crossCommunityEdges: crossEdges,
+      entityCount: graph.order,
+      edgeCount: graph.size,
+    };
+  }
+
+  async analyzeGraphStructure(): Promise<any> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    const { graph } = this._buildGraphologyGraph();
+    if (graph.order === 0) {
+      return { message: 'Knowledge graph is empty', entityCount: 0, edgeCount: 0 };
+    }
+
+    // Density
+    const density = graph.size > 0
+      ? (2 * graph.size) / (graph.order * (graph.order - 1))
+      : 0;
+
+    // Degree distribution
+    const degrees: number[] = [];
+    const isolatedNodes: string[] = [];
+    graph.forEachNode((id: string, attrs: any) => {
+      const deg = graph.degree(id);
+      degrees.push(deg);
+      if (deg === 0) isolatedNodes.push(attrs.name);
+    });
+    degrees.sort((a, b) => a - b);
+    const avgDegree = degrees.reduce((s, d) => s + d, 0) / degrees.length;
+    const medianDegree = degrees[Math.floor(degrees.length / 2)];
+
+    // Connected components (BFS)
+    const visited = new Set<string>();
+    const components: string[][] = [];
+    graph.forEachNode((startId: string) => {
+      if (visited.has(startId)) return;
+      const component: string[] = [];
+      const queue: string[] = [startId];
+      visited.add(startId);
+      while (queue.length > 0) {
+        const nodeId = queue.shift()!;
+        component.push(graph.getNodeAttribute(nodeId, 'name'));
+        graph.forEachNeighbor(nodeId, (neighbor: string) => {
+          if (!visited.has(neighbor)) {
+            visited.add(neighbor);
+            queue.push(neighbor);
+          }
+        });
+      }
+      components.push(component);
+    });
+    components.sort((a, b) => b.length - a.length);
+
+    // Relationship type distribution
+    const relTypeCount: Record<string, number> = {};
+    graph.forEachEdge((_edge: string, attrs: any) => {
+      const type = attrs.relationType || 'UNKNOWN';
+      relTypeCount[type] = (relTypeCount[type] || 0) + 1;
+    });
+
+    // Average clustering coefficient
+    let totalClustering = 0;
+    let clusterableNodes = 0;
+    graph.forEachNode((nodeId: string) => {
+      const neighbors = graph.neighbors(nodeId);
+      if (neighbors.length < 2) return;
+      let triangles = 0;
+      for (let i = 0; i < neighbors.length; i++) {
+        for (let j = i + 1; j < neighbors.length; j++) {
+          if (graph.hasEdge(neighbors[i], neighbors[j])) triangles++;
+        }
+      }
+      const possibleTriangles = (neighbors.length * (neighbors.length - 1)) / 2;
+      totalClustering += triangles / possibleTriangles;
+      clusterableNodes++;
+    });
+    const avgClustering = clusterableNodes > 0 ? totalClustering / clusterableNodes : 0;
+
+    return {
+      entityCount: graph.order,
+      edgeCount: graph.size,
+      density: Math.round(density * 10000) / 10000,
+      connectedComponents: {
+        count: components.length,
+        largest: components[0]?.length || 0,
+        sizes: components.map(c => c.length),
+        isolatedNodes,
+      },
+      degreeDistribution: {
+        min: degrees[0],
+        max: degrees[degrees.length - 1],
+        avg: Math.round(avgDegree * 100) / 100,
+        median: medianDegree,
+      },
+      averageClusteringCoefficient: Math.round(avgClustering * 10000) / 10000,
+      relationshipTypes: relTypeCount,
+    };
+  }
+
   // === MIGRATION TOOLS ===
 
   async getMigrationStatus(): Promise<{ currentVersion: number; migrations: Array<{ version: number; description: string; applied: boolean; applied_at?: string }>; pendingCount: number }> {
@@ -2782,7 +3056,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.runMigrations(), null, 2) }] };
       case "rollbackMigration":
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.rollbackMigration((validatedArgs as any).targetVersion as number), null, 2) }] };
-      
+
+      // Graph Analytics tools (graphology)
+      case "getGraphMetrics":
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.getGraphMetrics((validatedArgs as any).entityNames, (validatedArgs as any).metrics, (validatedArgs as any).limit || 10), null, 2) }] };
+      case "detectCommunities":
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.detectCommunities((validatedArgs as any).resolution || 1.0), null, 2) }] };
+      case "analyzeGraphStructure":
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.analyzeGraphStructure(), null, 2) }] };
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
