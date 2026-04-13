@@ -281,7 +281,7 @@ class RAGKnowledgeGraphManager {
     `);
 
     for (const entity of entities) {
-      const entityId = `entity_${entity.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const entityId = `entity_${entity.name.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
       const timestamped = (entity.observations || []).map(o => this._timestampObservation(o));
 
       // Try insert first
@@ -334,8 +334,8 @@ class RAGKnowledgeGraphManager {
         { name: relation.to, entityType: 'CONCEPT', observations: [] }
       ]);
       
-      const sourceId = `entity_${relation.from.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
-      const targetId = `entity_${relation.to.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const sourceId = `entity_${relation.from.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
+      const targetId = `entity_${relation.to.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
       const relationId = `rel_${sourceId}_${relation.relationType}_${targetId}`.toLowerCase();
       
       const stmt = this.db.prepare(`
@@ -359,7 +359,7 @@ class RAGKnowledgeGraphManager {
     const results = [];
     
     for (const obs of observations) {
-      const entityId = `entity_${obs.entityName.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const entityId = `entity_${obs.entityName.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
       
       // Get current observations
       const entity = this.db.prepare(`
@@ -400,7 +400,7 @@ class RAGKnowledgeGraphManager {
     console.error(`🗑️ Deleting entities: ${entityNames.join(', ')}`);
     
     for (const name of entityNames) {
-      const entityId = `entity_${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const entityId = `entity_${name.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
       
       try {
         // Check if entity exists first
@@ -472,7 +472,7 @@ class RAGKnowledgeGraphManager {
     if (!this.db) throw new Error('Database not initialized');
     
     for (const deletion of deletions) {
-      const entityId = `entity_${deletion.entityName.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const entityId = `entity_${deletion.entityName.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
       
       const entity = this.db.prepare(`
         SELECT observations FROM entities WHERE id = ?
@@ -495,8 +495,8 @@ class RAGKnowledgeGraphManager {
     if (!this.db) throw new Error('Database not initialized');
 
     for (const relation of relations) {
-      const sourceId = `entity_${relation.from.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
-      const targetId = `entity_${relation.to.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const sourceId = `entity_${relation.from.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
+      const targetId = `entity_${relation.to.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
 
       this.db.prepare(`
         DELETE FROM relationships
@@ -512,8 +512,8 @@ class RAGKnowledgeGraphManager {
     let notFound = 0;
 
     for (const update of updates) {
-      const sourceId = `entity_${update.from.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
-      const targetId = `entity_${update.to.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const sourceId = `entity_${update.from.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
+      const targetId = `entity_${update.to.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
       const relationId = `rel_${sourceId}_${update.relationType}_${targetId}`.toLowerCase();
 
       // Check if relation exists
@@ -592,7 +592,7 @@ class RAGKnowledgeGraphManager {
     const effectiveDepth = Math.min(Math.max(depth, 1), 5);
 
     // Convert entity names to IDs
-    const seedIds = entityNames.map(name => `entity_${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`);
+    const seedIds = entityNames.map(name => `entity_${name.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`);
 
     // Build dynamic placeholders for the seed IDs
     const seedPlaceholders = seedIds.map(() => '?').join(',');
@@ -1773,7 +1773,7 @@ class RAGKnowledgeGraphManager {
     `);
 
     for (const entityName of entityNames) {
-      const entityId = `entity_${entityName.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+      const entityId = `entity_${entityName.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
 
       // Verify entity exists
       const entity = this.db.prepare(`
@@ -2693,7 +2693,7 @@ class RAGKnowledgeGraphManager {
     if (entityNames && entityNames.length > 0) {
       const targetIds = new Set<string>();
       for (const name of entityNames) {
-        const id = `entity_${name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+        const id = `entity_${name.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
         if (graph.hasNode(id)) targetIds.add(id);
       }
 
