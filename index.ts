@@ -137,6 +137,37 @@ interface DetailedContext {
 }
 
 // Safe rowid for vec0 virtual tables (require literal integer, not parameterized)
+// Trim incomplete UTF-8 multi-byte sequences at chunk boundaries.
+// Continuation bytes match 10xxxxxx (0x80-0xBF); lead bytes indicate how many
+// bytes the sequence needs (0xxxxxxx=1, 110xxxxx=2, 1110xxxx=3, 11110xxx=4).
+// When a chunk is not at the document head/tail, any partial sequence at that
+// edge belongs to an adjacent chunk and must be removed so TextDecoder does
+// not emit U+FFFD. Pass trimHead/trimTail=false to preserve head/tail bytes.
+function trimIncompleteUtf8(bytes: Uint8Array, trimHead: boolean, trimTail: boolean): Uint8Array {
+  let start = 0;
+  let end = bytes.length;
+
+  if (trimHead) {
+    while (start < end && (bytes[start] & 0xC0) === 0x80) start++;
+  }
+
+  if (trimTail) {
+    let i = end - 1;
+    while (i >= start && (bytes[i] & 0xC0) === 0x80) i--;
+    if (i >= start) {
+      const lead = bytes[i];
+      let needed = 1;
+      if ((lead & 0x80) === 0) needed = 1;
+      else if ((lead & 0xE0) === 0xC0) needed = 2;
+      else if ((lead & 0xF0) === 0xE0) needed = 3;
+      else if ((lead & 0xF8) === 0xF0) needed = 4;
+      if (end - i < needed) end = i;
+    }
+  }
+
+  return bytes.subarray(start, end);
+}
+
 function safeRowid(value: unknown): number {
   const n = Number(value);
   if (!Number.isInteger(n) || n < 0) {
@@ -1451,17 +1482,25 @@ class RAGKnowledgeGraphManager {
   }
 
   // Tokenize and chunk text
+  // BPE tokenizers (cl100k_base) split multi-byte UTF-8 sequences across tokens.
+  // Slicing token arrays at arbitrary boundaries can leave incomplete UTF-8
+  // prefix/suffix bytes, which TextDecoder replaces with U+FFFD (�). Trim the
+  // incomplete sequences at chunk boundaries; overlap covers the removed bytes.
   private chunkText(text: string, maxTokens = 800, overlap = 160): Chunk[] {
     if (!this.encoding) throw new Error('Tokenizer not initialized');
-    
+
     const tokens = this.encoding.encode(text);
     const chunks: Chunk[] = [];
-    
+
     for (let i = 0; i < tokens.length; i += maxTokens - overlap) {
       const chunkTokens = tokens.slice(i, i + maxTokens);
       const decodedBytes = this.encoding.decode(chunkTokens);
-      const chunkText = new TextDecoder().decode(decodedBytes);
-      
+
+      const isFirst = i === 0;
+      const isLast = i + chunkTokens.length >= tokens.length;
+      const safeBytes = trimIncompleteUtf8(decodedBytes, !isFirst, !isLast);
+      const chunkText = new TextDecoder('utf-8').decode(safeBytes);
+
       chunks.push({
         id: '',
         document_id: '',
@@ -1471,7 +1510,7 @@ class RAGKnowledgeGraphManager {
         end_pos: i + chunkTokens.length
       });
     }
-    
+
     return chunks;
   }
 
