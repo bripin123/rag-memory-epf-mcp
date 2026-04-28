@@ -473,7 +473,11 @@ export const migrations: Migration[] = [
     }
   },
 
-  // Migration 9: Separate token-space vs char-space chunk offsets.
+  // Migration 10: Separate token-space vs char-space chunk offsets.
+  // (Slot 9 is intentionally skipped — some user databases from early v3.x
+  // experiments have an unrelated migration recorded at version 9 (Ollama
+  // dimension swap). Reusing that slot would silently no-op against those
+  // databases. Version 10 ensures the migration runs everywhere.)
   // Before this migration, chunk_metadata.start_pos/end_pos held *token* indices
   // for document chunks (a leftover from the BPE tokenizer-based chunkText loop)
   // but already held character lengths (0..text.length) for entity/relationship
@@ -487,14 +491,23 @@ export const migrations: Migration[] = [
   // (already a valid 0..text.length char range against the chunk text itself);
   // token columns stay NULL since these chunks have no token-space concept.
   {
-    version: 9,
+    version: 10,
     description: 'Add start_token/end_token; reinterpret start_pos/end_pos as char offsets',
     up: (db) => {
-      // 1) Add columns
-      db.exec(`ALTER TABLE chunk_metadata ADD COLUMN start_token INTEGER`);
-      db.exec(`ALTER TABLE chunk_metadata ADD COLUMN end_token INTEGER`);
+      // 1) Add columns (idempotent — some databases may have been touched by a
+      //    pre-release v9 attempt; tolerate the column already existing).
+      const cols = (db.prepare(`PRAGMA table_info(chunk_metadata)`).all() as Array<{ name: string }>)
+        .map(c => c.name);
+      if (!cols.includes('start_token')) {
+        db.exec(`ALTER TABLE chunk_metadata ADD COLUMN start_token INTEGER`);
+      }
+      if (!cols.includes('end_token')) {
+        db.exec(`ALTER TABLE chunk_metadata ADD COLUMN end_token INTEGER`);
+      }
 
-      // 2) Move token data into new columns for document chunks
+      // 2) Move token data into new columns for document chunks (only if not
+      //    already moved — guard against re-running in the rare case a prior
+      //    partial run already touched some rows).
       db.exec(`
         UPDATE chunk_metadata
           SET start_token = start_pos,
@@ -502,6 +515,8 @@ export const migrations: Migration[] = [
               start_pos = NULL,
               end_pos = NULL
           WHERE chunk_type = 'document'
+            AND start_token IS NULL
+            AND start_pos IS NOT NULL
       `);
 
       // 3) Recompute char offsets via indexOf with a running cursor per document
