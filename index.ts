@@ -1495,15 +1495,19 @@ class RAGKnowledgeGraphManager {
   //
   // Each chunk records both token-space offsets (start_token/end_token from the
   // BPE encoder loop) and char-space offsets (start_pos/end_pos into the original
-  // text). Char offsets are recovered with indexOf using a running cursor at the
-  // previous chunk's start, so substr(text, start_pos, end_pos - start_pos)
-  // equals chunk.text. On a coincidental indexOf miss the char offsets are NULL.
+  // text). Char offsets are Unicode codepoint counts — language-neutral, so SQL
+  // substr, Python str slicing, and JS [...str] iteration all line up. JS's
+  // native UTF-16 indexing differs for supplementary characters (emoji, rare
+  // CJK), so the function maintains parallel UTF-16 and codepoint cursors and
+  // reports codepoint offsets. On a coincidental indexOf miss the char offsets
+  // are NULL.
   private chunkText(text: string, maxTokens = 800, overlap = 160): Chunk[] {
     if (!this.encoding) throw new Error('Tokenizer not initialized');
 
     const tokens = this.encoding.encode(text);
     const chunks: Chunk[] = [];
-    let charCursor = 0;
+    let utf16Cursor = 0;
+    let cpCursor = 0;
 
     for (let i = 0; i < tokens.length; i += maxTokens - overlap) {
       const chunkTokens = tokens.slice(i, i + maxTokens);
@@ -1514,23 +1518,29 @@ class RAGKnowledgeGraphManager {
       const safeBytes = trimIncompleteUtf8(decodedBytes, !isFirst, !isLast);
       const chunkText = new TextDecoder('utf-8').decode(safeBytes);
 
-      // Recover char-space offsets. First chunk is anchored at 0 because
-      // trimIncompleteUtf8 leaves the leading bytes intact when isFirst is true.
       let startPos: number | null;
       let endPos: number | null;
       if (isFirst) {
         startPos = 0;
-        endPos = chunkText.length;
-        charCursor = 0;
+        endPos = [...chunkText].length;
+        utf16Cursor = 0;
+        cpCursor = 0;
       } else if (chunkText.length === 0) {
         startPos = null;
         endPos = null;
       } else {
-        const idx = text.indexOf(chunkText, charCursor);
-        if (idx >= 0) {
-          startPos = idx;
-          endPos = idx + chunkText.length;
-          charCursor = idx;
+        const utfIdx = text.indexOf(chunkText, utf16Cursor);
+        if (utfIdx >= 0) {
+          // Advance cpCursor by codepoints between the previous cursor and the
+          // new chunk's start (handles overlap by anchoring at the previous
+          // chunk's start, not its end).
+          if (utfIdx > utf16Cursor) {
+            cpCursor += [...text.slice(utf16Cursor, utfIdx)].length;
+            utf16Cursor = utfIdx;
+          }
+          const cpLen = [...chunkText].length;
+          startPos = cpCursor;
+          endPos = cpCursor + cpLen;
         } else {
           startPos = null;
           endPos = null;

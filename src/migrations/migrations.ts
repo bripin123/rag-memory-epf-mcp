@@ -567,5 +567,54 @@ export const migrations: Migration[] = [
       // start_token/end_token columns remain (no DROP COLUMN); they will be
       // ignored by older code.
     }
+  },
+
+  // Migration 11: Convert chunk_metadata.start_pos/end_pos from JS UTF-16 code
+  // unit indices to Unicode codepoint indices. v3.3.4 stored offsets in JS's
+  // native UTF-16 unit space, which mismatches SQL substr/length and Python
+  // string indexing for any document containing supplementary characters
+  // (emoji, rare CJK). Codepoints are language-neutral. Walks each document's
+  // chunks in chunk_index order, locating each chunk in the source via UTF-16
+  // indexOf and counting codepoints between cursor positions to derive the
+  // codepoint offsets. Idempotent — chunks where indexOf misses keep their
+  // existing values.
+  {
+    version: 11,
+    description: 'Convert chunk_metadata.start_pos/end_pos to Unicode codepoint indices',
+    up: (db) => {
+      const docRows = db.prepare(`SELECT DISTINCT document_id FROM chunk_metadata
+        WHERE chunk_type='document' AND document_id IS NOT NULL
+          AND start_pos IS NOT NULL AND end_pos IS NOT NULL`).all() as Array<{ document_id: string }>;
+      const getContent = db.prepare(`SELECT content FROM documents WHERE id = ?`);
+      const getChunks = db.prepare(`SELECT rowid, text FROM chunk_metadata
+        WHERE document_id=? AND chunk_type='document'
+          AND start_pos IS NOT NULL AND end_pos IS NOT NULL
+        ORDER BY chunk_index ASC`);
+      const upd = db.prepare(`UPDATE chunk_metadata SET start_pos=?, end_pos=? WHERE rowid=?`);
+
+      for (const { document_id } of docRows) {
+        const doc = getContent.get(document_id) as { content: string } | undefined;
+        if (!doc) continue;
+        const content = doc.content;
+        const chunks = getChunks.all(document_id) as Array<{ rowid: number; text: string }>;
+        let utf16Cursor = 0;
+        let cpCursor = 0;
+        for (const c of chunks) {
+          if (!c.text) continue;
+          const utfIdx = content.indexOf(c.text, utf16Cursor);
+          if (utfIdx < 0) continue; // miss: leave existing
+          if (utfIdx > utf16Cursor) {
+            cpCursor += [...content.slice(utf16Cursor, utfIdx)].length;
+            utf16Cursor = utfIdx;
+          }
+          const cpLen = [...c.text].length;
+          upd.run(cpCursor, cpCursor + cpLen, c.rowid);
+        }
+      }
+    },
+    down: (_db) => {
+      // No clean reversal: would need the original document content to recompute
+      // UTF-16 indices, and we never recorded which chunks were touched. No-op.
+    }
   }
 ];
