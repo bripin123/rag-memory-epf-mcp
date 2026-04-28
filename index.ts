@@ -80,8 +80,14 @@ interface Chunk {
   document_id: string;
   chunk_index: number;
   text: string;
+  // Char offsets into the source document.content (NULL for entity/relationship chunks
+  // that are synthesized rather than sliced from a document).
   start_pos: number;
   end_pos: number;
+  // Token-space offsets from the BPE tokenizer used by chunkText.
+  // NULL for entity/relationship chunks (no token-space concept).
+  start_token: number | null;
+  end_token: number | null;
   embedding?: Float32Array;
 }
 
@@ -1486,11 +1492,18 @@ class RAGKnowledgeGraphManager {
   // Slicing token arrays at arbitrary boundaries can leave incomplete UTF-8
   // prefix/suffix bytes, which TextDecoder replaces with U+FFFD (�). Trim the
   // incomplete sequences at chunk boundaries; overlap covers the removed bytes.
+  //
+  // Each chunk records both token-space offsets (start_token/end_token from the
+  // BPE encoder loop) and char-space offsets (start_pos/end_pos into the original
+  // text). Char offsets are recovered with indexOf using a running cursor at the
+  // previous chunk's start, so substr(text, start_pos, end_pos - start_pos)
+  // equals chunk.text. On a coincidental indexOf miss the char offsets are NULL.
   private chunkText(text: string, maxTokens = 800, overlap = 160): Chunk[] {
     if (!this.encoding) throw new Error('Tokenizer not initialized');
 
     const tokens = this.encoding.encode(text);
     const chunks: Chunk[] = [];
+    let charCursor = 0;
 
     for (let i = 0; i < tokens.length; i += maxTokens - overlap) {
       const chunkTokens = tokens.slice(i, i + maxTokens);
@@ -1501,13 +1514,38 @@ class RAGKnowledgeGraphManager {
       const safeBytes = trimIncompleteUtf8(decodedBytes, !isFirst, !isLast);
       const chunkText = new TextDecoder('utf-8').decode(safeBytes);
 
+      // Recover char-space offsets. First chunk is anchored at 0 because
+      // trimIncompleteUtf8 leaves the leading bytes intact when isFirst is true.
+      let startPos: number | null;
+      let endPos: number | null;
+      if (isFirst) {
+        startPos = 0;
+        endPos = chunkText.length;
+        charCursor = 0;
+      } else if (chunkText.length === 0) {
+        startPos = null;
+        endPos = null;
+      } else {
+        const idx = text.indexOf(chunkText, charCursor);
+        if (idx >= 0) {
+          startPos = idx;
+          endPos = idx + chunkText.length;
+          charCursor = idx;
+        } else {
+          startPos = null;
+          endPos = null;
+        }
+      }
+
       chunks.push({
         id: '',
         document_id: '',
         chunk_index: chunks.length,
         text: chunkText,
-        start_pos: i,
-        end_pos: i + chunkTokens.length
+        start_pos: startPos as number,
+        end_pos: endPos as number,
+        start_token: i,
+        end_token: i + chunkTokens.length
       });
     }
 
@@ -1570,7 +1608,7 @@ class RAGKnowledgeGraphManager {
     return { id, stored: true };
   }
 
-  async chunkDocument(documentId: string, options: { maxTokens?: number; overlap?: number } = {}): Promise<{ documentId: string; chunks: Array<{ id: string; text: string; startPos: number; endPos: number }> }> {
+  async chunkDocument(documentId: string, options: { maxTokens?: number; overlap?: number } = {}): Promise<{ documentId: string; chunks: Array<{ id: string; text: string; startPos: number | null; endPos: number | null; startToken: number | null; endToken: number | null }> }> {
     if (!this.db) throw new Error('Database not initialized');
     
     // Get document
@@ -1595,19 +1633,30 @@ class RAGKnowledgeGraphManager {
     
     for (const chunk of chunks) {
       const chunkId = `${documentId}_chunk_${chunk.chunk_index}`;
-      
+
       // Store chunk metadata (no embedding yet)
       this.db.prepare(`
         INSERT INTO chunk_metadata (
-          chunk_id, document_id, chunk_index, text, start_pos, end_pos
-        ) VALUES (?, ?, ?, ?, ?, ?)
-      `).run(chunkId, documentId, chunk.chunk_index, chunk.text, chunk.start_pos, chunk.end_pos);
-      
+          chunk_id, document_id, chunk_index, text, start_pos, end_pos, start_token, end_token
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        chunkId,
+        documentId,
+        chunk.chunk_index,
+        chunk.text,
+        chunk.start_pos,
+        chunk.end_pos,
+        chunk.start_token,
+        chunk.end_token
+      );
+
       resultChunks.push({
         id: chunkId,
         text: chunk.text,
         startPos: chunk.start_pos,
-        endPos: chunk.end_pos
+        endPos: chunk.end_pos,
+        startToken: chunk.start_token,
+        endToken: chunk.end_token
       });
     }
     
@@ -2183,6 +2232,8 @@ class RAGKnowledgeGraphManager {
           m.text,
           m.start_pos,
           m.end_pos,
+          m.start_token,
+          m.end_token,
           COALESCE(m.metadata, '{}') as chunk_metadata,
           c.distance,
           COALESCE(d.metadata, '{}') as doc_metadata
@@ -2201,8 +2252,10 @@ class RAGKnowledgeGraphManager {
         relationship_id: string | null;
         chunk_index: number;
         text: string;
-        start_pos: number;
-        end_pos: number;
+        start_pos: number | null;
+        end_pos: number | null;
+        start_token: number | null;
+        end_token: number | null;
         chunk_metadata: string;
         distance: number;
         doc_metadata: string;
@@ -2286,6 +2339,8 @@ class RAGKnowledgeGraphManager {
               cm.text,
               cm.start_pos,
               cm.end_pos,
+              cm.start_token,
+              cm.end_token,
               COALESCE(cm.metadata, '{}') as chunk_metadata,
               COALESCE(d.metadata, '{}') as doc_metadata
             FROM chunk_metadata cm

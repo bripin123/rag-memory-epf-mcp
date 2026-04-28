@@ -471,5 +471,86 @@ export const migrations: Migration[] = [
       db.exec(`DROP TABLE IF EXISTS entities_fts`);
       db.exec(`DROP TABLE IF EXISTS chunks_fts`);
     }
+  },
+
+  // Migration 9: Separate token-space vs char-space chunk offsets.
+  // Before this migration, chunk_metadata.start_pos/end_pos held *token* indices
+  // for document chunks (a leftover from the BPE tokenizer-based chunkText loop)
+  // but already held character lengths (0..text.length) for entity/relationship
+  // chunks. Same column, two meanings — and a column name (`*_pos`) that implies
+  // char offsets in `documents.content`. This migration adds explicit
+  // start_token/end_token columns and reinterprets start_pos/end_pos as character
+  // offsets going forward. Existing document chunks: token data is moved to the
+  // new columns and char offsets are recomputed from documents.content via
+  // indexOf with a running cursor (NULL on miss — caller can re-chunk to fill).
+  // Existing entity/relationship chunks: leave start_pos/end_pos as-is
+  // (already a valid 0..text.length char range against the chunk text itself);
+  // token columns stay NULL since these chunks have no token-space concept.
+  {
+    version: 9,
+    description: 'Add start_token/end_token; reinterpret start_pos/end_pos as char offsets',
+    up: (db) => {
+      // 1) Add columns
+      db.exec(`ALTER TABLE chunk_metadata ADD COLUMN start_token INTEGER`);
+      db.exec(`ALTER TABLE chunk_metadata ADD COLUMN end_token INTEGER`);
+
+      // 2) Move token data into new columns for document chunks
+      db.exec(`
+        UPDATE chunk_metadata
+          SET start_token = start_pos,
+              end_token = end_pos,
+              start_pos = NULL,
+              end_pos = NULL
+          WHERE chunk_type = 'document'
+      `);
+
+      // 3) Recompute char offsets via indexOf with a running cursor per document
+      const docRows = db.prepare(`
+        SELECT DISTINCT document_id FROM chunk_metadata
+          WHERE chunk_type = 'document' AND document_id IS NOT NULL
+      `).all() as Array<{ document_id: string }>;
+
+      const docContentStmt = db.prepare(`SELECT content FROM documents WHERE id = ?`);
+      const chunksStmt = db.prepare(`
+        SELECT rowid, text FROM chunk_metadata
+          WHERE document_id = ? AND chunk_type = 'document'
+          ORDER BY chunk_index ASC
+      `);
+      const updateStmt = db.prepare(`
+        UPDATE chunk_metadata SET start_pos = ?, end_pos = ? WHERE rowid = ?
+      `);
+
+      for (const { document_id } of docRows) {
+        const doc = docContentStmt.get(document_id) as { content: string } | undefined;
+        if (!doc) continue;
+        const content = doc.content;
+        const chunks = chunksStmt.all(document_id) as Array<{ rowid: number; text: string }>;
+        // Cursor advances by the previous chunk's *start*, not its end, so we can
+        // still locate overlapping chunks. Token-space stride guarantees each
+        // chunk's start is strictly forward of the previous chunk's start.
+        let cursor = 0;
+        for (const c of chunks) {
+          if (!c.text) continue;
+          const idx = content.indexOf(c.text, cursor);
+          if (idx >= 0) {
+            updateStmt.run(idx, idx + c.text.length, c.rowid);
+            cursor = idx;
+          }
+          // miss: leave NULL — caller can re-chunk to repair
+        }
+      }
+    },
+    down: (db) => {
+      // SQLite cannot DROP COLUMN cleanly. Best-effort: copy token data back into
+      // start_pos/end_pos for document chunks so a downgrade leaves the legacy
+      // token-space semantics in place.
+      db.exec(`
+        UPDATE chunk_metadata
+          SET start_pos = start_token, end_pos = end_token
+          WHERE chunk_type = 'document' AND start_token IS NOT NULL
+      `);
+      // start_token/end_token columns remain (no DROP COLUMN); they will be
+      // ignored by older code.
+    }
   }
 ];
