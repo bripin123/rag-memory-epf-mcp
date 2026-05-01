@@ -1,7 +1,25 @@
 {
   "name": "rag-memory-epf-mcp",
-  "version": "3.3.5",
-  "description": "MCP server for project-local RAG memory with knowledge graph and multilingual vector search",
+  "version": "3.3.6",
+  "description": "Project-local RAG memory MCP server — knowledge graph + multilingual vector + FTS5 in a single SQLite file. Per-project isolation, 30 MCP tools, codepoint-safe chunking (Korean/CJK/emoji).",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "rag",
+    "knowledge-graph",
+    "vector-search",
+    "fts5",
+    "sqlite",
+    "embeddings",
+    "bge-m3",
+    "multilingual",
+    "korean",
+    "claude-code",
+    "gemini-cli",
+    "codex-cli",
+    "memory",
+    "agent-memory"
+  ],
   "license": "MIT",
   "author": "bripin123",
   "homepage": "https://github.com/bripin123/rag-memory-epf-mcp",
@@ -21,7 +39,10 @@
   "scripts": {
     "build": "tsc && shx chmod +x dist/*.js",
     "prepare": "npm run build",
-    "watch": "tsc --watch"
+    "watch": "tsc --watch",
+    "verify:invariants": "node test/chunk-invariants.test.mjs",
+    "test": "npm run build && npm run verify:invariants",
+    "prepublishOnly": "npm run build && npm run verify:invariants"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.5.1",

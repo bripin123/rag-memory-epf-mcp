@@ -28,6 +28,9 @@ import { getAllMCPTools, validateToolArgs, getSystemInfo } from './src/tools/too
 
 // Import migration system
 import { MigrationManager } from './src/migrations/migration-manager.js';
+
+// Import chunk text algorithm (extracted for publish-time invariant testing)
+import { chunkText as splitTextIntoChunks } from './src/chunkText.js';
 import { migrations } from './src/migrations/migrations.js';
 import { createHash } from 'crypto';
 import { createRequire } from 'module';
@@ -149,30 +152,7 @@ interface DetailedContext {
 // When a chunk is not at the document head/tail, any partial sequence at that
 // edge belongs to an adjacent chunk and must be removed so TextDecoder does
 // not emit U+FFFD. Pass trimHead/trimTail=false to preserve head/tail bytes.
-function trimIncompleteUtf8(bytes: Uint8Array, trimHead: boolean, trimTail: boolean): Uint8Array {
-  let start = 0;
-  let end = bytes.length;
-
-  if (trimHead) {
-    while (start < end && (bytes[start] & 0xC0) === 0x80) start++;
-  }
-
-  if (trimTail) {
-    let i = end - 1;
-    while (i >= start && (bytes[i] & 0xC0) === 0x80) i--;
-    if (i >= start) {
-      const lead = bytes[i];
-      let needed = 1;
-      if ((lead & 0x80) === 0) needed = 1;
-      else if ((lead & 0xE0) === 0xC0) needed = 2;
-      else if ((lead & 0xF0) === 0xE0) needed = 3;
-      else if ((lead & 0xF8) === 0xF0) needed = 4;
-      if (end - i < needed) end = i;
-    }
-  }
-
-  return bytes.subarray(start, end);
-}
+// (Implementation moved to src/chunkText.ts for testability.)
 
 function safeRowid(value: unknown): number {
   const n = Number(value);
@@ -1503,63 +1483,17 @@ class RAGKnowledgeGraphManager {
   // are NULL.
   private chunkText(text: string, maxTokens = 800, overlap = 160): Chunk[] {
     if (!this.encoding) throw new Error('Tokenizer not initialized');
-
-    const tokens = this.encoding.encode(text);
-    const chunks: Chunk[] = [];
-    let utf16Cursor = 0;
-    let cpCursor = 0;
-
-    for (let i = 0; i < tokens.length; i += maxTokens - overlap) {
-      const chunkTokens = tokens.slice(i, i + maxTokens);
-      const decodedBytes = this.encoding.decode(chunkTokens);
-
-      const isFirst = i === 0;
-      const isLast = i + chunkTokens.length >= tokens.length;
-      const safeBytes = trimIncompleteUtf8(decodedBytes, !isFirst, !isLast);
-      const chunkText = new TextDecoder('utf-8').decode(safeBytes);
-
-      let startPos: number | null;
-      let endPos: number | null;
-      if (isFirst) {
-        startPos = 0;
-        endPos = [...chunkText].length;
-        utf16Cursor = 0;
-        cpCursor = 0;
-      } else if (chunkText.length === 0) {
-        startPos = null;
-        endPos = null;
-      } else {
-        const utfIdx = text.indexOf(chunkText, utf16Cursor);
-        if (utfIdx >= 0) {
-          // Advance cpCursor by codepoints between the previous cursor and the
-          // new chunk's start (handles overlap by anchoring at the previous
-          // chunk's start, not its end).
-          if (utfIdx > utf16Cursor) {
-            cpCursor += [...text.slice(utf16Cursor, utfIdx)].length;
-            utf16Cursor = utfIdx;
-          }
-          const cpLen = [...chunkText].length;
-          startPos = cpCursor;
-          endPos = cpCursor + cpLen;
-        } else {
-          startPos = null;
-          endPos = null;
-        }
-      }
-
-      chunks.push({
-        id: '',
-        document_id: '',
-        chunk_index: chunks.length,
-        text: chunkText,
-        start_pos: startPos as number,
-        end_pos: endPos as number,
-        start_token: i,
-        end_token: i + chunkTokens.length
-      });
-    }
-
-    return chunks;
+    const segments = splitTextIntoChunks(text, this.encoding, maxTokens, overlap);
+    return segments.map((seg, idx) => ({
+      id: '',
+      document_id: '',
+      chunk_index: idx,
+      text: seg.text,
+      start_pos: seg.start_pos as number,
+      end_pos: seg.end_pos as number,
+      start_token: seg.start_token,
+      end_token: seg.end_token
+    }));
   }
 
   // Generate embeddings using sentence transformers
