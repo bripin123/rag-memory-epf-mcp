@@ -1,6 +1,6 @@
 {
   "name": "rag-memory-epf-mcp",
-  "version": "3.3.6",
+  "version": "3.4.0",
   "description": "Project-local RAG memory MCP server — knowledge graph + multilingual vector + FTS5 in a single SQLite file. Per-project isolation, 30 MCP tools, codepoint-safe chunking (Korean/CJK/emoji).",
   "keywords": [
     "mcp",

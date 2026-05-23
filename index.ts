@@ -1534,9 +1534,65 @@ class RAGKnowledgeGraphManager {
 
   // === NEW SEPARATE TOOLS ===
 
+  async syncDocumentFromFile(
+    filePath: string,
+    documentId: string,
+    options: {
+      metadata?: Record<string, any>;
+      content?: string;
+      entityNames?: string[];
+      chunkParams?: { maxTokens?: number; overlap?: number };
+    } = {}
+  ): Promise<{ documentId: string; bytes: number; chunks: number; embeddedChunks: number; linkedEntities: number; explicitlyLinked?: number; warning?: string }> {
+    if (!this.db) throw new Error('Database not initialized');
+
+    // 1. Resolve content: raw file verbatim (default) or explicit override.
+    //    Content is read on the server and never routed through the model context.
+    const content = options.content !== undefined
+      ? options.content
+      : fsSync.readFileSync(filePath, 'utf-8');
+    const bytes = Buffer.byteLength(content, 'utf-8');
+
+    // 2. Metadata: default source=path, updated=today (YYYY-MM-DD); caller can override either.
+    const today = new Date().toISOString().slice(0, 10);
+    const metadata = { source: filePath, updated: today, ...(options.metadata || {}) };
+
+    console.error(`🔄 syncDocumentFromFile: ${documentId} <- ${filePath} (${bytes} bytes)`);
+
+    // 3. delete -> store -> chunk -> embed, reusing the existing pipeline methods.
+    await this.deleteDocuments(documentId);
+    await this.storeDocument(documentId, content, metadata);
+    const chunkResult = await this.chunkDocument(documentId, options.chunkParams || {});
+    const embedResult = await this.embedChunks(documentId);
+
+    // 4. Optional explicit entity links (in addition to auto term-matching in embedChunks).
+    let explicitlyLinked: number | undefined;
+    if (options.entityNames && options.entityNames.length > 0) {
+      const linkResult = await this.linkEntitiesToDocument(documentId, options.entityNames);
+      explicitlyLinked = linkResult.linkedEntities;
+    }
+
+    const linkedEntities = embedResult.linkedEntities ?? 0;
+
+    // 5. Terse summary only (no chunk text / content echo) to keep caller context flat.
+    const result: { documentId: string; bytes: number; chunks: number; embeddedChunks: number; linkedEntities: number; explicitlyLinked?: number; warning?: string } = {
+      documentId,
+      bytes,
+      chunks: chunkResult.chunks.length,
+      embeddedChunks: embedResult.embeddedChunks,
+      linkedEntities,
+      ...(explicitlyLinked !== undefined ? { explicitlyLinked } : {}),
+    };
+    if (linkedEntities === 0 && explicitlyLinked === undefined) {
+      result.warning = 'linkedEntities=0: ensure the file content contains entity-name literals (e.g. a wiki anchor line "RAG entity: ...") so term-matching can link entities.';
+    }
+    console.error(`✅ syncDocumentFromFile done: ${documentId} (${result.chunks} chunks, ${result.embeddedChunks} embedded, ${linkedEntities} linked)`);
+    return result;
+  }
+
   async storeDocument(id: string, content: string, metadata: Record<string, any> = {}): Promise<{ id: string; stored: boolean }> {
     if (!this.db) throw new Error('Database not initialized');
-    
+
     console.error(`📄 Storing document: ${id}`);
     
     // Clean up existing document
@@ -3076,7 +3132,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.deleteDocuments((validatedArgs as any).documentIds as string | string[]), null, 2) }] };
       case "listDocuments":
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.listDocuments((validatedArgs as any).includeMetadata !== false), null, 2) }] };
-      
+      case "syncDocumentFromFile":
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.syncDocumentFromFile(
+          (validatedArgs as any).path as string,
+          (validatedArgs as any).documentId as string,
+          {
+            metadata: (validatedArgs as any).metadata,
+            content: (validatedArgs as any).content,
+            entityNames: (validatedArgs as any).entityNames,
+            chunkParams: (validatedArgs as any).chunkParams,
+          }
+        ), null, 2) }] };
+
       // NEW: Entity embedding tools
       case "embedAllEntities":
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.embedAllEntities(), null, 2) }] };

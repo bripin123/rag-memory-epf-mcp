@@ -558,6 +558,98 @@ export const listDocumentsTool: ToolDefinition = {
   annotations: { readOnlyHint: true },
 };
 
+// === SYNC DOCUMENT FROM FILE TOOL ===
+
+const syncDocumentFromFileCapability: ToolCapabilityInfo = {
+  description: 'Read a file server-side and run the full document sync pipeline (delete, store, chunk, embed, link) in one call, returning only a terse summary',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: {
+        type: 'string',
+        description: 'Absolute path of the file to sync. Content is read server-side and never routed through the model context.'
+      },
+      documentId: {
+        type: 'string',
+        description: 'RAG document ID to (re)create from the file'
+      },
+      metadata: {
+        type: 'object',
+        description: 'Metadata merged into the stored document (source defaults to path, updated defaults to today)',
+        additionalProperties: true,
+        optional: true
+      },
+      content: {
+        type: 'string',
+        description: 'Optional content override; if provided, this is stored instead of reading the file',
+        optional: true
+      },
+      entityNames: {
+        type: 'array',
+        description: 'Optional entities to explicitly link in addition to automatic term-matching',
+        items: { type: 'string' },
+        optional: true
+      },
+      chunkParams: {
+        type: 'object',
+        description: 'Optional chunking parameters { maxTokens, overlap }',
+        additionalProperties: true,
+        optional: true
+      }
+    },
+    required: ['path', 'documentId'],
+  },
+};
+
+const syncDocumentFromFileDescription: ToolRegistrationDescription = () => `<description>
+Read a file on the server and perform the entire document sync pipeline in a single call:
+deleteDocuments -> storeDocument -> chunkDocument -> embedChunks -> (optional) linkEntitiesToDocument.
+**The file content is read server-side and is NOT routed through the model context**, and only a
+terse summary is returned (no chunk text). This collapses the usual 5 tool calls per document into
+one and keeps the conversation context flat, which is the dominant cost of large /sync runs.
+</description>
+
+<importantNotes>
+- (!important!) **Content is read from \`path\` on the server** - it does not pass through the model context
+- (!important!) **Stores the raw file verbatim** by default (higher search fidelity); pass \`content\` to override
+- (!important!) **Idempotent** - the target documentId is fully re-synced (delete + recreate) each call
+- (!important!) **Returns terse counts only** - { documentId, bytes, chunks, embeddedChunks, linkedEntities }
+- (!important!) **Entity linking** happens automatically via term-matching during embedding; \`entityNames\` adds explicit links
+</importantNotes>
+
+<whenToUseThisTool>
+- During /sync to persist a Markdown/SSOT file into the RAG store without paying the context cost of reading it into the model
+- When re-syncing decision logs, current-focus, wiki pages, or any file-backed document
+- As a one-call replacement for the manual storeDocument + chunkDocument + embedChunks + linkEntitiesToDocument sequence
+</whenToUseThisTool>
+
+<bestPractices>
+- Use the document's canonical ID (e.g. \`current-focus\`, \`wiki-project-context\`)
+- Keep an entity-name literal (e.g. wiki anchor line "RAG entity: ...") in the file so term-matching can link entities; a warning is returned if linkedEntities is 0
+- Pass \`metadata.updated\` (YYYY-MM-DD) for change tracking
+</bestPractices>
+
+<examples>
+- Sync current-focus: {"path": "/abs/decisions/current-focus.md", "documentId": "current-focus", "metadata": {"updated": "2026-05-23"}}
+- With explicit links: {"path": "/abs/wiki/project-context.md", "documentId": "wiki-project-context", "entityNames": ["Ultimate AI Personal Assistant"]}
+</examples>`;
+
+const syncDocumentFromFileSchema: z.ZodRawShape = {
+  path: z.string().describe('Absolute path of the file to sync (read server-side)'),
+  documentId: z.string().describe('RAG document ID to (re)create from the file'),
+  metadata: z.record(z.any()).optional().describe('Metadata merged into the stored document'),
+  content: z.string().optional().describe('Optional content override; stored instead of reading the file'),
+  entityNames: z.array(z.string()).optional().describe('Optional entities to explicitly link'),
+  chunkParams: z.record(z.any()).optional().describe('Optional chunking parameters { maxTokens, overlap }'),
+};
+
+export const syncDocumentFromFileTool: ToolDefinition = {
+  capability: syncDocumentFromFileCapability,
+  description: syncDocumentFromFileDescription,
+  schema: syncDocumentFromFileSchema,
+  annotations: { idempotentHint: true },
+};
+
 // Export all RAG tools
 export const ragTools = {
   storeDocument: storeDocumentTool,
@@ -568,4 +660,5 @@ export const ragTools = {
   getKnowledgeGraphStats: getKnowledgeGraphStatsTool,
   deleteDocuments: deleteDocumentsTool,
   listDocuments: listDocumentsTool,
-}; 
+  syncDocumentFromFile: syncDocumentFromFileTool,
+};
