@@ -13,7 +13,7 @@ A **project-local RAG memory** MCP server — knowledge graph + multilingual vec
 - **3-signal hybrid search** — vector similarity (bge-m3, 1024-dim) + FTS5 BM25 keyword matching + knowledge graph re-ranking, combined via Reciprocal Rank Fusion
 - **100+ languages** — Korean, Chinese, Japanese, Arabic, and more. Cross-lingual search works out of the box.
 - **Graph-aware scoring** — per-entity geometric decay (0.5^i) with hard cap prevents any single document from dominating results
-- **30 MCP tools** — knowledge graph CRUD, document pipeline, hybrid search, multi-hop traversal, graph analytics (centrality / community detection / structure), export/import, temporal queries
+- **31 MCP tools** — knowledge graph CRUD, document pipeline, hybrid search, multi-hop traversal, graph analytics (centrality / community detection / structure), export/import, temporal queries
 - **Codepoint-safe chunking** — chunk offsets are Unicode codepoints, language-neutral across SQL `substr`, Python slicing, and JS `[...str]` iteration. Korean/CJK/emoji documents stay aligned. Verified by a publish-time invariant test.
 - **SQLite optimized** — WAL mode, 32MB cache, 256MB mmap, FTS5 triggers, 7 indexes
 - **MCP SDK 1.27.1** — Tool Annotations (readOnly/destructive/idempotent), latest protocol 2025-11-25
@@ -36,7 +36,7 @@ A **project-local RAG memory** MCP server — knowledge graph + multilingual vec
 
 Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each project maintains completely isolated memory.
 
-## Tools (30)
+## Tools (31)
 
 ### Knowledge Graph (7)
 | Tool | Description | Annotation |
@@ -49,7 +49,7 @@ Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each 
 | `deleteRelations` | Remove specific relationships | destructive |
 | `deleteObservations` | Remove specific observations | destructive |
 
-### Document Pipeline (8)
+### Document Pipeline (9)
 | Tool | Description | Annotation |
 |------|------------|------------|
 | `storeDocument` | Store documents with metadata | idempotent |
@@ -60,6 +60,7 @@ Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each 
 | `linkEntitiesToDocument` | Link entities to chunks where they actually appear (text-matched) | idempotent |
 | `deleteDocuments` | Remove documents and associated data | destructive |
 | `listDocuments` | View all stored documents | readOnly |
+| `syncDocumentFromFile` | One-call server-side sync: reads file + delete/store/chunk/embed/link, content stays off model context | idempotent |
 
 ### Search & Retrieval (9)
 | Tool | Description | Annotation |
@@ -135,6 +136,9 @@ storeDocument(id, content, metadata)
 | `EMBEDDING_MODEL` | `Xenova/bge-m3` | HuggingFace model ID for embeddings |
 
 ## Changelog
+
+### v3.4.0
+- **`syncDocumentFromFile`: one-call server-side document sync** - reads a file on the server and runs the full pipeline (`deleteDocuments` → `storeDocument` → `chunkDocument` → `embedChunks` → `linkEntitiesToDocument`) in a single call, returning only a terse summary `{ documentId, bytes, chunks, embeddedChunks, linkedEntities, warning? }`. File content is read server-side and never routed through the model context, collapsing the usual 5 tool calls per document into one and keeping conversation context flat (the dominant cost of large sync runs). 30 → 31 tools.
 
 ### v3.3.6
 - **Publish-time invariant test** — `npm run verify:invariants` (wired as `prepublishOnly`) catches `chunkText` offset regressions before they ship. Tests ASCII / Korean / emoji-heavy / mixed CJK + supplementary plane / pure supplementary inputs against the codepoint-slice contract.
