@@ -1547,7 +1547,7 @@ export class RAGKnowledgeGraphManager {
       entityNames?: string[];
       chunkParams?: { maxTokens?: number; overlap?: number };
     } = {}
-  ): Promise<{ documentId: string; bytes: number; chunks: number; embeddedChunks: number; linkedEntities: number; explicitlyLinked?: number; warning?: string }> {
+  ): Promise<{ documentId: string; bytes: number; chunks: number; embeddedChunks: number; linkedEntities: number; explicitlyLinked?: number; warning?: string; skipped?: boolean; reason?: string }> {
     if (!this.db) throw new Error('Database not initialized');
 
     // 1. Resolve content: raw file verbatim (default) or explicit override.
@@ -1563,27 +1563,63 @@ export class RAGKnowledgeGraphManager {
 
     console.error(`🔄 syncDocumentFromFile: ${documentId} <- ${filePath} (${bytes} bytes)`);
 
-    // 3. delete -> store -> chunk -> embed, reusing the existing pipeline methods.
-    await this.deleteDocuments(documentId);
-    await this.storeDocument(documentId, content, metadata);
-    const chunkResult = await this.chunkDocument(documentId, options.chunkParams || {});
-    const embedResult = await this.embedChunks(documentId);
+    // 3. Pre-compute chunks + embeddings BEFORE any DB mutation. If embedding
+    //    throws (model down), the existing document is left completely intact.
+    const { maxTokens = 800, overlap = 160 } = options.chunkParams || {};
+    const segments = this.chunkText(content, maxTokens, overlap);
+    const embedded: Array<{ seg: typeof segments[number]; embedding: Float32Array }> = [];
+    for (const seg of segments) {
+      const embedding = await this.generateEmbedding(seg.text);
+      embedded.push({ seg, embedding });
+    }
 
-    // 4. Optional explicit entity links (in addition to auto term-matching in embedChunks).
+    // 4. Atomic swap: delete old -> insert doc -> insert chunks + embeddings,
+    //    all in a single synchronous better-sqlite3 transaction (all-or-nothing).
+    const applyTx = this.db.transaction(() => {
+      const db = this.db!;
+      // 4a. cleanup old doc (inlined sync version of cleanupDocument).
+      const existing = db.prepare(`SELECT rowid FROM chunk_metadata WHERE document_id = ?`).all(documentId) as { rowid: number }[];
+      for (const ch of existing) {
+        db.prepare(`DELETE FROM chunk_entities WHERE chunk_rowid = ?`).run(ch.rowid);
+        db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(ch.rowid)}`);
+      }
+      db.prepare(`DELETE FROM chunk_metadata WHERE document_id = ?`).run(documentId);
+      db.prepare(`DELETE FROM documents WHERE id = ?`).run(documentId);
+
+      // 4b. insert document.
+      db.prepare(`INSERT INTO documents (id, content, metadata) VALUES (?, ?, ?)`)
+        .run(documentId, content, JSON.stringify(metadata));
+
+      // 4c. insert chunk_metadata (FTS5 chunks_fts auto-filled by trigger) + embeddings.
+      for (const { seg, embedding } of embedded) {
+        const chunkId = `${documentId}_chunk_${seg.chunk_index}`;
+        const info = db.prepare(`
+          INSERT INTO chunk_metadata (chunk_id, document_id, chunk_index, text, start_pos, end_pos, start_token, end_token)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(chunkId, documentId, seg.chunk_index, seg.text, seg.start_pos, seg.end_pos, seg.start_token, seg.end_token);
+        const rowid = Number(info.lastInsertRowid);
+        db.prepare(`INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)`).run(Buffer.from(embedding.buffer));
+      }
+    });
+    applyTx();
+
+    const embeddedChunks = embedded.length;
+
+    // 5. Entity linking AFTER commit. Non-destructive + idempotent (INSERT OR
+    //    IGNORE), so a linking failure cannot corrupt the doc/embeddings.
+    const linkedEntities = await this.autoLinkEntities(documentId);
     let explicitlyLinked: number | undefined;
     if (options.entityNames && options.entityNames.length > 0) {
       const linkResult = await this.linkEntitiesToDocument(documentId, options.entityNames);
       explicitlyLinked = linkResult.linkedEntities;
     }
 
-    const linkedEntities = embedResult.linkedEntities ?? 0;
-
-    // 5. Terse summary only (no chunk text / content echo) to keep caller context flat.
-    const result: { documentId: string; bytes: number; chunks: number; embeddedChunks: number; linkedEntities: number; explicitlyLinked?: number; warning?: string } = {
+    // 6. Terse summary only (no chunk text / content echo) to keep caller context flat.
+    const result: { documentId: string; bytes: number; chunks: number; embeddedChunks: number; linkedEntities: number; explicitlyLinked?: number; warning?: string; skipped?: boolean; reason?: string } = {
       documentId,
       bytes,
-      chunks: chunkResult.chunks.length,
-      embeddedChunks: embedResult.embeddedChunks,
+      chunks: segments.length,
+      embeddedChunks,
       linkedEntities,
       ...(explicitlyLinked !== undefined ? { explicitlyLinked } : {}),
     };
