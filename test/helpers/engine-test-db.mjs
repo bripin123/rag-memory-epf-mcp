@@ -36,6 +36,7 @@ export function installFakeEmbedder(manager) {
 export function simulateModelDown(manager) {
   manager.embeddingModel = null;
   manager.modelInitialized = false;
+  manager.embeddingCache = new Map(); // drop cached query embeddings so the down path is actually exercised
 }
 
 function assert(cond, msg) {

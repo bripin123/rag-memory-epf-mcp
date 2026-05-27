@@ -128,6 +128,7 @@ interface EnhancedSearchResult {
   full_context_available: boolean;
   chunk_type: 'document' | 'entity' | 'relationship'; // NEW: Indicates the source type
   source_id?: string; // NEW: ID of the source entity/relationship if applicable
+  search_mode?: 'hybrid' | 'fts-only'; // NEW: 'fts-only' when vector/embedding degraded
 }
 
 // NEW: Interface for detailed context retrieval
@@ -2280,7 +2281,8 @@ export class RAGKnowledgeGraphManager {
     if (queryVariants.length > 1) {
       console.error(`🌐 Cross-lingual variants: ${queryVariants.slice(1).join(' | ')}`);
     }
-    const primaryQueryEmbedding = await this.generateEmbedding(queryVariants[0], 1024, true);
+    let vectorDegraded = false;
+    let primaryQueryEmbedding: Float32Array | null = null;
 
     // Vector search helper
     const searchChunks = (embedding: Float32Array, k: number) => {
@@ -2330,15 +2332,21 @@ export class RAGKnowledgeGraphManager {
 
     // Search original query plus cross-lingual expansions and keep best match per chunk.
     const resultMap = new Map<string, ChunkSearchResult>();
-    for (const variant of queryVariants) {
-      const embedding = await this.generateEmbedding(variant, 1024, true);
-      const variantResults = searchChunks(embedding, limit * 3);
-      for (const r of variantResults) {
-        const existing = resultMap.get(r.chunk_id);
-        if (!existing || r.distance < existing.distance) {
-          resultMap.set(r.chunk_id, r);
+    try {
+      primaryQueryEmbedding = await this.generateEmbedding(queryVariants[0], 1024, true);
+      for (const variant of queryVariants) {
+        const embedding = await this.generateEmbedding(variant, 1024, true);
+        const variantResults = searchChunks(embedding, limit * 3);
+        for (const r of variantResults) {
+          const existing = resultMap.get(r.chunk_id);
+          if (!existing || r.distance < existing.distance) {
+            resultMap.set(r.chunk_id, r);
+          }
         }
       }
+    } catch (embErr) {
+      vectorDegraded = true;
+      console.error(`⚠️ Vector search unavailable (embedding model down) — degrading to FTS5-only:`, embErr instanceof Error ? embErr.message : embErr);
     }
     const vectorResults = Array.from(resultMap.values()).sort((a, b) => a.distance - b.distance);
 
@@ -2435,7 +2443,7 @@ export class RAGKnowledgeGraphManager {
     // Get entity information for graph enhancement via vector similarity
     let connectedEntities = new Set<string>();
     let queryMatchedEntities = new Set<string>();
-    if (useGraph) {
+    if (useGraph && !vectorDegraded) {
       // Vector search: find entities semantically similar to the query (dual search)
       try {
         const searchEntities = (embedding: Float32Array) => {
@@ -2545,7 +2553,7 @@ export class RAGKnowledgeGraphManager {
       
       // Enhanced graph boost calculation with decay + cap
       let graphBoost = 0;
-      if (useGraph) {
+      if (useGraph && !vectorDegraded) {
         const queryEntities = this.extractTermsFromText(query);
 
         // Base boost for knowledge graph chunks
@@ -2594,13 +2602,20 @@ export class RAGKnowledgeGraphManager {
         graphBoost += Math.min(entityBoost, 0.4);
       }
       
-      // Generate semantic summary
-      const { summary, keyHighlight, relevanceScore } = await this.generateContentSummary(
-        result.text,
-        primaryQueryEmbedding,
-        chunkEntities,
-        result.chunk_type === 'relationship' ? 1 : 2 // Shorter summary for relationships
-      );
+      // Generate semantic summary (skip when degraded — no embeddings available).
+      let summary: string, keyHighlight: string, relevanceScore: number;
+      if (vectorDegraded || !primaryQueryEmbedding) {
+        keyHighlight = result.text.slice(0, 150);
+        summary = result.text.slice(0, 300);
+        relevanceScore = 0;
+      } else {
+        ({ summary, keyHighlight, relevanceScore } = await this.generateContentSummary(
+          result.text,
+          primaryQueryEmbedding,
+          chunkEntities,
+          result.chunk_type === 'relationship' ? 1 : 2 // Shorter summary for relationships
+        ));
+      }
       
       const vectorSimilarity = Math.max(0, 1 - result.distance / 2);
       const ftsBoost = ftsBoostMap.get(result.chunk_id) || 0;
@@ -2633,11 +2648,12 @@ export class RAGKnowledgeGraphManager {
         document_title: documentTitle,
         entities: chunkEntities,
         vector_similarity: vectorSimilarity,
-        graph_boost: useGraph ? graphBoost : undefined,
+        graph_boost: (useGraph && !vectorDegraded) ? graphBoost : undefined,
         fts_boost: ftsBoost > 0 ? ftsBoost : undefined,
         full_context_available: true,
         chunk_type: result.chunk_type as 'document' | 'entity' | 'relationship',
-        source_id: sourceId
+        source_id: sourceId,
+        search_mode: vectorDegraded ? 'fts-only' : 'hybrid'
       });
     }
     
