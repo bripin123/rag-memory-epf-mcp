@@ -1557,9 +1557,33 @@ export class RAGKnowledgeGraphManager {
       : fsSync.readFileSync(filePath, 'utf-8');
     const bytes = Buffer.byteLength(content, 'utf-8');
 
-    // 2. Metadata: default source=path, updated=today (YYYY-MM-DD); caller can override either.
+    // 2. Metadata: default source=path, updated=today, content_hash; caller can override.
     const today = new Date().toISOString().slice(0, 10);
-    const metadata = { source: filePath, updated: today, ...(options.metadata || {}) };
+    const contentHash = createHash('sha256').update(content).digest('hex');
+    const metadata = { source: filePath, updated: today, content_hash: contentHash, ...(options.metadata || {}) };
+
+    // 2b. Dedup gate: skip the full delete/store/chunk/embed pipeline when the
+    //     file is unchanged AND the existing document is fully embedded. The
+    //     completeness check avoids wrongly skipping a partial/failed prior sync.
+    const existingDoc = this.db.prepare(`SELECT metadata FROM documents WHERE id = ?`).get(documentId) as { metadata: string } | undefined;
+    if (existingDoc) {
+      let existingHash: string | undefined;
+      try { existingHash = JSON.parse(existingDoc.metadata)?.content_hash; } catch { /* ignore */ }
+      if (existingHash === contentHash) {
+        const cmCount = (this.db.prepare(`SELECT count(*) AS n FROM chunk_metadata WHERE document_id = ?`).get(documentId) as { n: number }).n;
+        const embCount = (this.db.prepare(`
+          SELECT count(*) AS n FROM chunks c JOIN chunk_metadata m ON c.rowid = m.rowid WHERE m.document_id = ?
+        `).get(documentId) as { n: number }).n;
+        if (cmCount > 0 && cmCount === embCount) {
+          const linked = (this.db.prepare(`
+            SELECT count(DISTINCT ce.entity_id) AS n FROM chunk_entities ce
+            JOIN chunk_metadata m ON ce.chunk_rowid = m.rowid WHERE m.document_id = ?
+          `).get(documentId) as { n: number }).n;
+          console.error(`⏭️  syncDocumentFromFile: ${documentId} unchanged (hash match, ${cmCount} chunks embedded) — skipped`);
+          return { documentId, bytes, chunks: cmCount, embeddedChunks: embCount, linkedEntities: linked, skipped: true, reason: 'unchanged' };
+        }
+      }
+    }
 
     console.error(`🔄 syncDocumentFromFile: ${documentId} <- ${filePath} (${bytes} bytes)`);
 
