@@ -1,7 +1,6 @@
-# Database files
-**/*.db
-**/*.sqlite
-**/*.sqlite3
+# Database files (incl. SQLite WAL/SHM sidecars: *.db-wal, *.db-shm)
+**/*.db*
+**/*.sqlite*
 
 # Source files
 src/
