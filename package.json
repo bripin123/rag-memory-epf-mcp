@@ -1,6 +1,6 @@
 {
   "name": "rag-memory-epf-mcp",
-  "version": "3.4.0",
+  "version": "3.5.0",
   "description": "Project-local RAG memory MCP server — knowledge graph + multilingual vector + FTS5 in a single SQLite file. Per-project isolation, 30 MCP tools, codepoint-safe chunking (Korean/CJK/emoji).",
   "keywords": [
     "mcp",
@@ -41,8 +41,9 @@
     "prepare": "npm run build",
     "watch": "tsc --watch",
     "verify:invariants": "node test/chunk-invariants.test.mjs",
-    "test": "npm run build && npm run verify:invariants",
-    "prepublishOnly": "npm run build && npm run verify:invariants"
+    "verify:engine": "node test/engine-smoke.test.mjs && node test/sync-atomicity.test.mjs && node test/dedup.test.mjs && node test/search-degradation.test.mjs",
+    "test": "npm run build && npm run verify:invariants && npm run verify:engine",
+    "prepublishOnly": "npm run build && npm run verify:invariants && npm run verify:engine"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.5.1",

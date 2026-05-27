@@ -60,12 +60,12 @@ Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each 
 | `linkEntitiesToDocument` | Link entities to chunks where they actually appear (text-matched) | idempotent |
 | `deleteDocuments` | Remove documents and associated data | destructive |
 | `listDocuments` | View all stored documents | readOnly |
-| `syncDocumentFromFile` | One-call server-side sync: reads file + delete/store/chunk/embed/link, content stays off model context | idempotent |
+| `syncDocumentFromFile` | One-call server-side sync: reads file + delete/store/chunk/embed/link, content stays off model context. Atomic (embed-first transaction swap) + `content_hash` dedup (skips unchanged files) | idempotent |
 
 ### Search & Retrieval (9)
 | Tool | Description | Annotation |
 |------|------------|------------|
-| `hybridSearch` | Vector + FTS5 BM25 + graph traversal (3-signal) | readOnly |
+| `hybridSearch` | Vector + FTS5 BM25 + graph traversal (3-signal). Degrades to FTS5-only (`search_mode`) when the embedding model is down | readOnly |
 | `searchNodes` | Semantic entity search with `since`/`until` temporal filtering | readOnly |
 | `openNodes` | Retrieve specific entities by name | readOnly |
 | `readGraph` | Get complete knowledge graph | readOnly |
@@ -136,6 +136,11 @@ storeDocument(id, content, metadata)
 | `EMBEDDING_MODEL` | `Xenova/bge-m3` | HuggingFace model ID for embeddings |
 
 ## Changelog
+
+### v3.5.0
+- **Atomic `syncDocumentFromFile`**: embeddings are computed before any DB write, then applied in a single synchronous transaction, so a failed embedding (e.g. model still loading) leaves the existing document fully intact instead of a half-deleted or partially-embedded state.
+- **`content_hash` dedup**: unchanged files short-circuit the delete/chunk/embed pipeline (`skipped: true`), with a completeness gate that still re-processes a partially-embedded document.
+- **FTS5-only graceful degradation**: when the embedding model is unavailable, `hybridSearch` returns BM25 (full-text) results tagged `search_mode: 'fts-only'` instead of failing the whole query.
 
 ### v3.4.0
 - **`syncDocumentFromFile`: one-call server-side document sync** - reads a file on the server and runs the full pipeline (`deleteDocuments` → `storeDocument` → `chunkDocument` → `embedChunks` → `linkEntitiesToDocument`) in a single call, returning only a terse summary `{ documentId, bytes, chunks, embeddedChunks, linkedEntities, warning? }`. File content is read server-side and never routed through the model context, collapsing the usual 5 tool calls per document into one and keeping conversation context flat (the dominant cost of large sync runs). 30 → 31 tools.
