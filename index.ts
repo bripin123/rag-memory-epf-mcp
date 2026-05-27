@@ -163,7 +163,7 @@ function safeRowid(value: unknown): number {
 }
 
 // Enhanced RAG-enabled Knowledge Graph Manager
-class RAGKnowledgeGraphManager {
+export class RAGKnowledgeGraphManager {
   private db: Database.Database | null = null;
   private encoding: any = null;
   private embeddingModel: any = null;
@@ -172,7 +172,7 @@ class RAGKnowledgeGraphManager {
   private readonly EMBEDDING_CACHE_MAX = 500;
   private dictionaryCache: { nativeToEn: Record<string, string>; enToNative: Record<string, string> } | null = null;
 
-  async initialize() {
+  async initialize(opts: { skipModel?: boolean } = {}) {
     console.error('🚀 Initializing RAG Knowledge Graph MCP Server...');
 
     // Initialize database
@@ -193,8 +193,12 @@ class RAGKnowledgeGraphManager {
     // Initialize tiktoken
     this.encoding = get_encoding("cl100k_base");
 
-    // Initialize embedding model
-    await this.initializeEmbeddingModel();
+    // Initialize embedding model (skippable for tests / FTS-only environments)
+    if (!opts.skipModel) {
+      await this.initializeEmbeddingModel();
+    } else {
+      console.error('⏭️  Skipping embedding model load (skipModel=true)');
+    }
 
     // Run database migrations
     await this.runMigrations();
@@ -3206,8 +3210,12 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error("Fatal error in main():", error);
-  ragKgManager.cleanup();
-  process.exit(1);
-});
+// Only boot the server when run as the entry point — not when imported (tests).
+const isDirectRun = process.argv[1] === fileURLToPath(import.meta.url);
+if (isDirectRun) {
+  main().catch((error) => {
+    console.error("Fatal error in main():", error);
+    ragKgManager.cleanup();
+    process.exit(1);
+  });
+}
