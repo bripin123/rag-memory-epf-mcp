@@ -3286,9 +3286,12 @@ async function main() {
   }
 }
 
-// Only boot the server when run as the entry point — not when imported (tests).
-const isDirectRun = process.argv[1] === fileURLToPath(import.meta.url);
-if (isDirectRun) {
+// Boot the server unless explicitly suppressed. Tests import this module with
+// RAG_MEMORY_NO_AUTOSTART=1 to access the class without starting the stdio server.
+// (An argv-vs-import.meta.url comparison is unreliable: npx/bin launches the entry
+// via a symlinked path, so the two never match and main() silently skips → the
+// MCP client cannot connect. v3.5.0 shipped that bug; env-var opt-out is robust.)
+if (process.env.RAG_MEMORY_NO_AUTOSTART !== '1') {
   main().catch((error) => {
     console.error("Fatal error in main():", error);
     ragKgManager.cleanup();

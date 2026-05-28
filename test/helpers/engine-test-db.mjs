@@ -10,6 +10,7 @@ export async function makeManager() {
   const dir = mkdtempSync(join(tmpdir(), 'ragmem-test-'));
   const dbPath = join(dir, 'test.db');
   process.env.DB_FILE_PATH = dbPath;           // must be set BEFORE the import below
+  process.env.RAG_MEMORY_NO_AUTOSTART = '1';   // suppress stdio server boot on import
   const mod = await import('../../dist/index.js');
   const manager = new mod.RAGKnowledgeGraphManager();
   await manager.initialize({ skipModel: true }); // DB + migrations, NO embedding model
