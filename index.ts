@@ -893,9 +893,22 @@ export class RAGKnowledgeGraphManager {
   // === NEW RAG FUNCTIONALITY ===
 
   // Generate embedding text for an entity (identity + newest observations within a char budget).
+  private generateEntityEmbeddingText(entity: { name: string; entityType: string; observations: string[] }): string {
+    return this.buildEntityEmbeddingText(entity).text;
+  }
+
+  // Build entity embedding text plus stats for instrumentation.
   // The char budget keeps the entity vector representative of CURRENT state and stays under the
   // bge-m3 8192-token ceiling; older history lives in RAG document chunks / dated entities.
-  private generateEntityEmbeddingText(entity: { name: string; entityType: string; observations: string[] }): string {
+  // Returns selected/total observation counts and filtered (pre-cap) vs capped observation char
+  // sizes so callers can log truncation accurately (identity prefix is excluded from these sizes).
+  private buildEntityEmbeddingText(entity: { name: string; entityType: string; observations: string[] }): {
+    text: string;
+    filteredObsChars: number;
+    cappedObsChars: number;
+    selectedObsCount: number;
+    totalObsCount: number;
+  } {
     const maxObservationChars = Math.max(
       1000,
       Number.parseInt(process.env.ENTITY_EMBED_OBS_CHAR_BUDGET || '12000', 10) || 12000
@@ -905,6 +918,7 @@ export class RAGKnowledgeGraphManager {
       !o.startsWith('Source:') && !o.startsWith('Created:') && !o.startsWith('Type:') &&
       !o.startsWith('Tags:') && !o.startsWith('Content length:')
     );
+    const filteredObsChars = observations.join('. ').length;
 
     const selected: string[] = [];
     let remaining = maxObservationChars;
@@ -925,7 +939,14 @@ export class RAGKnowledgeGraphManager {
     }
 
     const observationsText = selected.reverse().join('. ');
-    return `${entity.entityType}: ${entity.name}. ${observationsText}`.trim();
+    const text = `${entity.entityType}: ${entity.name}. ${observationsText}`.trim();
+    return {
+      text,
+      filteredObsChars,
+      cappedObsChars: observationsText.length,
+      selectedObsCount: selected.length,
+      totalObsCount: observations.length,
+    };
   }
 
   // NEW: Generic semantic summary generation methods
@@ -1092,23 +1113,21 @@ export class RAGKnowledgeGraphManager {
     }
     
     const parsedObservations = JSON.parse(entity.observations);
-    const rawObsChars = parsedObservations.reduce(
-      (sum: number, o: unknown) => sum + (typeof o === 'string' ? o.length : 0),
-      0
-    );
-    const embeddingText = this.generateEntityEmbeddingText({
+    const built = this.buildEntityEmbeddingText({
       name: entity.name,
       entityType: entity.entityType,
       observations: parsedObservations
     });
-    
-    // Instrumentation (stderr only): how big was the entity vs what we actually embed, and how long.
-    const capped = embeddingText.length < rawObsChars;
+    const embeddingText = built.text;
+
+    // Instrumentation (stderr only): observations kept vs total, filtered pre-cap vs capped obs
+    // char size (identity excluded), and embed duration. `capped` = some observation chars dropped.
+    const capped = built.cappedObsChars < built.filteredObsChars;
     const embedStart = Date.now();
     const embedding = await this.generateEmbedding(embeddingText);
     const embedMs = Date.now() - embedStart;
     console.error(
-      `[embed] ${entity.name}: ${parsedObservations.length} obs, raw ${rawObsChars}ch -> embed ${embeddingText.length}ch${capped ? ' (capped)' : ''}, ${embedMs}ms`
+      `[embed] ${entity.name}: ${built.selectedObsCount}/${built.totalObsCount} obs, ${built.filteredObsChars}ch -> ${built.cappedObsChars}ch${capped ? ' (capped)' : ''}, ${embedMs}ms`
     );
     
     try {

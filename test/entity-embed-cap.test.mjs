@@ -46,6 +46,30 @@ try {
   const floor = gen({ name: 'X', entityType: 'T', observations: [floorObs] });
   assert(floor === `T: X. ${floorObs}`, 'env below floor 1000 ignored, 500-char obs fully kept');
 
+  // 8. Empty observations -> identity only.
+  delete process.env.ENTITY_EMBED_OBS_CHAR_BUDGET;
+  const empty = gen({ name: 'X', entityType: 'T', observations: [] });
+  assert(empty === 'T: X.', 'empty observations -> identity only');
+
+  // 9. All observations are metadata -> identity only.
+  const allMeta = gen({ name: 'X', entityType: 'T', observations: ['Source: a', 'Created: b', 'Tags: c'] });
+  assert(allMeta === 'T: X.', 'all-metadata observations -> identity only');
+
+  // 10. Stats from buildEntityEmbeddingText drive the `capped` log flag accurately.
+  const under = manager.buildEntityEmbeddingText({ name: 'X', entityType: 'T', observations: ['a', 'b'] });
+  assert(under.selectedObsCount === 2 && under.totalObsCount === 2, 'stats: under-budget keeps all obs');
+  assert(under.cappedObsChars === under.filteredObsChars, 'stats: under-budget not flagged capped');
+
+  process.env.ENTITY_EMBED_OBS_CHAR_BUDGET = '1000';
+  const overStats = manager.buildEntityEmbeddingText({ name: 'X', entityType: 'T', observations: ['A'.repeat(600), 'B'.repeat(600)] });
+  assert(overStats.selectedObsCount === 1 && overStats.totalObsCount === 2, 'stats: over-budget drops oldest obs');
+  assert(overStats.cappedObsChars < overStats.filteredObsChars, 'stats: over-budget flagged capped');
+
+  // 11. Metadata-only entity is NOT flagged capped (filtered, not truncated).
+  delete process.env.ENTITY_EMBED_OBS_CHAR_BUDGET;
+  const metaStats = manager.buildEntityEmbeddingText({ name: 'X', entityType: 'T', observations: ['Source: ' + 'z'.repeat(20000)] });
+  assert(metaStats.cappedObsChars === metaStats.filteredObsChars, 'stats: metadata-only not flagged capped');
+
   console.log(process.exitCode ? 'ENTITY-EMBED-CAP FAILED' : 'ENTITY-EMBED-CAP OK');
 } finally {
   delete process.env.ENTITY_EMBED_OBS_CHAR_BUDGET;
