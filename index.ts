@@ -892,11 +892,39 @@ export class RAGKnowledgeGraphManager {
 
   // === NEW RAG FUNCTIONALITY ===
 
-  // Generate embedding text for an entity (combines name, type, and observations)
+  // Generate embedding text for an entity (identity + newest observations within a char budget).
+  // The char budget keeps the entity vector representative of CURRENT state and stays under the
+  // bge-m3 8192-token ceiling; older history lives in RAG document chunks / dated entities.
   private generateEntityEmbeddingText(entity: { name: string; entityType: string; observations: string[] }): string {
-    const observationsText = entity.observations
-      .filter(o => !o.startsWith('Source:') && !o.startsWith('Created:') && !o.startsWith('Type:') && !o.startsWith('Tags:') && !o.startsWith('Content length:'))
-      .join('. ');
+    const maxObservationChars = Math.max(
+      1000,
+      Number.parseInt(process.env.ENTITY_EMBED_OBS_CHAR_BUDGET || '12000', 10) || 12000
+    );
+
+    const observations = entity.observations.filter(o =>
+      !o.startsWith('Source:') && !o.startsWith('Created:') && !o.startsWith('Type:') &&
+      !o.startsWith('Tags:') && !o.startsWith('Content length:')
+    );
+
+    const selected: string[] = [];
+    let remaining = maxObservationChars;
+    for (let i = observations.length - 1; i >= 0 && remaining > 0; i--) {
+      const obs = observations[i];
+      const separatorCost = selected.length > 0 ? 2 : 0; // '. ' joiner
+      const available = remaining - separatorCost;
+      if (available <= 0) break;
+      if (obs.length <= available) {
+        selected.push(obs);
+        remaining -= obs.length + separatorCost;
+      } else if (selected.length === 0) {
+        selected.push(obs.slice(0, available)); // single giant obs: keep a truncated head, never empty
+        break;
+      } else {
+        break;
+      }
+    }
+
+    const observationsText = selected.reverse().join('. ');
     return `${entity.entityType}: ${entity.name}. ${observationsText}`.trim();
   }
 

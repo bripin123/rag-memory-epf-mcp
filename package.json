@@ -41,7 +41,7 @@
     "prepare": "npm run build",
     "watch": "tsc --watch",
     "verify:invariants": "node test/chunk-invariants.test.mjs",
-    "verify:engine": "node test/engine-smoke.test.mjs && node test/launch-smoke.test.mjs && node test/sync-atomicity.test.mjs && node test/dedup.test.mjs && node test/search-degradation.test.mjs",
+    "verify:engine": "node test/engine-smoke.test.mjs && node test/launch-smoke.test.mjs && node test/sync-atomicity.test.mjs && node test/dedup.test.mjs && node test/search-degradation.test.mjs && node test/entity-embed-cap.test.mjs",
     "test": "npm run build && npm run verify:invariants && npm run verify:engine",
     "prepublishOnly": "npm run build && npm run verify:invariants && npm run verify:engine"
   },
