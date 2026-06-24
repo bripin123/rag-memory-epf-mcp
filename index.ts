@@ -1092,14 +1092,24 @@ export class RAGKnowledgeGraphManager {
     }
     
     const parsedObservations = JSON.parse(entity.observations);
+    const rawObsChars = parsedObservations.reduce(
+      (sum: number, o: unknown) => sum + (typeof o === 'string' ? o.length : 0),
+      0
+    );
     const embeddingText = this.generateEntityEmbeddingText({
       name: entity.name,
       entityType: entity.entityType,
       observations: parsedObservations
     });
     
-    // Generate embedding
+    // Instrumentation (stderr only): how big was the entity vs what we actually embed, and how long.
+    const capped = embeddingText.length < rawObsChars;
+    const embedStart = Date.now();
     const embedding = await this.generateEmbedding(embeddingText);
+    const embedMs = Date.now() - embedStart;
+    console.error(
+      `[embed] ${entity.name}: ${parsedObservations.length} obs, raw ${rawObsChars}ch -> embed ${embeddingText.length}ch${capped ? ' (capped)' : ''}, ${embedMs}ms`
+    );
     
     try {
       // Delete existing embedding if any
