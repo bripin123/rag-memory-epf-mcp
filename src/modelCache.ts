@@ -9,7 +9,7 @@
 // never retrieval config (spec §6c layer 1).
 
 import { mkdirSync, writeFileSync, readFileSync, unlinkSync, existsSync, renameSync, rmSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 
 export function resolveModelCacheDir(
@@ -165,8 +165,10 @@ export function isCacheIntegrityError(e: unknown, cacheDir?: string): boolean {
   const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
   if (CACHE_PRESERVE_SIGNATURES.some(re => re.test(msg))) return false;
   if (CACHE_INTEGRITY_SIGNATURES.some(re => re.test(msg))) return true;
-  // Missing-file errors are integrity ONLY when they point at a cache artifact.
-  if (cacheDir && (/ENOENT/.test(msg) || /no such file/i.test(msg)) && msg.includes(cacheDir)) return true;
+  // Missing-file errors are integrity ONLY when they point INSIDE the cache
+  // dir (path-boundary-safe: '/cache' must not match '/cache-old' — 6R note).
+  if (cacheDir && (/ENOENT/.test(msg) || /no such file/i.test(msg))
+      && (msg.includes(cacheDir + sep) || msg.includes(cacheDir + '/'))) return true;
   return false;
 }
 
