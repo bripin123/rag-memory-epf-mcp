@@ -3198,6 +3198,10 @@ export class RAGKnowledgeGraphManager {
       SELECT COUNT(*) as count FROM chunk_metadata
     `).get() as { count: number };
     
+    // v3.6 (spec §8-2, additive): server self-report — the framework's /start
+    // reads version, model/reconciliation state, and provenance coverage here.
+    const gs = this.gate.status;
+    const cov = this.coordinator?.coverage();
     return {
       entities: {
         total: entityStats.reduce((sum, stat) => sum + stat.count, 0),
@@ -3208,7 +3212,23 @@ export class RAGKnowledgeGraphManager {
         by_type: Object.fromEntries(relationshipStats.map(s => [s.relationType, s.count]))
       },
       documents: documentCount.count,
-      chunks: chunkCount.count
+      chunks: chunkCount.count,
+      server: {
+        version: PKG_VERSION,
+        node: process.versions.node,
+        embeddings_mode: this.embeddingsMode,
+        model: `${EMBEDDING_MODEL}@${MODEL_REVISION}`,
+        model_state: gs.state,
+        ready_since: gs.readySince ?? null,
+        last_error: gs.lastError ? sanitizeErrorMessage(gs.lastError) : null,
+        retry_at: gs.retryAt ?? null,
+        reconciliation_state: this.coordinator?.reconState ?? 'n/a',
+        reconciliation_last_error: this.coordinator?.reconLastError ?? null,
+        coverage: cov ? {
+          chunk: { total: cov.chunk.total, embedded: cov.chunk.embedded, verified: cov.chunk.verified, legacy_assumed: cov.chunk.legacy_assumed },
+          entity: { total: cov.entity.total, embedded: cov.entity.embedded, verified: cov.entity.verified, legacy_assumed: cov.entity.legacy_assumed },
+        } : null,
+      }
     };
   }
 

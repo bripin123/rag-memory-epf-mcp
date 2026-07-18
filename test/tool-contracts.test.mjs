@@ -63,6 +63,19 @@ installFakeEmbedder(mgr);
   console.log('  OK: disabled shapes (disabled status, EMBEDDINGS_DISABLED on explicit embed)');
 }
 
+// ---- stats server block (spec §8-2, T9) -----------------------------------
+{
+  const stats = await mgr.getKnowledgeGraphStats();
+  assert.ok(stats.server, 'server block missing');
+  for (const k of ['version', 'node', 'embeddings_mode', 'model', 'model_state', 'reconciliation_state', 'coverage']) {
+    assert.ok(k in stats.server, `server.${k} missing`);
+  }
+  assert.match(stats.server.version, /^3\.6\./);
+  assert.ok(stats.server.coverage.entity.total >= 1);
+  assert.ok('verified' in stats.server.coverage.chunk && 'legacy_assumed' in stats.server.coverage.chunk);
+  console.log('  OK: stats server block (version, states, 3-way provenance coverage)');
+}
+
 mgr.cleanup();
 rmSync(dir, { recursive: true, force: true });
 console.log('TOOL-CONTRACTS OK');
