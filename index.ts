@@ -36,7 +36,7 @@ import { migrations } from './src/migrations/migrations.js';
 // v3.6 lite install: model lifecycle + version-independent cache (A′ boundary)
 import { EmbeddingGate, GateNotReadyError, GateDisabledError, TerminalConfigError } from './src/embeddingGate.js';
 import type { EmbedFn, EmbedPriority } from './src/embeddingGate.js';
-import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock, quarantinePartialCache } from './src/modelCache.js';
+import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock, quarantinePartialCache, isCacheIntegrityError } from './src/modelCache.js';
 import { BackfillCoordinator } from './src/backfillCoordinator.js';
 import os from 'node:os';
 import { createHash } from 'crypto';
@@ -340,7 +340,6 @@ export class RAGKnowledgeGraphManager {
         throw new TerminalConfigError(`embedding model ${EMBEDDING_MODEL} outputs ${actualDims} dims — this engine's vec0 tables are fixed at 1024. Use a 1024-dim model.`);
       }
       if (role === 'owner') lock.markComplete();
-      lock.clearOwnerFailure();
       console.error(`✅ ${EMBEDDING_MODEL} model loaded (${MODEL_DTYPE})`);
       return async (text: string, dims: number, isQuery: boolean) => {
         const input = isQuery ? `Represent this sentence for searching relevant passages: ${text}` : text;
@@ -348,26 +347,23 @@ export class RAGKnowledgeGraphManager {
         return new Float32Array((r.data as Float32Array).slice(0, dims));
       };
     } catch (e) {
-      // Error classification (beta 2R B3 + 3R M1):
+      // Error classification (beta 2R B3 -> 4R M1: by CAUSE, not by role/count):
       // - TerminalConfigError: cache is fine — no quarantine, no marker change.
-      // - owner-role failure: TWO-strike policy — the first failure preserves
-      //   the cache (OOM/session/transient errors would otherwise trash a fine
-      //   1.2GB download on every backoff); only a second consecutive owner
-      //   failure quarantines (persistent corruption).
-      // - ready-role failure (marker existed): invalidate the marker only; the
-      //   next attempt becomes a locked owner and re-validates under the same
-      //   two-strike policy.
-      if (!(e instanceof TerminalConfigError)) {
-        if (role === 'owner') {
-          if (lock.recordOwnerFailure() === 'quarantine') {
-            console.error('🧹 second consecutive owner load failure — quarantining model cache');
-            quarantinePartialCache(cacheDir, EMBEDDING_MODEL);
-          } else {
-            console.error('… first owner load failure — cache preserved for revalidation');
-          }
-        } else {
-          lock.invalidateMarker();
-        }
+      // - cache read/parse/integrity signature: the files themselves are bad —
+      //   quarantine (retention 1) and drop the marker so the next attempt is
+      //   a locked owner with a clean slate.
+      // - anything else (OOM, session allocation, network, unknown): PRESERVE
+      //   the cache no matter how often it repeats — re-downloading 1.2GB
+      //   cannot fix a memory-starved machine. Ready-role keeps its marker too
+      //   (a transient error does not disprove a verified cache). Unknown-
+      //   signature corruption therefore stays put by design; the manual
+      //   recovery path is documented in docs/UPDATING.md.
+      if (!(e instanceof TerminalConfigError) && isCacheIntegrityError(e)) {
+        console.error('🧹 cache-integrity failure signature — quarantining model cache');
+        lock.invalidateMarker();
+        quarantinePartialCache(cacheDir, EMBEDDING_MODEL);
+      } else if (!(e instanceof TerminalConfigError)) {
+        console.error('… non-integrity load failure — model cache preserved');
       }
       throw e;
     } finally {

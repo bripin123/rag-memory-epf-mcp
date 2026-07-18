@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
-import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock } from '../dist/src/modelCache.js';
+import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock, isCacheIntegrityError } from '../dist/src/modelCache.js';
 
 // (a)-(c) resolution matrix
 assert.equal(resolveModelCacheDir({ RAG_MEMORY_MODEL_CACHE_DIR: '/x' }, 'darwin', '/h'), '/x');
@@ -62,6 +62,22 @@ console.log('  OK: marker temp-rename leaves no residue');
   const r2 = await l2.acquireOrWait({ pollMs: 10, timeoutMs: 1000, signal: ac.signal }).catch(e => e);
   assert.ok(r2 instanceof Error && /abort/.test(r2.message), `aborted waiter returned ready despite abort: ${r2}`);
   console.log('  OK: abort checked before marker/acquire (beta 2R B5)');
+}
+
+// (i) error classification (beta 4R M1): only integrity signatures quarantine;
+// OOM/session/network errors preserve the cache regardless of repetition.
+{
+  for (const msg of ['invalid protobuf detected', 'Failed to deserialize model',
+    'ENOENT: no such file or directory', 'unexpected end of file', 'corrupt data detected']) {
+    assert.equal(isCacheIntegrityError(new Error(msg)), true, `integrity not detected: ${msg}`);
+  }
+  for (const msg of ['std::bad_alloc', 'out of memory', 'session allocation failed: OOM',
+    'fetch failed', 'read ECONNRESET', 'some entirely unknown runtime condition']) {
+    assert.equal(isCacheIntegrityError(new Error(msg)), false, `wrongly quarantines on: ${msg}`);
+  }
+  // precedence: a network error mentioning a parse-ish word still preserves
+  assert.equal(isCacheIntegrityError(new Error('fetch failed while parsing response')), false);
+  console.log('  OK: cache error classification (integrity quarantines, OOM/network preserves)');
 }
 
 rmSync(base, { recursive: true, force: true });

@@ -170,6 +170,10 @@ db3.prepare(`INSERT INTO entities (id, name, entityType, observations) VALUES ('
 const r3 = db3.prepare(`INSERT INTO entity_embeddings (embedding) VALUES (?)`).run(VEC);
 db3.prepare(`INSERT INTO entity_embedding_metadata (rowid, entity_id, embedding_text, input_hash, profile_id, provenance_state)
   VALUES (?, 'entity_y', 'old', 'h', 999, 'verified')`).run(r3.lastInsertRowid);
+// stamped chunk metadata with NO vector (beta 4R non-blocker regression):
+db3.prepare(`INSERT INTO documents (id, content, metadata) VALUES ('d3','x','{}')`).run();
+db3.prepare(`INSERT INTO chunk_metadata (chunk_id, document_id, chunk_index, text, input_hash, profile_id, provenance_state)
+  VALUES ('c3','d3',0,'x','h',${mgr3.currentProfileId},'verified')`).run();
 await mgr3.startReconciliation();
 assert.equal(mgr3.coordinator.reconState, 'deferred', 'off mode missed old-profile repair need');
 assert.equal(db3.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE entity_id='entity_y'`).get().c, 1,

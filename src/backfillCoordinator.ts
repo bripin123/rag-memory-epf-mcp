@@ -59,6 +59,7 @@ export class BackfillCoordinator {
   private shuttingDown = false;
   private scanning = false;
   private scanPromise: Promise<void> | null = null;
+  private rerunRequested = false;
   private snapshot: CoverageSnapshot | null = null;
 
   constructor(private readonly deps: CoordinatorDeps) {}
@@ -351,16 +352,25 @@ export class BackfillCoordinator {
   kick(): void {
     if (this.shuttingDown || this.deps.gateIsDisabled()) return;
     if (!this.eligible) return;
-    // A running scan re-kicks itself via mutation callbacks; scanPromise must
-    // not be overwritten by a no-op second scan (beta 3R non-blocker).
-    if (this.kickTimer || this.scanPromise || this.scanning) return;
+    // A kick landing during a running scan must not be LOST (beta 4R M2): the
+    // running scan works from a snapshot and may miss rows created after it —
+    // record the wake-up and re-run once the current scan settles, without
+    // overwriting the tracked scanPromise.
+    if (this.scanPromise || this.scanning) { this.rerunRequested = true; return; }
+    if (this.kickTimer) return;
     this.kickTimer = setTimeout(() => {
       this.kickTimer = null;
       // Tracked so shutdown can await the whole scan, not just poll `scanning`
       // (beta 2R B2).
       this.scanPromise = this.scanAndBackfill()
         .catch(e => console.error(`⚠️ backfill scan error: ${e instanceof Error ? e.message : e}`))
-        .finally(() => { this.scanPromise = null; });
+        .finally(() => {
+          this.scanPromise = null;
+          if (this.rerunRequested && !this.shuttingDown) {
+            this.rerunRequested = false;
+            this.kick();
+          }
+        });
     }, KICK_DEBOUNCE_MS);
     this.kickTimer.unref?.();
   }

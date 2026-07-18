@@ -34,16 +34,29 @@ const entry = join(here, '..', 'dist', 'index.js');
   });
   let stderrBuf = '';
   child.stderr.on('data', d => { stderrBuf += d.toString(); });
-  await new Promise(r => setTimeout(r, 1500)); // connect + loader now waiting on the held lock
+  // (beta 4R M3) Wait for the server-running marker — signal handlers are
+  // registered in the same startup region — instead of a blind sleep, so a
+  // slow environment cannot deliver SIGTERM before the handlers exist (default
+  // signal death would fake a pass).
+  await new Promise((res, rej) => {
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (/running on stdio/.test(stderrBuf)) { clearInterval(iv); res(); }
+      else if (Date.now() - t0 > 15000) { clearInterval(iv); child.kill('SIGKILL'); rej(new Error(`server never reached running state\n${stderrBuf.slice(-400)}`)); }
+    }, 50);
+  });
+  await new Promise(r => setTimeout(r, 300)); // loader is now inside the held-lock wait
   child.kill('SIGTERM');
-  const code = await new Promise((res) => {
-    const t = setTimeout(() => res('hang'), 8000);
-    child.on('exit', c => { clearTimeout(t); res(c); });
+  const { code, signal } = await new Promise((res) => {
+    const t = setTimeout(() => { child.kill('SIGKILL'); res({ code: 'hang', signal: null }); }, 8000);
+    child.on('exit', (c, s) => { clearTimeout(t); res({ code: c, signal: s }); });
   });
   holder.release();
   assert.notEqual(code, 'hang', `lock-waiting server hung on SIGTERM\nstderr: ${stderrBuf.slice(-400)}`);
+  assert.equal(signal, null, `terminated by default signal death (signal=${signal}) — handler never ran`);
+  assert.equal(code, 0, `natural exit expected code 0, got ${code}`);
   assert.ok(!/bounded exit/.test(stderrBuf), 'abortable lock wait must exit NATURALLY, not via the bounded branch');
-  console.log('  OK: SIGTERM during lock wait -> abort -> natural exit');
+  console.log('  OK: SIGTERM during lock wait -> abort -> natural exit (code 0, no signal death)');
   rmSync(dir, { recursive: true, force: true });
 }
 
