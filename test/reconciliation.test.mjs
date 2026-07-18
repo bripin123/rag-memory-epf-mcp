@@ -181,5 +181,22 @@ assert.equal(db3.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE
 console.log('  OK: off mode -> deferred on old-profile rows, zero writes');
 mgr3.cleanup();
 
+// ---- (g3) off mode: stamped-vectorless CHUNK alone triggers deferred -------
+// (beta 5R residual: previous fixture also had an old-profile entity, so this
+// SQL branch was not independently proven.)
+for (const suffix of ['', '-wal', '-shm']) { const p = dbPath + suffix; if (existsSync(p)) unlinkSync(p); }
+const mgr4 = new mod.RAGKnowledgeGraphManager();
+await mgr4.initialize({ skipModel: true });
+const db4 = mgr4.db;
+db4.prepare(`INSERT INTO documents (id, content, metadata) VALUES ('d4','x','{}')`).run();
+db4.prepare(`INSERT INTO chunk_metadata (chunk_id, document_id, chunk_index, text, input_hash, profile_id, provenance_state)
+  VALUES ('c4','d4',0,'x','h',${mgr4.currentProfileId},'verified')`).run();  // stamped, NO vector
+await mgr4.startReconciliation();
+assert.equal(mgr4.coordinator.reconState, 'deferred', 'off mode missed stamped-vectorless chunk');
+assert.equal(db4.prepare(`SELECT provenance_state FROM chunk_metadata WHERE chunk_id='c4'`).get().provenance_state, 'verified',
+  'off mode modified the chunk row (must be read-only)');
+console.log('  OK: off mode -> deferred on stamped-vectorless chunk alone, read-only');
+mgr4.cleanup();
+
 rmSync(dir, { recursive: true, force: true });
 console.log('RECONCILIATION OK');

@@ -36,7 +36,7 @@ import { migrations } from './src/migrations/migrations.js';
 // v3.6 lite install: model lifecycle + version-independent cache (A′ boundary)
 import { EmbeddingGate, GateNotReadyError, GateDisabledError, TerminalConfigError } from './src/embeddingGate.js';
 import type { EmbedFn, EmbedPriority } from './src/embeddingGate.js';
-import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock, quarantinePartialCache, isCacheIntegrityError } from './src/modelCache.js';
+import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock, handleLoaderFailure } from './src/modelCache.js';
 import { BackfillCoordinator } from './src/backfillCoordinator.js';
 import os from 'node:os';
 import { createHash } from 'crypto';
@@ -319,6 +319,7 @@ export class RAGKnowledgeGraphManager {
     const key = artifactKey(EMBEDDING_MODEL, MODEL_REVISION, MODEL_DTYPE);
     const lock = new ModelDownloadLock(cacheDir, key);
     // Shutdown aborts the lock wait via the gate's AbortController (spec §3).
+    console.error('⏳ acquiring model download lock...'); // deterministic lock-wait marker (5R test residual)
     const role = await lock.acquireOrWait({ timeoutMs: 10 * 60_000, signal: this.gate.abort.signal });
     try {
       this.gate.markDownloading();
@@ -347,24 +348,18 @@ export class RAGKnowledgeGraphManager {
         return new Float32Array((r.data as Float32Array).slice(0, dims));
       };
     } catch (e) {
-      // Error classification (beta 2R B3 -> 4R M1: by CAUSE, not by role/count):
-      // - TerminalConfigError: cache is fine — no quarantine, no marker change.
-      // - cache read/parse/integrity signature: the files themselves are bad —
-      //   quarantine (retention 1) and drop the marker so the next attempt is
-      //   a locked owner with a clean slate.
-      // - anything else (OOM, session allocation, network, unknown): PRESERVE
-      //   the cache no matter how often it repeats — re-downloading 1.2GB
-      //   cannot fix a memory-starved machine. Ready-role keeps its marker too
-      //   (a transient error does not disprove a verified cache). Unknown-
-      //   signature corruption therefore stays put by design; the manual
-      //   recovery path is documented in docs/UPDATING.md.
-      if (!(e instanceof TerminalConfigError) && isCacheIntegrityError(e)) {
-        console.error('🧹 cache-integrity failure signature — quarantining model cache');
-        lock.invalidateMarker();
-        quarantinePartialCache(cacheDir, EMBEDDING_MODEL);
-      } else if (!(e instanceof TerminalConfigError)) {
-        console.error('… non-integrity load failure — model cache preserved');
-      }
+      // Cache policy by CAUSE and ROLE (beta 2R B3 -> 4R M1 -> 5R M1), unit-
+      // tested in modelCache: config errors touch nothing; integrity errors
+      // invalidate the marker, and only a lock-holding OWNER may quarantine
+      // (a ready-role process racing other readers never deletes shared
+      // files); OOM/network/unknown preserve everything.
+      const action = handleLoaderFailure({
+        role, error: e, lock, cacheDir, modelId: EMBEDDING_MODEL,
+        terminal: e instanceof TerminalConfigError,
+      });
+      if (action === 'quarantined') console.error('🧹 cache-integrity failure (owner) — model cache quarantined');
+      else if (action === 'marker-invalidated') console.error('… cache-integrity failure (reader) — marker dropped, next retry re-proves as locked owner');
+      else if (!(e instanceof TerminalConfigError)) console.error('… non-integrity load failure — model cache preserved');
       throw e;
     } finally {
       lock.release();
@@ -3885,6 +3880,7 @@ async function main() {
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
     process.on('exit', () => { try { ragKgManager.cleanup(); } catch { /* idempotent */ } });
+    console.error('🛡️ shutdown handlers registered'); // deterministic handler-ready marker (5R test residual)
   } catch (error) {
     console.error("Failed to initialize server:", error);
     try { ragKgManager.cleanup(); } catch { /* already down */ }

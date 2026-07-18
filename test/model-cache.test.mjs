@@ -64,20 +64,64 @@ console.log('  OK: marker temp-rename leaves no residue');
   console.log('  OK: abort checked before marker/acquire (beta 2R B5)');
 }
 
-// (i) error classification (beta 4R M1): only integrity signatures quarantine;
-// OOM/session/network errors preserve the cache regardless of repetition.
+// (i) error classification (beta 4R M1 -> 5R M2): only STRONG integrity
+// signatures quarantine; generic words and out-of-cache ENOENT preserve.
 {
+  const CD = '/tmp/model-cache-x';
   for (const msg of ['invalid protobuf detected', 'Failed to deserialize model',
-    'ENOENT: no such file or directory', 'unexpected end of file', 'corrupt data detected']) {
-    assert.equal(isCacheIntegrityError(new Error(msg)), true, `integrity not detected: ${msg}`);
+    'unexpected end of file', 'corrupt data detected', 'checksum mismatch', 'file truncated']) {
+    assert.equal(isCacheIntegrityError(new Error(msg), CD), true, `integrity not detected: ${msg}`);
   }
   for (const msg of ['std::bad_alloc', 'out of memory', 'session allocation failed: OOM',
-    'fetch failed', 'read ECONNRESET', 'some entirely unknown runtime condition']) {
-    assert.equal(isCacheIntegrityError(new Error(msg)), false, `wrongly quarantines on: ${msg}`);
+    'fetch failed', 'read ECONNRESET', 'some entirely unknown runtime condition',
+    'invalid model architecture xyz',                       // config, not corruption (5R)
+    'failed to parse proxy response',                       // generic parse (5R)
+    'ENOENT: no such file /usr/lib/libonnxruntime.so']) {   // ENOENT outside the cache (5R)
+    assert.equal(isCacheIntegrityError(new Error(msg), CD), false, `wrongly quarantines on: ${msg}`);
   }
-  // precedence: a network error mentioning a parse-ish word still preserves
-  assert.equal(isCacheIntegrityError(new Error('fetch failed while parsing response')), false);
-  console.log('  OK: cache error classification (integrity quarantines, OOM/network preserves)');
+  // ENOENT pointing INSIDE the cache dir IS integrity
+  assert.equal(isCacheIntegrityError(new Error(`ENOENT: no such file ${CD}/Xenova/bge-m3/onnx/model_fp16.onnx`), CD), true);
+  // precedence: a network error mentioning corruption-ish words still preserves
+  assert.equal(isCacheIntegrityError(new Error('fetch failed: response truncated'), CD), false);
+  console.log('  OK: cache error classification (strong signatures only, cache-scoped ENOENT)');
+}
+
+// (j) loader-failure policy by role (beta 5R M1): a ready-role reader may drop
+// the marker but must NEVER touch shared cache files; only a locked owner
+// quarantines.
+{
+  const { handleLoaderFailure } = await import('../dist/src/modelCache.js');
+  const { mkdirSync, writeFileSync: wf, existsSync: ex, readdirSync: rd } = await import('node:fs');
+  const pdir = mkdtempSync(join(tmpdir(), 'rag-policy-'));
+  const modelDir = join(pdir, 'Org', 'model-x');
+  mkdirSync(modelDir, { recursive: true });
+  wf(join(modelDir, 'weights.onnx'), 'data');
+  const plock = new ModelDownloadLock(pdir, 'pol');
+  plock.markComplete();
+  const integrity = new Error('invalid protobuf detected');
+
+  // ready-role: marker gone, cache untouched
+  let action = handleLoaderFailure({ role: 'ready', error: integrity, lock: plock, cacheDir: pdir, modelId: 'Org/model-x', terminal: false });
+  assert.equal(action, 'marker-invalidated');
+  assert.ok(ex(join(modelDir, 'weights.onnx')), 'ready-role deleted shared cache files!');
+  assert.ok(!ex(plock.markerPath), 'ready-role left the marker');
+
+  // owner-role: quarantined
+  action = handleLoaderFailure({ role: 'owner', error: integrity, lock: plock, cacheDir: pdir, modelId: 'Org/model-x', terminal: false });
+  assert.equal(action, 'quarantined');
+  assert.ok(!ex(modelDir), 'owner quarantine left the dir in place');
+  assert.ok(rd(join(pdir, 'Org')).some(f => f.startsWith('model-x.quarantine.')), 'quarantine dir missing');
+
+  // non-integrity: nothing happens either role
+  mkdirSync(modelDir, { recursive: true });
+  action = handleLoaderFailure({ role: 'owner', error: new Error('out of memory'), lock: plock, cacheDir: pdir, modelId: 'Org/model-x', terminal: false });
+  assert.equal(action, 'none');
+  assert.ok(ex(modelDir), 'OOM owner failure touched the cache');
+  // terminal config: nothing happens
+  action = handleLoaderFailure({ role: 'owner', error: integrity, lock: plock, cacheDir: pdir, modelId: 'Org/model-x', terminal: true });
+  assert.equal(action, 'none');
+  rmSync(pdir, { recursive: true, force: true });
+  console.log('  OK: loader-failure policy (reader never deletes, owner quarantines, OOM/terminal preserve)');
 }
 
 rmSync(base, { recursive: true, force: true });

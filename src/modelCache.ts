@@ -146,25 +146,57 @@ export class ModelDownloadLock {
   }
 }
 
-// (beta 4R M1) Error classification for cache handling: ONLY positive
-// read/parse/integrity signatures justify quarantining a 1.2GB cache.
-// OOM / session-allocation / runtime errors preserve the cache regardless of
-// how often they repeat — re-downloading cannot fix a memory-starved machine.
-// Residual risk (documented): a corruption whose message matches no signature
-// stays in place and keeps failing; docs/UPDATING.md tells the operator to
-// delete the model cache directory manually in that case.
+// (beta 4R M1 -> 5R M2) Error classification for cache handling: ONLY strong
+// serialization/truncation/corruption signatures justify quarantining a 1.2GB
+// cache. Generic words (parse, invalid model, byte length) and bare ENOENT
+// match far too much outside the cache — ENOENT counts only when the message
+// points INSIDE the model cache directory. OOM / allocation / network errors
+// preserve the cache regardless of repetition. Residual risk (documented): a
+// corruption with no matching signature stays put; docs/UPDATING.md tells the
+// operator to delete the model cache directory manually.
 const CACHE_INTEGRITY_SIGNATURES = [
-  /protobuf/i, /invalid model/i, /corrupt/i, /ENOENT/, /no such file/i,
-  /unexpected end/i, /deseriali[sz]e/i, /parse/i, /magic number/i,
-  /byte length/i, /truncated/i, /checksum/i, /Failed to load model.*file/i,
+  /protobuf/i, /corrupt/i, /unexpected end/i, /deseriali[sz]e/i,
+  /magic number/i, /truncated/i, /checksum/i,
 ];
 const CACHE_PRESERVE_SIGNATURES = [
   /out of memory/i, /bad_alloc/i, /allocation/i, /OOM/i, /ETIMEDOUT/, /ECONNRESET/, /fetch/i, /network/i,
 ];
-export function isCacheIntegrityError(e: unknown): boolean {
+export function isCacheIntegrityError(e: unknown, cacheDir?: string): boolean {
   const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
   if (CACHE_PRESERVE_SIGNATURES.some(re => re.test(msg))) return false;
-  return CACHE_INTEGRITY_SIGNATURES.some(re => re.test(msg));
+  if (CACHE_INTEGRITY_SIGNATURES.some(re => re.test(msg))) return true;
+  // Missing-file errors are integrity ONLY when they point at a cache artifact.
+  if (cacheDir && (/ENOENT/.test(msg) || /no such file/i.test(msg)) && msg.includes(cacheDir)) return true;
+  return false;
+}
+
+// (beta 5R M1) Loader-failure cache policy, extracted for unit testing.
+// Quarantine requires EXCLUSIVITY: only the lock-holding OWNER may rename or
+// delete shared cache files — a ready-role process (no lock) racing other
+// readers must never touch the directory; it only drops the marker so the
+// next retry becomes a locked owner and re-proves the same integrity error
+// before any destructive action.
+export function handleLoaderFailure(opts: {
+  role: 'owner' | 'ready';
+  error: unknown;
+  lock: ModelDownloadLock;
+  cacheDir: string;
+  modelId: string;
+  terminal: boolean;
+}): 'none' | 'marker-invalidated' | 'quarantined' {
+  if (opts.terminal) return 'none';                              // config error: cache is fine
+  if (!isCacheIntegrityError(opts.error, opts.cacheDir)) {
+    // OOM / network / unknown: preserve everything (marker included — a
+    // transient error does not disprove a verified cache).
+    return 'none';
+  }
+  if (opts.role === 'ready') {
+    opts.lock.invalidateMarker();
+    return 'marker-invalidated';
+  }
+  opts.lock.invalidateMarker();
+  quarantinePartialCache(opts.cacheDir, opts.modelId);
+  return 'quarantined';
 }
 
 // Owner-side failure handling: partially downloaded model dirs are quarantined

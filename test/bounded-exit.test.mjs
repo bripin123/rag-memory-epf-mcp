@@ -34,18 +34,19 @@ const entry = join(here, '..', 'dist', 'index.js');
   });
   let stderrBuf = '';
   child.stderr.on('data', d => { stderrBuf += d.toString(); });
-  // (beta 4R M3) Wait for the server-running marker — signal handlers are
-  // registered in the same startup region — instead of a blind sleep, so a
-  // slow environment cannot deliver SIGTERM before the handlers exist (default
-  // signal death would fake a pass).
-  await new Promise((res, rej) => {
+  // (beta 4R M3 + 5R residual) Wait for BOTH explicit markers — shutdown
+  // handlers registered AND the loader inside the held-lock wait — so SIGTERM
+  // can never race handler registration (default signal death faking a pass)
+  // and the lock-wait state is proven, not assumed via sleep.
+  const waitMarker = (re, what) => new Promise((res, rej) => {
     const t0 = Date.now();
     const iv = setInterval(() => {
-      if (/running on stdio/.test(stderrBuf)) { clearInterval(iv); res(); }
-      else if (Date.now() - t0 > 15000) { clearInterval(iv); child.kill('SIGKILL'); rej(new Error(`server never reached running state\n${stderrBuf.slice(-400)}`)); }
+      if (re.test(stderrBuf)) { clearInterval(iv); res(); }
+      else if (Date.now() - t0 > 15000) { clearInterval(iv); child.kill('SIGKILL'); rej(new Error(`marker "${what}" never appeared\n${stderrBuf.slice(-400)}`)); }
     }, 50);
   });
-  await new Promise(r => setTimeout(r, 300)); // loader is now inside the held-lock wait
+  await waitMarker(/shutdown handlers registered/, 'handlers-ready');
+  await waitMarker(/acquiring model download lock/, 'lock-wait entered');
   child.kill('SIGTERM');
   const { code, signal } = await new Promise((res) => {
     const t = setTimeout(() => { child.kill('SIGKILL'); res({ code: 'hang', signal: null }); }, 8000);
