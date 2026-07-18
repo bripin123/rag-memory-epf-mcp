@@ -72,6 +72,26 @@ await new Promise(r => setTimeout(r, 500));
 assert.equal(inferences.length, before, 'completed rows re-embedded on second kick');
 console.log('  OK: second kick reprocesses nothing (DoD 7)');
 
+// ---- (a2) mutation atomicity (beta B2): old vector is ALREADY gone at the
+// moment inference runs — the entity change and the stale-vector delete commit
+// in one transaction BEFORE any embed await.
+{
+  let staleVisibleAtInference = null;
+  const origEmbedFn = gate.embedFn;
+  gate.embedFn = async (text) => {
+    if (text.includes('Alpha Node')) {
+      staleVisibleAtInference = db.prepare(
+        `SELECT COUNT(*) c FROM entity_embedding_metadata WHERE entity_id='entity_alpha_node'`).get().c;
+    }
+    return origEmbedFn(text);
+  };
+  await mgr.addObservations([{ entityName: 'Alpha Node', contents: ['atomicity probe obs'] }]);
+  gate.embedFn = origEmbedFn;
+  assert.equal(staleVisibleAtInference, 0,
+    'stale vector still searchable while inference was running (§6a-1 violation)');
+  console.log('  OK: mutation deletes old vector in the same tx, before inference (beta B2)');
+}
+
 // ---- (b) deleteObservations re-embed fix (stale vector regression) ---------
 const oldHash = db.prepare(`SELECT input_hash FROM entity_embedding_metadata WHERE entity_id=?`).get(entityId).input_hash;
 const delRes = await mgr.deleteObservations([{ entityName: 'Alpha Node', observations: db.prepare(`SELECT observations FROM entities WHERE id=?`).get(entityId).observations ? JSON.parse(db.prepare(`SELECT observations FROM entities WHERE id=?`).get(entityId).observations).slice(0, 1) : [] }]);

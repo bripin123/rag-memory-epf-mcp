@@ -82,6 +82,47 @@ process.on('unhandledRejection', () => { unhandled++; });
   console.log('  OK: priority interactive>backfill, concurrency 1');
 }
 
+// (i) systemic inference failure: 3 consecutive errors -> failed + backoff recovery (beta B6)
+{
+  let healthy = false;
+  const g = new EmbeddingGate({
+    mode: 'lazy', backoffMs: [50, 100],
+    loadModel: async () => async () => {
+      if (!healthy) throw new Error('onnx runtime blew up');
+      return vec();
+    },
+  });
+  await g.start();
+  assert.equal(g.status.state, 'ready');
+  for (let i = 0; i < 3; i++) await g.embed('x' + i, { priority: 'bulk' }).catch(() => {});
+  assert.equal(g.status.state, 'failed', 'ready survived 3 consecutive inference failures');
+  assert.ok(g.status.retryAt, 'no retry scheduled after systemic failure');
+  healthy = true;
+  await new Promise(r => setTimeout(r, 200));
+  assert.equal(g.status.state, 'ready', 'reload did not recover');
+  const v2 = await g.embed('post-recovery', { priority: 'interactive' });
+  assert.equal(v2.length, 1024);
+  await g.shutdown();
+  console.log('  OK: systemic inference failure -> failed + reload recovery');
+}
+
+// (j) shutdown settles an in-flight load (bounded) instead of ignoring it (beta B1)
+{
+  let resolveLoad;
+  const g = new EmbeddingGate({
+    mode: 'lazy',
+    loadModel: () => new Promise(res => { resolveLoad = () => res(async () => vec()); }),
+  });
+  const sp = g.start();
+  setTimeout(() => resolveLoad(), 100);           // load completes during settle window
+  const t0 = Date.now();
+  await g.shutdown(2000);
+  assert.ok(Date.now() - t0 >= 90, 'shutdown did not wait for the in-flight load');
+  assert.equal(g.loadInFlight, false, 'loadInFlight still true after settled load');
+  await sp.catch(() => {});
+  console.log('  OK: shutdown settles in-flight load; loadInFlight reflects it');
+}
+
 // (h) shutdown discards in-flight result, rejects queued + new work
 {
   const g = new EmbeddingGate({

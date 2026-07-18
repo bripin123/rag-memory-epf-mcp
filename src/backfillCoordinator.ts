@@ -71,15 +71,66 @@ export class BackfillCoordinator {
     return this.deps.gateIsReady() && (this.recon === 'complete' || this.recon === 'n/a');
   }
 
+  // "Unreconciled vector" = a row that actually HAS a vector and no provenance.
+  // Entity metadata is joined against entity_embeddings (beta B3): pre-v3.6
+  // non-atomic writes can leave metadata-without-vector and vector-without-
+  // metadata split states, and neither must be miscounted as reconciled work.
   private countNullWithVector(db: Database.Database): number {
     const ent = db.prepare(
-      `SELECT COUNT(*) c FROM entity_embedding_metadata WHERE provenance_state IS NULL`
+      `SELECT COUNT(*) c FROM entity_embedding_metadata m JOIN entity_embeddings v ON v.rowid = m.rowid
+       WHERE m.provenance_state IS NULL`
     ).get() as { c: number };
     const chk = db.prepare(
       `SELECT COUNT(*) c FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid
        WHERE m.provenance_state IS NULL`
     ).get() as { c: number };
     return ent.c + chk.c;
+  }
+
+  // Sanitation (beta B3·B4) — runs on EVERY reconciliation entry, even when no
+  // NULL rows exist, so profile changes and legacy split states are repaired
+  // before vector eligibility can open:
+  //   1. entity vectors without metadata (orphans)      -> delete vector
+  //   2. entity metadata without vector (split state)   -> delete metadata (row becomes a backfill target)
+  //   3. provenance-stamped rows whose compatibility profile != current
+  //      (old engine/model profile)                     -> delete-to-missing
+  //   4. chunk metadata stamped but vectorless          -> normalize to missing (NULL provenance)
+  private sanitize(db: Database.Database): number {
+    const profileId = this.deps.currentProfileId();
+    let touched = 0;
+    const tx = db.transaction(() => {
+      touched += db.prepare(
+        `DELETE FROM entity_embeddings WHERE rowid NOT IN (SELECT rowid FROM entity_embedding_metadata)`
+      ).run().changes;
+      touched += db.prepare(
+        `DELETE FROM entity_embedding_metadata WHERE rowid NOT IN (SELECT rowid FROM entity_embeddings)`
+      ).run().changes;
+      const staleEnt = db.prepare(
+        `SELECT m.rowid FROM entity_embedding_metadata m
+         WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ?`
+      ).all(profileId) as Array<{ rowid: number }>;
+      for (const r of staleEnt) {
+        db.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(r.rowid)}`);
+        db.prepare(`DELETE FROM entity_embedding_metadata WHERE rowid = ?`).run(r.rowid);
+        touched++;
+      }
+      const staleChunk = db.prepare(
+        `SELECT m.rowid FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid
+         WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ?`
+      ).all(profileId) as Array<{ rowid: number }>;
+      for (const r of staleChunk) {
+        db.exec(`DELETE FROM chunks WHERE rowid = ${Number(r.rowid)}`);
+        db.prepare(`UPDATE chunk_metadata SET input_hash = NULL, profile_id = NULL, provenance_state = NULL WHERE rowid = ?`).run(r.rowid);
+        touched++;
+      }
+      touched += db.prepare(
+        `UPDATE chunk_metadata SET input_hash = NULL, profile_id = NULL, provenance_state = NULL
+         WHERE provenance_state IS NOT NULL AND rowid NOT IN (SELECT rowid FROM chunks)`
+      ).run().changes;
+    });
+    tx();
+    if (touched > 0) console.error(`🧾 provenance sanitation: ${touched} split-state/old-profile rows invalidated`);
+    return touched;
   }
 
   // Single-flight, idempotent. off mode defers (spec §9); fresh DBs go straight
@@ -94,12 +145,14 @@ export class BackfillCoordinator {
     const db = this.deps.db();
     if (!db) { this.recon = 'failed'; this.reconError = 'db not initialized'; return; }
     if (this.recon === 'complete' || this.recon === 'n/a') return;
-    const legacy = this.countNullWithVector(db);
     if (this.deps.mode() === 'off') {
-      this.recon = legacy > 0 ? 'deferred' : 'n/a';
+      // No sanitation writes in off mode either — classification only (spec §3 N4).
+      this.recon = this.countNullWithVector(db) > 0 ? 'deferred' : 'n/a';
       this.reconPromise = null; // a later lazy/eager restart may re-run
       return;
     }
+    this.sanitize(db); // split states + old profiles first (beta B3·B4)
+    const legacy = this.countNullWithVector(db);
     if (legacy === 0) { this.recon = 'n/a'; this.kick(); return; }
     this.recon = 'running';
     console.error(`🧾 provenance reconciliation: ${legacy} legacy vector rows to examine...`);
@@ -113,6 +166,13 @@ export class BackfillCoordinator {
       console.error('✅ provenance reconciliation complete');
       this.kick();
     } catch (e) {
+      if (this.shuttingDown) {
+        // Interrupted by shutdown, not broken: next boot resumes the remaining
+        // NULL rows (per-row transactions make this crash-safe).
+        this.recon = 'pending';
+        this.reconPromise = null;
+        return;
+      }
       this.recon = 'failed';
       this.reconError = e instanceof Error ? e.message : String(e);
       console.error(`❌ reconciliation failed — vector search stays disabled: ${this.reconError}`);
@@ -122,11 +182,21 @@ export class BackfillCoordinator {
   private async reconcileEntities(db: Database.Database): Promise<void> {
     const profileId = this.deps.currentProfileId();
     const allow = this.deps.grandfatherAllowed();
+    // Malformed rows (NULL embedding_text / unbuildable current text) are
+    // dropped fail-closed AND recorded (spec §6b — beta 1R supplement).
+    const recordMalformed = db.prepare(
+      `INSERT INTO embedding_backfill_failures (kind, target_id, input_hash, profile_id, attempts, last_error, updated_at)
+       VALUES ('entity', ?, NULL, ?, 0, ?, datetime('now'))
+       ON CONFLICT(kind, target_id) DO UPDATE SET last_error = excluded.last_error, updated_at = datetime('now')`);
     for (;;) {
       if (this.shuttingDown) throw new Error('shutdown during reconciliation');
+      // Vector-join (beta B3): only rows that actually have a vector are
+      // grandfather candidates — metadata-without-vector was already removed by
+      // sanitize().
       const rows = db.prepare(
-        `SELECT rowid, entity_id, embedding_text FROM entity_embedding_metadata
-         WHERE provenance_state IS NULL LIMIT ${RECON_BATCH}`
+        `SELECT m.rowid, m.entity_id, m.embedding_text FROM entity_embedding_metadata m
+         JOIN entity_embeddings v ON v.rowid = m.rowid
+         WHERE m.provenance_state IS NULL LIMIT ${RECON_BATCH}`
       ).all() as Array<{ rowid: number; entity_id: string; embedding_text: string | null }>;
       if (rows.length === 0) return;
       for (const row of rows) {
@@ -151,11 +221,21 @@ export class BackfillCoordinator {
           ).run(hash, profileId, row.rowid);
         });
         try {
-          if (!allow || row.embedding_text === null) { dropTx(); continue; }
+          if (!allow) { dropTx(); continue; }
+          if (row.embedding_text === null) {
+            dropTx();
+            recordMalformed.run(row.entity_id, profileId, 'reconciliation: stored embedding_text is NULL');
+            continue;
+          }
           const currentHash = this.deps.buildEntityInputHash(row.entity_id);
+          if (currentHash === null) {
+            dropTx();
+            recordMalformed.run(row.entity_id, profileId, 'reconciliation: current entity text unbuildable (malformed observations?)');
+            continue;
+          }
           const storedHash = this.deps.hashEntityText(row.embedding_text);
-          if (currentHash !== null && storedHash === currentHash) stampTx(currentHash);
-          else dropTx(); // stale (e.g. old deleteObservations residue) or malformed -> missing
+          if (storedHash === currentHash) stampTx(currentHash);
+          else dropTx(); // stale (e.g. old deleteObservations residue) -> missing, normal backfill target
         } catch (rowErr) {
           // Row-level isolation: try to invalidate; if even that fails, escalate.
           try { dropTx(); } catch {
@@ -310,14 +390,17 @@ export class BackfillCoordinator {
 
       // Phase 2: entities.
       const entityRows = db.prepare(
-        `SELECT e.id, m.input_hash, m.profile_id, m.provenance_state, m.rowid AS meta_rowid
+        `SELECT e.id, m.input_hash, m.profile_id, m.provenance_state, m.rowid AS meta_rowid,
+                CASE WHEN m.rowid IS NOT NULL AND EXISTS(SELECT 1 FROM entity_embeddings v WHERE v.rowid = m.rowid) THEN 1 ELSE 0 END AS has_vec
          FROM entities e LEFT JOIN entity_embedding_metadata m ON m.entity_id = e.id`
-      ).all() as Array<{ id: string; input_hash: string | null; profile_id: number | null; provenance_state: string | null; meta_rowid: number | null }>;
+      ).all() as Array<{ id: string; input_hash: string | null; profile_id: number | null; provenance_state: string | null; meta_rowid: number | null; has_vec: number }>;
       for (const row of entityRows) {
         if (this.shuttingDown || !this.eligible) return;
         const currentHash = this.deps.buildEntityInputHash(row.id);
         if (currentHash === null) continue;                      // malformed entity: leave to explicit repair
-        const isTarget = row.meta_rowid === null
+        // Vector existence checked explicitly (beta B3): metadata alone is not
+        // proof of an embedded row.
+        const isTarget = row.meta_rowid === null || !row.has_vec
           || (row.provenance_state !== null && (row.profile_id !== profileId || row.input_hash !== currentHash));
         if (!isTarget) continue;
         if (shouldSkip('entity', row.id, currentHash)) continue;
@@ -348,8 +431,10 @@ export class BackfillCoordinator {
       `SELECT m.provenance_state s, COUNT(*) c FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid
        GROUP BY m.provenance_state`).all() as Array<{ s: string | null; c: number }>;
     const entTotal = (db.prepare(`SELECT COUNT(*) c FROM entities`).get() as { c: number }).c;
+    // Vector-join (beta B3): metadata without an actual vector is missing, not embedded.
     const entBy = db.prepare(
-      `SELECT provenance_state s, COUNT(*) c FROM entity_embedding_metadata GROUP BY provenance_state`
+      `SELECT m.provenance_state s, COUNT(*) c FROM entity_embedding_metadata m
+       JOIN entity_embeddings v ON v.rowid = m.rowid GROUP BY m.provenance_state`
     ).all() as Array<{ s: string | null; c: number }>;
     const pick = (rows: Array<{ s: string | null; c: number }>, s: string) =>
       rows.find(r => r.s === s)?.c ?? 0;
@@ -366,13 +451,21 @@ export class BackfillCoordinator {
     return this.snapshot;
   }
 
-  // spec §3 shutdown order: block new batches, let the current row transaction
-  // finish, settle the loop, then the caller closes the DB.
+  // spec §3 shutdown order (beta B1): block new batches, let the current row
+  // transaction finish, settle BOTH the backfill loop and an in-flight
+  // reconciliation pass, then the caller closes the DB — nothing may touch a
+  // closed handle afterwards.
   async shutdown(deadlineMs = 5000): Promise<void> {
     this.shuttingDown = true;
     if (this.kickTimer) { clearTimeout(this.kickTimer); this.kickTimer = null; }
     if (this.sweepTimer) { clearInterval(this.sweepTimer); this.sweepTimer = null; }
     const deadline = Date.now() + deadlineMs;
+    if (this.reconPromise) {
+      await Promise.race([
+        this.reconPromise.catch(() => { /* settled */ }),
+        new Promise(r => setTimeout(r, Math.max(0, deadline - Date.now()))),
+      ]);
+    }
     while (this.scanning && Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 20));
     }

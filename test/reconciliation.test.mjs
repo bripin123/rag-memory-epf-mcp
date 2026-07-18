@@ -58,6 +58,23 @@ db.prepare(`INSERT INTO chunk_metadata (chunk_id, document_id, chunk_index, text
 const cnullRowid = db.prepare(`SELECT rowid FROM chunk_metadata WHERE chunk_id='c-null'`).get().rowid;
 db.prepare(`INSERT INTO chunks (rowid, embedding) VALUES (${cnullRowid}, ?)`).run(VEC);
 
+// Split-state fixtures (beta 1R B3): pre-v3.6 non-atomic writes.
+// e-meta-only: metadata WITHOUT a vector row (must be removed -> backfill target).
+seedEntity('entity_e_meta_only', 'e-meta-only', ['[2026-07-18] delta']);
+db.prepare(`INSERT INTO entity_embedding_metadata (rowid, entity_id, embedding_text) VALUES (99991, 'entity_e_meta_only', 'whatever')`).run();
+// orphan vector WITHOUT metadata (must be deleted).
+db.prepare(`INSERT INTO entity_embeddings (rowid, embedding) VALUES (99992, ?)`).run(VEC);
+// Old-profile verified rows (beta 1R B4): a previous compatibility profile must
+// not stay searchable after reconciliation.
+seedEntity('entity_e_oldprof', 'e-oldprof', ['[2026-07-18] epsilon']);
+const rOld = db.prepare(`INSERT INTO entity_embeddings (embedding) VALUES (?)`).run(VEC);
+db.prepare(`INSERT INTO entity_embedding_metadata (rowid, entity_id, embedding_text, input_hash, profile_id, provenance_state)
+  VALUES (?, 'entity_e_oldprof', 'old profile text', 'oldhash', 999, 'verified')`).run(rOld.lastInsertRowid);
+db.prepare(`INSERT INTO chunk_metadata (chunk_id, document_id, chunk_index, text, input_hash, profile_id, provenance_state)
+  VALUES ('c-oldprof','doc1',2,'old profile chunk','oldhash',999,'verified')`).run();
+const coldRowid = db.prepare(`SELECT rowid FROM chunk_metadata WHERE chunk_id='c-oldprof'`).get().rowid;
+db.prepare(`INSERT INTO chunks (rowid, embedding) VALUES (${coldRowid}, ?)`).run(VEC);
+
 // ---- (g) RACE: model ready first, kick before reconciliation ---------------
 assert.equal(mgr.coordinator.reconState, 'pending');
 assert.equal(mgr.coordinator.eligible, false, 'eligible before reconciliation');
@@ -70,13 +87,32 @@ console.log('  OK: backfill barrier - no inference before reconciliation (DoD 20
 await mgr.startReconciliation();
 assert.equal(mgr.coordinator.reconState, 'complete');
 
-// (a) complete invariant: no vector-bearing row remains provenance NULL
-const nullEnt = db.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE provenance_state IS NULL`).get().c;
+// (a) complete invariant: no VECTOR-BEARING row remains provenance NULL —
+// entity side joined against entity_embeddings (beta 1R test-defect fix).
+const nullEnt = db.prepare(`
+  SELECT COUNT(*) c FROM entity_embedding_metadata m JOIN entity_embeddings v ON v.rowid = m.rowid
+  WHERE m.provenance_state IS NULL`).get().c;
 const nullChunk = db.prepare(`
   SELECT COUNT(*) c FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid
   WHERE m.provenance_state IS NULL`).get().c;
 assert.equal(nullEnt + nullChunk, 0, 'complete invariant violated (DoD 21)');
 console.log('  OK: complete invariant - zero unreconciled vectors');
+
+// (a2) split-state sanitation (beta B3): metadata-only row removed, orphan vector removed
+assert.equal(db.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE entity_id='entity_e_meta_only'`).get().c, 0,
+  'metadata-without-vector not sanitized');
+assert.equal(db.prepare(`SELECT COUNT(*) c FROM entity_embeddings WHERE rowid NOT IN (SELECT rowid FROM entity_embedding_metadata)`).get().c, 0,
+  'orphan vectors not sanitized');
+console.log('  OK: split-state sanitation (meta-only removed, orphans removed)');
+
+// (a3) old-profile sanitation (beta B4): previous-profile verified vectors deleted-to-missing
+assert.equal(db.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE entity_id='entity_e_oldprof'`).get().c, 0,
+  'old-profile entity vector still searchable');
+assert.equal(db.prepare(`SELECT COUNT(*) c FROM chunks WHERE rowid=${coldRowid}`).get().c, 0,
+  'old-profile chunk vector still searchable');
+assert.equal(db.prepare(`SELECT provenance_state FROM chunk_metadata WHERE chunk_id='c-oldprof'`).get().provenance_state, null,
+  'old-profile chunk not normalized to missing');
+console.log('  OK: old-profile verified vectors sanitized before eligibility (DoD 3)');
 
 // (b) matching entity grandfathered: legacy_assumed + input_hash, vector kept
 const eMatch = db.prepare(`SELECT provenance_state, input_hash, profile_id FROM entity_embedding_metadata WHERE entity_id='entity_e_match'`).get();

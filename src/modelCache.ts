@@ -64,19 +64,32 @@ export class ModelDownloadLock {
     }
   }
 
-  // Stale = holder pid is dead, or the lock has seen no progress for 30 min.
-  // Both pid AND recorded start time are consulted to defend against pid reuse.
+  // Stale = holder pid is dead or the lock is unreadable. A LIVE pid is never
+  // reclaimed by age alone (beta B5): a slow 1.2GB download has no heartbeat,
+  // so an mtime rule would mint a second concurrent owner — the exact failure
+  // this lock exists to prevent. A hung-but-alive holder instead surfaces as a
+  // waiter timeout -> gate 'failed' + backoff (honest, no corruption).
+  // startedAt guards against pid reuse: a recycled pid younger than the lock
+  // cannot be the original holder.
   private isStale(): boolean {
     try {
       const info = JSON.parse(readFileSync(this.lockPath, 'utf-8')) as { pid: number; startedAt: number };
       let pidAlive = true;
       try { process.kill(info.pid, 0); } catch { pidAlive = false; }
       if (!pidAlive) return true;
-      const age = Date.now() - statSync(this.lockPath).mtimeMs;
-      return age > STALE_LOCK_MS;
+      const lockMtime = statSync(this.lockPath).mtimeMs;
+      if (info.startedAt && Math.abs(lockMtime - info.startedAt) > STALE_LOCK_MS * 10) return true; // pid-reuse heuristic
+      return false;
     } catch {
       return true; // unreadable lock = stale
     }
+  }
+
+  // Corrupted-cache recovery (beta B5): a marker only proves a PAST verified
+  // load. When a marker-holder ('ready' role) later fails to load, the caller
+  // must invalidate the marker so the next attempt becomes a locked owner.
+  invalidateMarker(): void {
+    try { unlinkSync(this.markerPath); } catch { /* already gone */ }
   }
 
   // Returns 'owner' (caller must download, then markComplete + release) or
@@ -116,8 +129,11 @@ export class ModelDownloadLock {
 
 // Owner-side failure handling: partially downloaded model dirs are quarantined
 // (renamed aside) rather than left in place, so the next attempt starts clean.
+// transformers.js FileCache keys are `<org>/<model>/...` — the on-disk layout
+// nests the model id's path segments under cacheDir (beta B5: a flattened
+// `org_model` path would miss the real files entirely).
 export function quarantinePartialCache(cacheDir: string, modelId: string): void {
-  const dir = join(cacheDir, modelId.replace('/', '_'));
+  const dir = join(cacheDir, ...modelId.split('/'));
   if (existsSync(dir)) {
     try {
       renameSync(dir, `${dir}.quarantine.${Date.now()}`);

@@ -97,19 +97,21 @@ const DB_FILE_PATH = process.env.DB_FILE_PATH
   : defaultDbPath;
 
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/bge-m3';
+// v3.5 default model config — grandfathering legacy vectors is only automatic
+// when the current config matches this (spec §6b custom-model guard). An
+// EXPLICIT `EMBEDDING_MODEL=Xenova/bge-m3` counts as default: same weights,
+// same pin, same grandfather policy (beta 1R consistency fix).
+const IS_DEFAULT_MODEL_CONFIG = !process.env.EMBEDDING_MODEL || process.env.EMBEDDING_MODEL === 'Xenova/bge-m3';
 // Default model pinned to an upstream commit (spec §6c): a shared version-
 // independent cache must never silently swap weights under 'main'. Verified
 // 2026-07-18 via `git ls-remote https://huggingface.co/Xenova/bge-m3` — the
 // same revision the local v3.5 cache was downloaded from. Custom models stay
 // on 'main' (their vectors are never auto-grandfathered anyway).
-const MODEL_REVISION = process.env.EMBEDDING_MODEL ? 'main' : '4de13258303883538bd53b696b452bf8099f0858';
+const MODEL_REVISION = IS_DEFAULT_MODEL_CONFIG ? '4de13258303883538bd53b696b452bf8099f0858' : 'main';
 const MODEL_DTYPE = 'fp16';
 // Entity embedding text builder version — mixed into entity input hashes so a
 // builder change re-backfills entities without touching chunk vectors (spec §6c).
 const TEXT_BUILDER_VERSION = 'tb1';
-// v3.5 default model config — grandfathering legacy vectors is only automatic
-// when the current config matches this (spec §6b custom-model guard).
-const IS_DEFAULT_MODEL_CONFIG = !process.env.EMBEDDING_MODEL || process.env.EMBEDDING_MODEL === 'Xenova/bge-m3';
 
 // Original MCP interfaces
 interface Entity {
@@ -316,7 +318,8 @@ export class RAGKnowledgeGraphManager {
     if (!pf.ok) throw new Error(`model cache dir not writable (${cacheDir}): ${pf.error}`);
     const key = artifactKey(EMBEDDING_MODEL, MODEL_REVISION, MODEL_DTYPE);
     const lock = new ModelDownloadLock(cacheDir, key);
-    const role = await lock.acquireOrWait({ timeoutMs: 10 * 60_000 });
+    // Shutdown aborts the lock wait via the gate's AbortController (spec §3).
+    const role = await lock.acquireOrWait({ timeoutMs: 10 * 60_000, signal: this.gate.abort.signal });
     try {
       this.gate.markDownloading();
       env.allowRemoteModels = true;
@@ -324,6 +327,14 @@ export class RAGKnowledgeGraphManager {
       console.error(`🤖 Loading embedding model: ${EMBEDDING_MODEL} (1024-dim, cache=${cacheDir})...`);
       const model = await pipeline('feature-extraction', EMBEDDING_MODEL,
         { revision: MODEL_REVISION, dtype: MODEL_DTYPE, cache_dir: cacheDir } as any);
+      // dims fail-fast (spec §2 / beta B8): probe the ACTUAL output length — a
+      // 384/768-dim custom model must fail here with a clear message, not at
+      // every subsequent vector write.
+      const probe = await model('dimension probe', { pooling: 'cls', normalize: true });
+      const actualDims = (probe.data as Float32Array).length;
+      if (actualDims !== 1024) {
+        throw new Error(`embedding model ${EMBEDDING_MODEL} outputs ${actualDims} dims — this engine's vec0 tables are fixed at 1024. Use a 1024-dim model.`);
+      }
       if (role === 'owner') lock.markComplete();
       console.error(`✅ ${EMBEDDING_MODEL} model loaded (${MODEL_DTYPE})`);
       return async (text: string, dims: number, isQuery: boolean) => {
@@ -332,7 +343,16 @@ export class RAGKnowledgeGraphManager {
         return new Float32Array((r.data as Float32Array).slice(0, dims));
       };
     } catch (e) {
-      if (role === 'owner') quarantinePartialCache(cacheDir, EMBEDDING_MODEL);
+      if (role === 'owner') {
+        quarantinePartialCache(cacheDir, EMBEDDING_MODEL);
+      } else {
+        // 'ready' role failed to load from a marker-blessed cache: the cache is
+        // corrupted. Invalidate the marker and quarantine so the next attempt
+        // becomes a LOCKED owner instead of an unlocked re-download stampede
+        // (beta B5).
+        lock.invalidateMarker();
+        quarantinePartialCache(cacheDir, EMBEDDING_MODEL);
+      }
       throw e;
     } finally {
       lock.release();
@@ -402,6 +422,25 @@ export class RAGKnowledgeGraphManager {
     }
   }
 
+  // §6a-1 (beta B2): the entity change and the stale-vector removal commit in
+  // ONE synchronous transaction, BEFORE any inference await. No window exists
+  // where another tool call can retrieve the pre-mutation vector, and a crash
+  // between mutation and re-embed leaves a clean missing state (backfill
+  // target), never a stale-searchable one.
+  private mutateEntityAndInvalidate(entityId: string, mutate: () => void): void {
+    const tx = this.db!.transaction(() => {
+      mutate();
+      const meta = this.db!.prepare(`SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?`)
+        .get(entityId) as { rowid: number } | undefined;
+      if (meta) {
+        this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(meta.rowid)}`);
+        this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`).run(entityId);
+      }
+    });
+    tx();
+    this.coordinator?.invalidateCoverage();
+  }
+
   // §6a-1 invariant: when an entity's embedding input changed but re-embedding
   // is unavailable, its old vector must not stay searchable.
   invalidateEntityVector(entityId: string): void {
@@ -444,21 +483,28 @@ export class RAGKnowledgeGraphManager {
     }
   }
 
-  // spec §3 shutdown order: block new batches -> settle coordinator -> settle
-  // gate -> close DB -> natural exit. process.exit is forbidden while an ONNX
-  // session exists (runtime mutex crash) — but if the model never finished
-  // loading there is NO ONNX session, and an in-flight download fetch would
-  // otherwise hold the event loop indefinitely, so a bounded exit is safe and
-  // required there (advisor 4R M5 / N6 distinction).
+  // spec §3 shutdown order (beta B1): block new batches -> settle coordinator
+  // (INCLUDING an in-flight reconciliation pass) -> settle gate (INCLUDING an
+  // in-flight model load, bounded) -> close DB -> natural exit.
+  //
+  // Bounded-exit rationale, re-derived after beta 1R: the exit decision is made
+  // AFTER the settle wait, not before — if the load completed during settling
+  // (ONNX session now exists) we take the natural-exit path. Only when the load
+  // is STILL pending after the deadline (dominant case: the 1.2GB download,
+  // which is un-abortable through transformers.js and would hold the event
+  // loop indefinitely) do we exit(). At that point the DB is already closed
+  // cleanly, so even the residual worst case — the load being inside ONNX
+  // session construction at exit — risks an ugly abort message, never data
+  // loss. Hanging forever is the alternative and is worse.
   async shutdownAll(): Promise<void> {
     console.error('\n🧹 Cleaning up...');
-    try { await this.coordinator?.shutdown(); } catch { /* settle best-effort */ }
-    const modelWasLoading = this.gate && (this.gate.status.state === 'loading' || this.gate.status.state === 'downloading');
+    try { await this.coordinator?.shutdown(5000); } catch { /* settle best-effort */ }
     try { await this.gate?.shutdown(5000); } catch { /* settle best-effort */ }
+    const loadStillPending = this.gate?.loadInFlight ?? false;
     try { this.cleanup(); } catch { /* DB close */ }
     process.exitCode = process.exitCode ?? 0;
-    if (modelWasLoading) {
-      console.error('… model load/download was in flight (no ONNX session yet) — bounded exit');
+    if (loadStillPending) {
+      console.error('… model load/download still in flight after settle deadline — bounded exit (DB already closed)');
       process.exit(process.exitCode);
     }
   }
@@ -553,8 +599,10 @@ export class RAGKnowledgeGraphManager {
           if (newObs.length > 0 || needsTypeUpdate) {
             const mergedObs = [...currentObs, ...newObs];
             const updatedType = needsTypeUpdate ? entity.entityType : existing.entityType;
-            this.db.prepare(`UPDATE entities SET observations = ?, entityType = ? WHERE id = ?`)
-              .run(JSON.stringify(mergedObs), updatedType, entityId);
+            this.mutateEntityAndInvalidate(entityId, () => {
+              this.db!.prepare(`UPDATE entities SET observations = ?, entityType = ? WHERE id = ?`)
+                .run(JSON.stringify(mergedObs), updatedType, entityId);
+            });
 
             console.error(`♻️ Upserted entity: ${entity.name} (+${newObs.length} obs${needsTypeUpdate ? ', type→' + updatedType : ''})`);
             const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
@@ -631,11 +679,13 @@ export class RAGKnowledgeGraphManager {
 
       if (newObservations.length > 0) {
         const updatedObservations = [...currentObservations, ...newObservations];
-        
-        this.db.prepare(`
-          UPDATE entities SET observations = ? WHERE id = ?
-        `).run(JSON.stringify(updatedObservations), entityId);
-        
+
+        this.mutateEntityAndInvalidate(entityId, () => {
+          this.db!.prepare(`
+            UPDATE entities SET observations = ? WHERE id = ?
+          `).run(JSON.stringify(updatedObservations), entityId);
+        });
+
         // Regenerate embedding for the updated entity (queued when not ready)
         console.error(`🔮 Regenerating embedding for updated entity: ${obs.entityName}`);
         const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
@@ -754,8 +804,10 @@ export class RAGKnowledgeGraphManager {
         results.push({ entityName: deletion.entityName, deleted: 0, embedding_status: 'n/a' });
         continue;
       }
-      this.db.prepare(`UPDATE entities SET observations = ? WHERE id = ?`)
-        .run(JSON.stringify(filteredObservations), entityId);
+      this.mutateEntityAndInvalidate(entityId, () => {
+        this.db!.prepare(`UPDATE entities SET observations = ? WHERE id = ?`)
+          .run(JSON.stringify(filteredObservations), entityId);
+      });
       const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
       total += deleted;
       results.push({ entityName: deletion.entityName, deleted, embedding_status });
@@ -1064,15 +1116,24 @@ export class RAGKnowledgeGraphManager {
       observations: string;
     }>();
 
-    for (const variant of queryVariants) {
-      const embedding = await this.generateEmbedding(variant, 1024, true);
-      const variantResults = searchEntities(embedding, limit * 2);
-      for (const result of variantResults) {
-        const existing = resultMap.get(result.entity_id);
-        if (!existing || result.distance < existing.distance) {
-          resultMap.set(result.entity_id, result);
+    try {
+      for (const variant of queryVariants) {
+        const embedding = await this.generateEmbedding(variant, 1024, true);
+        const variantResults = searchEntities(embedding, limit * 2);
+        for (const result of variantResults) {
+          const existing = resultMap.get(result.entity_id);
+          if (!existing || result.distance < existing.distance) {
+            resultMap.set(result.entity_id, result);
+          }
         }
       }
+    } catch (embErr) {
+      // Ready-state inference failure degrades to FTS instead of failing the
+      // tool (beta B6) — same contract as hybridSearch. The gate's own
+      // consecutive-failure counter handles the systemic transition.
+      console.error(`⚠️ searchNodes vector path failed — FTS fallback:`, embErr instanceof Error ? embErr.message : embErr);
+      return { ...this.searchNodesFts(query, limit, since, until), search_mode: 'fts-only',
+        ...stateFields(), degradation_reason: this.degradationReason() ?? 'inference_error' };
     }
 
     const entityResults = Array.from(resultMap.values()).sort((a, b) => a.distance - b.distance).slice(0, limit);
@@ -1488,7 +1549,8 @@ export class RAGKnowledgeGraphManager {
     }
     
     console.error(`✅ Entity embeddings completed: ${embeddedCount}/${entities.length} entities embedded`);
-    
+    this.coordinator?.invalidateCoverage();
+
     return {
       totalEntities: entities.length,
       embeddedEntities: embeddedCount
@@ -1927,9 +1989,13 @@ export class RAGKnowledgeGraphManager {
       try { existingHash = JSON.parse(existingDoc.metadata)?.content_hash; } catch { /* ignore */ }
       if (existingHash === contentHash) {
         const cmCount = (this.db.prepare(`SELECT count(*) AS n FROM chunk_metadata WHERE document_id = ?`).get(documentId) as { n: number }).n;
+        // "Embedded" for dedup completeness = vector exists AND its profile is
+        // current (or legacy-NULL awaiting grandfather). Raw vector counts
+        // would misjudge old-profile rows as complete (beta 1R supplement).
         const embCount = (this.db.prepare(`
-          SELECT count(*) AS n FROM chunks c JOIN chunk_metadata m ON c.rowid = m.rowid WHERE m.document_id = ?
-        `).get(documentId) as { n: number }).n;
+          SELECT count(*) AS n FROM chunks c JOIN chunk_metadata m ON c.rowid = m.rowid
+          WHERE m.document_id = ? AND (m.provenance_state IS NULL OR m.profile_id = ?)
+        `).get(documentId, this.currentProfileId) as { n: number }).n;
         const linked = (this.db.prepare(`
           SELECT count(DISTINCT ce.entity_id) AS n FROM chunk_entities ce
           JOIN chunk_metadata m ON ce.chunk_rowid = m.rowid WHERE m.document_id = ?
@@ -2158,6 +2224,7 @@ export class RAGKnowledgeGraphManager {
     }
 
     console.error(`✅ Chunks embedded: ${embeddedCount}/${chunks.length}`);
+    this.coordinator?.invalidateCoverage();
 
     // Auto-link entities to document after embedding
     const linkedCount = await this.autoLinkEntities(documentId);
@@ -2672,6 +2739,9 @@ export class RAGKnowledgeGraphManager {
     if (!this.encoding) throw new Error('Tokenizer not initialized');
     
     console.error(`🔍 Enhanced hybrid search: "${query}"`);
+    // Parity with searchNodes (beta 1R supplement): an unsearchable query gets
+    // an explicit warning instead of a silent empty envelope.
+    const ftsUnsearchable = compileFtsLiteralQuery(query) === null;
     const queryVariants = this.buildCrossLingualVariants(query);
     if (queryVariants.length > 1) {
       console.error(`🌐 Cross-lingual variants: ${queryVariants.slice(1).join(' | ')}`);
@@ -2749,8 +2819,10 @@ export class RAGKnowledgeGraphManager {
         }
       } catch (embErr) {
         vectorDegraded = true;
-        degradationReason = 'model_not_ready';
-        console.error(`⚠️ Vector search unavailable (embedding model down) — degrading to FTS5-only:`, embErr instanceof Error ? embErr.message : embErr);
+        // 'inference_error' (not 'model_not_ready'): model_state may still read
+        // 'ready' here — a contradictory reason pair confused callers (beta B6).
+        degradationReason = this.degradationReason() ?? 'inference_error';
+        console.error(`⚠️ Vector search unavailable — degrading to FTS5-only:`, embErr instanceof Error ? embErr.message : embErr);
       }
     }
     const vectorResults = Array.from(resultMap.values()).sort((a, b) => a.distance - b.distance);
@@ -2851,6 +2923,7 @@ export class RAGKnowledgeGraphManager {
         model_state: this.gate.status.state,
         coverage: { chunk_pct: chunkPctE, graph_coverage_pct: graphPctE },
         ...(degradationReason ? { degradation_reason: degradationReason } : {}),
+        ...(ftsUnsearchable ? { warning: 'query has no searchable terms for FTS' } : {}),
       };
     }
 
@@ -3095,6 +3168,7 @@ export class RAGKnowledgeGraphManager {
       model_state: this.gate.status.state,
       coverage: { chunk_pct: chunkPct, graph_coverage_pct: graphPct },
       ...(degradationReason ? { degradation_reason: degradationReason } : {}),
+      ...(ftsUnsearchable ? { warning: 'query has no searchable terms for FTS' } : {}),
     };
   }
 
@@ -3247,8 +3321,8 @@ export class RAGKnowledgeGraphManager {
         reconciliation_state: this.coordinator?.reconState ?? 'n/a',
         reconciliation_last_error: this.coordinator?.reconLastError ?? null,
         coverage: cov ? {
-          chunk: { total: cov.chunk.total, embedded: cov.chunk.embedded, verified: cov.chunk.verified, legacy_assumed: cov.chunk.legacy_assumed },
-          entity: { total: cov.entity.total, embedded: cov.entity.embedded, verified: cov.entity.verified, legacy_assumed: cov.entity.legacy_assumed },
+          chunk: { total: cov.chunk.total, embedded: cov.chunk.embedded, verified: cov.chunk.verified, legacy_assumed: cov.chunk.legacy_assumed, missing: cov.chunk.total - cov.chunk.embedded },
+          entity: { total: cov.entity.total, embedded: cov.entity.embedded, verified: cov.entity.verified, legacy_assumed: cov.entity.legacy_assumed, missing: cov.entity.total - cov.entity.embedded },
         } : null,
       }
     };
@@ -3757,6 +3831,10 @@ async function main() {
       // Background: model load + provenance reconciliation run in parallel.
       // Failures surface via gate/coordinator state, never as rejections.
       void ragKgManager.gate.start().catch(() => {});
+      void ragKgManager.startReconciliation().catch(() => {});
+    } else if (ragKgManager.embeddingsMode === 'off') {
+      // off mode still CLASSIFIES reconciliation state (deferred vs n/a) so
+      // stats honor the mode matrix — no sanitation, no inference (beta B7).
       void ragKgManager.startReconciliation().catch(() => {});
     }
 

@@ -37,7 +37,8 @@
     "rag-memory-mcp": "dist/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "docs/UPDATING.md"
   ],
   "scripts": {
     "build": "tsc && shx chmod +x dist/*.js",

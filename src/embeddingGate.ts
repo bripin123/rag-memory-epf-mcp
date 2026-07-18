@@ -61,6 +61,9 @@ export class EmbeddingGate {
   private shuttingDown = false;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private attempt = 0;
+  private inferenceFailures = 0;                 // consecutive DISTINCT-input failures; 3 -> failed + reload (beta B6)
+  private lastFailedText: string | null = null;  // same-input retries are data-specific (poison row), not systemic
+  readonly abort = new AbortController();        // loader passes this to lock waits / fetches
   private readySince?: string;
   private lastError?: string;
   private retryAt?: string;
@@ -151,25 +154,68 @@ export class EmbeddingGate {
     this.running = true;
     void this.embedFn(job.text, job.dims, job.isQuery)
       .then(v => {
+        this.inferenceFailures = 0;
+        this.lastFailedText = null;
         if (job.gen === this.generation) job.resolve(v);
         else job.reject(new Error('embedding discarded: gate shut down'));
       })
-      .catch(e => job.reject(e))
+      .catch(e => {
+        // Systemic-failure detection (beta B6): a ready model that keeps
+        // throwing on DIFFERENT inputs must not stay 'ready' forever — after 3
+        // consecutive distinct-input failures transition to failed and re-enter
+        // the load/backoff cycle. Same-input repeats are data-specific (a
+        // poison row) and belong to the backfill attempts cap, not to model
+        // demotion — otherwise one bad row would drive endless reload loops.
+        if (this.lastFailedText !== job.text) {
+          this.inferenceFailures++;
+          this.lastFailedText = job.text;
+        }
+        if (this.inferenceFailures >= 3 && this.state === 'ready' && !this.shuttingDown) {
+          this.lastError = e instanceof Error ? e.message : String(e);
+          this.embedFn = null;
+          this.startPromise = null;
+          this.setState('failed');
+          const delay = this.backoff[0];
+          this.retryAt = new Date(Date.now() + delay).toISOString();
+          this.retryTimer = setTimeout(() => {
+            this.retryTimer = null;
+            void this.start().catch(() => { /* surfaced via state */ });
+          }, delay);
+          this.retryTimer.unref?.();
+          for (const j of this.queue.splice(0)) j.reject(new GateNotReadyError('failed'));
+        }
+        job.reject(e);
+      })
       .finally(() => {
         this.running = false;
         this.pump();
       });
   }
 
-  // Graceful shutdown (spec §3): block new work, discard in-flight results via
-  // generation token, clear retry timers, wait (bounded) for the current
-  // inference to settle. Never calls process.exit.
+  // Was the load still in flight when shutdown settled? (index.ts uses this to
+  // decide whether a bounded exit is needed — see shutdownAll.)
+  get loadInFlight(): boolean {
+    return this.startPromise !== null && this.state !== 'ready' && this.state !== 'failed' && this.state !== 'disabled';
+  }
+
+  // Graceful shutdown (spec §3, beta B1): block new work, abort what we can
+  // (lock waits via this.abort), discard in-flight inference results via the
+  // generation token, clear retry timers, then wait (bounded) for BOTH the
+  // current inference and an in-flight model load to settle.
   async shutdown(deadlineMs = 5000): Promise<void> {
     this.shuttingDown = true;
     this.generation++;
+    this.abort.abort();
     if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
     for (const j of this.queue.splice(0)) j.reject(new Error('gate shutdown'));
     const deadline = Date.now() + deadlineMs;
+    if (this.startPromise) {
+      const remaining = () => Math.max(0, deadline - Date.now());
+      await Promise.race([
+        this.startPromise.catch(() => { /* settled by failure is settled */ }),
+        new Promise(r => setTimeout(r, remaining())),
+      ]);
+    }
     while (this.running && Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 20));
     }

@@ -86,10 +86,12 @@ back to the default, the stored vectors cannot be attributed reliably. Run
   MCP server processes coexist (idle servers swap out to a few MB RSS). Each
   server that actually loads the model needs bge-m3 fp16 resident memory
   (~1.5–2GB while active). Keep concurrently *model-active* servers to a
-  handful; sessions that don't need semantic search can run
-  `RAG_MEMORY_EMBEDDINGS=off`. In v3.6 lazy mode, sessions that never call an
-  embedding tool never load the model at all — idle footprint drops compared
-  to v3.5's eager boot.
+  handful; sessions that don't need semantic search should run
+  `RAG_MEMORY_EMBEDDINGS=off`. Note that **lazy mode still starts the model
+  load in the background right after connect** (so hybrid search becomes
+  available without any tool call) — `off` is the only zero-load mode. When
+  restarting many CLIs at once, the shared cache download happens once (lock),
+  but each process that finishes loading holds its own model memory.
 
 ## v3.6 breaking response changes
 
