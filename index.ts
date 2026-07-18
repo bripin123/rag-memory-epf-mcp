@@ -34,7 +34,7 @@ import { chunkText as splitTextIntoChunks } from './src/chunkText.js';
 import { migrations } from './src/migrations/migrations.js';
 
 // v3.6 lite install: model lifecycle + version-independent cache (A′ boundary)
-import { EmbeddingGate, GateNotReadyError, GateDisabledError } from './src/embeddingGate.js';
+import { EmbeddingGate, GateNotReadyError, GateDisabledError, TerminalConfigError } from './src/embeddingGate.js';
 import type { EmbedFn, EmbedPriority } from './src/embeddingGate.js';
 import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock, quarantinePartialCache } from './src/modelCache.js';
 import { BackfillCoordinator } from './src/backfillCoordinator.js';
@@ -333,7 +333,11 @@ export class RAGKnowledgeGraphManager {
       const probe = await model('dimension probe', { pooling: 'cls', normalize: true });
       const actualDims = (probe.data as Float32Array).length;
       if (actualDims !== 1024) {
-        throw new Error(`embedding model ${EMBEDDING_MODEL} outputs ${actualDims} dims — this engine's vec0 tables are fixed at 1024. Use a 1024-dim model.`);
+        // Config incompatibility, NOT cache corruption (beta 2R B3): the
+        // download and load both succeeded — quarantining or retrying cannot
+        // change the model's dimensions.
+        if (role === 'owner') lock.markComplete();  // cache itself is valid
+        throw new TerminalConfigError(`embedding model ${EMBEDDING_MODEL} outputs ${actualDims} dims — this engine's vec0 tables are fixed at 1024. Use a 1024-dim model.`);
       }
       if (role === 'owner') lock.markComplete();
       console.error(`✅ ${EMBEDDING_MODEL} model loaded (${MODEL_DTYPE})`);
@@ -343,15 +347,21 @@ export class RAGKnowledgeGraphManager {
         return new Float32Array((r.data as Float32Array).slice(0, dims));
       };
     } catch (e) {
-      if (role === 'owner') {
-        quarantinePartialCache(cacheDir, EMBEDDING_MODEL);
-      } else {
-        // 'ready' role failed to load from a marker-blessed cache: the cache is
-        // corrupted. Invalidate the marker and quarantine so the next attempt
-        // becomes a LOCKED owner instead of an unlocked re-download stampede
-        // (beta B5).
-        lock.invalidateMarker();
-        quarantinePartialCache(cacheDir, EMBEDDING_MODEL);
+      // Error classification (beta 2R B3):
+      // - TerminalConfigError: cache is fine — no quarantine, no marker change.
+      // - owner-role failure: the download was in OUR hands and did not reach a
+      //   verified state -> quarantine partials (retention keeps 1).
+      // - ready-role failure (marker existed): files MAY be fine (OOM/transient
+      //   errors land here too) -> invalidate the marker only; the next attempt
+      //   becomes a locked owner and re-validates. If THAT owner also fails,
+      //   its own owner-path quarantine cleans the cache — bounded, no
+      //   good-cache trashing on the first transient error.
+      if (!(e instanceof TerminalConfigError)) {
+        if (role === 'owner') {
+          quarantinePartialCache(cacheDir, EMBEDDING_MODEL);
+        } else {
+          lock.invalidateMarker();
+        }
       }
       throw e;
     } finally {
@@ -467,16 +477,22 @@ export class RAGKnowledgeGraphManager {
       const embedding = await this.generateEmbedding(row.text, 1024, false, 'backfill');
       const hash = createHash('sha256').update(row.text).digest('hex');
       const safe = Number(rowid);
-      const tx = this.db.transaction(() => {
+      // Write-back CAS (beta 2R B1): the rowid may have been deleted and reused
+      // by a re-sync while inference ran — re-read the CURRENT text in the
+      // transaction and only write when it still matches what was embedded.
+      const tx = this.db.transaction((): boolean => {
+        const cur = this.db!.prepare(`SELECT text FROM chunk_metadata WHERE rowid = ?`).get(rowid) as { text: string | null } | undefined;
+        if (!cur || cur.text !== row.text) return false;       // superseded — discard
         this.db!.exec(`DELETE FROM chunks WHERE rowid = ${safe}`);
         this.db!.prepare(`INSERT INTO chunks (rowid, embedding) VALUES (${safe}, ?)`).run(Buffer.from(embedding.buffer));
         this.db!.prepare(`UPDATE chunk_metadata SET input_hash = ?, profile_id = ?, provenance_state = 'verified' WHERE rowid = ?`)
           .run(hash, this.currentProfileId, rowid);
         this.db!.prepare(`DELETE FROM embedding_backfill_failures WHERE kind = 'chunk' AND target_id = ?`).run(String(rowid));
+        return true;
       });
-      tx();
+      const written = tx();
       this.coordinator?.invalidateCoverage();
-      return true;
+      return written;
     } catch (e) {
       if (e instanceof GateNotReadyError || e instanceof GateDisabledError) return false;
       throw e;
@@ -1502,10 +1518,17 @@ export class RAGKnowledgeGraphManager {
     );
     
     try {
-      // v3.6 (§6a-2): vector replace + provenance stamp commit atomically —
-      // crash leaves either the old verified state or nothing, never a mix.
+      // v3.6 (§6a-2): vector replace + provenance stamp commit atomically.
+      // Write-back CAS (beta 2R B1): the entity may have been mutated again
+      // while THIS inference was in flight — a late writer must never
+      // re-insert a vector for superseded content as 'verified'. Inside the
+      // write transaction the CURRENT entity text is rebuilt and hashed; on
+      // mismatch the result is discarded and the row stays missing/queued for
+      // the backfill pass that the newer mutation already kicked.
       const inputHash = this.hashWithBuilderVersion(embeddingText);
-      const writeTx = this.db.transaction(() => {
+      const writeTx = this.db.transaction((): boolean => {
+        const currentHash = this.entityInputHash(entityId);
+        if (currentHash !== inputHash) return false;           // superseded — discard
         const existingMetadata = this.db!.prepare(`
           SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?
         `).get(entityId) as { rowid: number } | undefined;
@@ -1520,9 +1543,13 @@ export class RAGKnowledgeGraphManager {
           INSERT INTO entity_embedding_metadata (rowid, entity_id, embedding_text, input_hash, profile_id, provenance_state)
           VALUES (?, ?, ?, ?, ?, 'verified')
         `).run(result.lastInsertRowid, entityId, embeddingText, inputHash, this.currentProfileId);
+        return true;
       });
-      writeTx();
-      return true;
+      const written = writeTx();
+      if (!written) {
+        console.error(`⏭️ discarded superseded embedding for ${entityId} (entity changed during inference)`);
+      }
+      return written;
     } catch (error) {
       console.error(`Failed to embed entity ${entityId}:`, error);
       return false;
@@ -3838,9 +3865,11 @@ async function main() {
       void ragKgManager.startReconciliation().catch(() => {});
     }
 
-    // Graceful shutdown (spec §3 order) — transport close FIRST so stdin stops
-    // holding the event loop, then settle coordinator/gate, then DB close.
-    // process.exit() stays forbidden (ONNX runtime mutex crash).
+    // Graceful shutdown (spec §3 order, beta-2R-amended) — transport close
+    // FIRST so stdin stops holding the event loop, then settle coordinator and
+    // gate, then DB close. process.exit is forbidden EXCEPT the one spec'd
+    // case: a model load/download still pending after the settle deadline
+    // (un-abortable fetch would hold the loop forever) — see shutdownAll.
     let shuttingDown = false;
     const shutdown = () => {
       if (shuttingDown) return;

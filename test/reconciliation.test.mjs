@@ -159,5 +159,23 @@ assert.equal(db2.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata`).get
 console.log('  OK: custom model guard - no auto grandfather');
 mgr2.cleanup();
 
+// ---- (g2) off mode classifies old-profile rows as deferred, read-only ------
+// (beta 2R residual: repair-needed includes split/old-profile states, and off
+// must not write anything.)
+for (const suffix of ['', '-wal', '-shm']) { const p = dbPath + suffix; if (existsSync(p)) unlinkSync(p); }
+const mgr3 = new mod.RAGKnowledgeGraphManager();
+await mgr3.initialize({ skipModel: true });                  // off mode
+const db3 = mgr3.db;
+db3.prepare(`INSERT INTO entities (id, name, entityType, observations) VALUES ('entity_y','y','CONCEPT','[]')`).run();
+const r3 = db3.prepare(`INSERT INTO entity_embeddings (embedding) VALUES (?)`).run(VEC);
+db3.prepare(`INSERT INTO entity_embedding_metadata (rowid, entity_id, embedding_text, input_hash, profile_id, provenance_state)
+  VALUES (?, 'entity_y', 'old', 'h', 999, 'verified')`).run(r3.lastInsertRowid);
+await mgr3.startReconciliation();
+assert.equal(mgr3.coordinator.reconState, 'deferred', 'off mode missed old-profile repair need');
+assert.equal(db3.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE entity_id='entity_y'`).get().c, 1,
+  'off mode wrote to the DB (must be classification only)');
+console.log('  OK: off mode -> deferred on old-profile rows, zero writes');
+mgr3.cleanup();
+
 rmSync(dir, { recursive: true, force: true });
 console.log('RECONCILIATION OK');

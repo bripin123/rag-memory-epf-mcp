@@ -8,7 +8,7 @@
 // Lock/marker keys use ONLY cache-artifact fields (model id, revision, dtype) —
 // never retrieval config (spec §6c layer 1).
 
-import { mkdirSync, writeFileSync, readFileSync, unlinkSync, existsSync, renameSync, statSync, rmSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, unlinkSync, existsSync, renameSync, rmSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -68,21 +68,23 @@ export class ModelDownloadLock {
   // reclaimed by age alone (beta B5): a slow 1.2GB download has no heartbeat,
   // so an mtime rule would mint a second concurrent owner — the exact failure
   // this lock exists to prevent. A hung-but-alive holder instead surfaces as a
-  // waiter timeout -> gate 'failed' + backoff (honest, no corruption).
-  // startedAt guards against pid reuse: a recycled pid younger than the lock
-  // cannot be the original holder.
+  // waiter timeout -> gate 'failed' + backoff, with the lock path and holder
+  // pid in the error so an operator can verify and remove it manually (the
+  // recovery procedure lives in docs/UPDATING.md). No pid-reuse heuristic:
+  // there is no portable process-start identity to compare against (beta 2R).
   private isStale(): boolean {
     try {
       const info = JSON.parse(readFileSync(this.lockPath, 'utf-8')) as { pid: number; startedAt: number };
-      let pidAlive = true;
-      try { process.kill(info.pid, 0); } catch { pidAlive = false; }
-      if (!pidAlive) return true;
-      const lockMtime = statSync(this.lockPath).mtimeMs;
-      if (info.startedAt && Math.abs(lockMtime - info.startedAt) > STALE_LOCK_MS * 10) return true; // pid-reuse heuristic
+      try { process.kill(info.pid, 0); } catch { return true; } // pid dead
       return false;
     } catch {
       return true; // unreadable lock = stale
     }
+  }
+
+  private holderPid(): number | null {
+    try { return (JSON.parse(readFileSync(this.lockPath, 'utf-8')) as { pid: number }).pid; }
+    catch { return null; }
   }
 
   // Corrupted-cache recovery (beta B5): a marker only proves a PAST verified
@@ -99,15 +101,23 @@ export class ModelDownloadLock {
     const poll = opts.pollMs ?? 500;
     const deadline = Date.now() + opts.timeoutMs;
     for (;;) {
+      // Abort FIRST (beta 2R B5): a shutdown-aborted waiter must never become
+      // an owner or report 'ready' and start a pipeline load.
+      if (opts.signal?.aborted) throw new Error('model download lock wait aborted');
       if (existsSync(this.markerPath)) return 'ready';
       if (this.tryAcquire()) return 'owner';
       if (this.isStale()) {
         try { unlinkSync(this.lockPath); } catch { /* raced with another reclaimer */ }
         continue;
       }
-      if (opts.signal?.aborted) throw new Error('model download lock wait aborted');
-      if (Date.now() > deadline) throw new Error(`model download lock wait timed out (${this.lockPath})`);
-      await new Promise(r => setTimeout(r, poll));
+      if (Date.now() > deadline) {
+        throw new Error(`model download lock wait timed out — holder pid=${this.holderPid() ?? 'unknown'}, lock=${this.lockPath}. If that process is hung, verify and remove the lock file manually (see docs/UPDATING.md).`);
+      }
+      // Abortable sleep: shutdown does not have to ride out the poll interval.
+      await new Promise<void>(resolve => {
+        const t = setTimeout(resolve, poll);
+        opts.signal?.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
+      });
     }
   }
 
@@ -141,4 +151,16 @@ export function quarantinePartialCache(cacheDir: string, modelId: string): void 
       rmSync(dir, { recursive: true, force: true });
     }
   }
+  // Retention (beta 2R B3): keep only the newest quarantine — repeated failures
+  // must not accumulate 1.2GB directories.
+  try {
+    const parent = join(cacheDir, ...modelId.split('/').slice(0, -1));
+    const leaf = modelId.split('/').pop() as string;
+    const quarantines = readdirSync(parent)
+      .filter(f => f.startsWith(`${leaf}.quarantine.`))
+      .sort();
+    for (const old of quarantines.slice(0, -1)) {
+      rmSync(join(parent, old), { recursive: true, force: true });
+    }
+  } catch { /* parent may not exist */ }
 }

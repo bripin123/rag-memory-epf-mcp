@@ -58,6 +58,7 @@ export class BackfillCoordinator {
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private shuttingDown = false;
   private scanning = false;
+  private scanPromise: Promise<void> | null = null;
   private snapshot: CoverageSnapshot | null = null;
 
   constructor(private readonly deps: CoordinatorDeps) {}
@@ -95,40 +96,74 @@ export class BackfillCoordinator {
   //   3. provenance-stamped rows whose compatibility profile != current
   //      (old engine/model profile)                     -> delete-to-missing
   //   4. chunk metadata stamped but vectorless          -> normalize to missing (NULL provenance)
-  private sanitize(db: Database.Database): number {
+  // Read-only repair check — used by off mode to classify deferred vs n/a
+  // without writing (beta 2R residual: split states and old profiles also
+  // count as pending repair work, not only provenance-NULL vectors).
+  private countRepairables(db: Database.Database): number {
+    const profileId = this.deps.currentProfileId();
+    const q = (sql: string, ...args: unknown[]) => (db.prepare(sql).get(...args) as { c: number }).c;
+    return this.countNullWithVector(db)
+      + q(`SELECT COUNT(*) c FROM entity_embeddings WHERE rowid NOT IN (SELECT rowid FROM entity_embedding_metadata)`)
+      + q(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE rowid NOT IN (SELECT rowid FROM entity_embeddings)`)
+      + q(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE provenance_state IS NOT NULL AND profile_id IS NOT ?`, profileId)
+      + q(`SELECT COUNT(*) c FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ?`, profileId);
+  }
+
+  // Batched (beta 2R residual): each batch commits its own transaction and
+  // yields the event loop — a large DB or a profile switch must not stall the
+  // freshly connected server (the lite-install point of it all).
+  private async sanitize(db: Database.Database): Promise<number> {
     const profileId = this.deps.currentProfileId();
     let touched = 0;
-    const tx = db.transaction(() => {
+    const batchTx = db.transaction((fn: () => void) => fn());
+    // Orphan vectors / metadata-without-vector: single set-based statements
+    // (index-backed subqueries — cheap even on large tables).
+    batchTx(() => {
       touched += db.prepare(
         `DELETE FROM entity_embeddings WHERE rowid NOT IN (SELECT rowid FROM entity_embedding_metadata)`
       ).run().changes;
       touched += db.prepare(
         `DELETE FROM entity_embedding_metadata WHERE rowid NOT IN (SELECT rowid FROM entity_embeddings)`
       ).run().changes;
-      const staleEnt = db.prepare(
-        `SELECT m.rowid FROM entity_embedding_metadata m
-         WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ?`
-      ).all(profileId) as Array<{ rowid: number }>;
-      for (const r of staleEnt) {
-        db.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(r.rowid)}`);
-        db.prepare(`DELETE FROM entity_embedding_metadata WHERE rowid = ?`).run(r.rowid);
-        touched++;
-      }
-      const staleChunk = db.prepare(
-        `SELECT m.rowid FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid
-         WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ?`
-      ).all(profileId) as Array<{ rowid: number }>;
-      for (const r of staleChunk) {
-        db.exec(`DELETE FROM chunks WHERE rowid = ${Number(r.rowid)}`);
-        db.prepare(`UPDATE chunk_metadata SET input_hash = NULL, profile_id = NULL, provenance_state = NULL WHERE rowid = ?`).run(r.rowid);
-        touched++;
-      }
       touched += db.prepare(
         `UPDATE chunk_metadata SET input_hash = NULL, profile_id = NULL, provenance_state = NULL
          WHERE provenance_state IS NOT NULL AND rowid NOT IN (SELECT rowid FROM chunks)`
       ).run().changes;
     });
-    tx();
+    await new Promise(r => setImmediate(r));
+    // Old-profile rows: row deletes in bounded batches with yields.
+    for (;;) {
+      if (this.shuttingDown) throw new Error('shutdown during sanitation');
+      const staleEnt = db.prepare(
+        `SELECT m.rowid FROM entity_embedding_metadata m
+         WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ? LIMIT ${RECON_BATCH}`
+      ).all(profileId) as Array<{ rowid: number }>;
+      if (staleEnt.length === 0) break;
+      batchTx(() => {
+        for (const r of staleEnt) {
+          db.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(r.rowid)}`);
+          db.prepare(`DELETE FROM entity_embedding_metadata WHERE rowid = ?`).run(r.rowid);
+          touched++;
+        }
+      });
+      await new Promise(r => setImmediate(r));
+    }
+    for (;;) {
+      if (this.shuttingDown) throw new Error('shutdown during sanitation');
+      const staleChunk = db.prepare(
+        `SELECT m.rowid FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid
+         WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ? LIMIT ${RECON_BATCH}`
+      ).all(profileId) as Array<{ rowid: number }>;
+      if (staleChunk.length === 0) break;
+      batchTx(() => {
+        for (const r of staleChunk) {
+          db.exec(`DELETE FROM chunks WHERE rowid = ${Number(r.rowid)}`);
+          db.prepare(`UPDATE chunk_metadata SET input_hash = NULL, profile_id = NULL, provenance_state = NULL WHERE rowid = ?`).run(r.rowid);
+          touched++;
+        }
+      });
+      await new Promise(r => setImmediate(r));
+    }
     if (touched > 0) console.error(`🧾 provenance sanitation: ${touched} split-state/old-profile rows invalidated`);
     return touched;
   }
@@ -146,12 +181,14 @@ export class BackfillCoordinator {
     if (!db) { this.recon = 'failed'; this.reconError = 'db not initialized'; return; }
     if (this.recon === 'complete' || this.recon === 'n/a') return;
     if (this.deps.mode() === 'off') {
-      // No sanitation writes in off mode either — classification only (spec §3 N4).
-      this.recon = this.countNullWithVector(db) > 0 ? 'deferred' : 'n/a';
+      // No writes in off mode — classification only (spec §3 N4). "Repair
+      // needed" includes split states and old profiles, not just NULL vectors
+      // (beta 2R residual).
+      this.recon = this.countRepairables(db) > 0 ? 'deferred' : 'n/a';
       this.reconPromise = null; // a later lazy/eager restart may re-run
       return;
     }
-    this.sanitize(db); // split states + old profiles first (beta B3·B4)
+    await this.sanitize(db); // split states + old profiles first (beta B3·B4)
     const legacy = this.countNullWithVector(db);
     if (legacy === 0) { this.recon = 'n/a'; this.kick(); return; }
     this.recon = 'running';
@@ -220,17 +257,22 @@ export class BackfillCoordinator {
              SET input_hash = ?, profile_id = ?, provenance_state = 'legacy_assumed' WHERE rowid = ?`
           ).run(hash, profileId, row.rowid);
         });
+        // Malformed-row observability (beta 2R residual): the vector drop and
+        // the failure record commit in ONE transaction — a crash between the
+        // two cannot lose the record.
+        const dropAndRecord = db.transaction((reason: string) => {
+          dropTx();
+          recordMalformed.run(row.entity_id, profileId, reason);
+        });
         try {
           if (!allow) { dropTx(); continue; }
           if (row.embedding_text === null) {
-            dropTx();
-            recordMalformed.run(row.entity_id, profileId, 'reconciliation: stored embedding_text is NULL');
+            dropAndRecord('reconciliation: stored embedding_text is NULL');
             continue;
           }
           const currentHash = this.deps.buildEntityInputHash(row.entity_id);
           if (currentHash === null) {
-            dropTx();
-            recordMalformed.run(row.entity_id, profileId, 'reconciliation: current entity text unbuildable (malformed observations?)');
+            dropAndRecord('reconciliation: current entity text unbuildable (malformed observations?)');
             continue;
           }
           const storedHash = this.deps.hashEntityText(row.embedding_text);
@@ -303,8 +345,11 @@ export class BackfillCoordinator {
     if (this.kickTimer) return;
     this.kickTimer = setTimeout(() => {
       this.kickTimer = null;
-      void this.scanAndBackfill().catch(e =>
-        console.error(`⚠️ backfill scan error: ${e instanceof Error ? e.message : e}`));
+      // Tracked so shutdown can await the whole scan, not just poll `scanning`
+      // (beta 2R B2).
+      this.scanPromise = this.scanAndBackfill()
+        .catch(e => console.error(`⚠️ backfill scan error: ${e instanceof Error ? e.message : e}`))
+        .finally(() => { this.scanPromise = null; });
     }, KICK_DEBOUNCE_MS);
     this.kickTimer.unref?.();
   }
@@ -357,9 +402,14 @@ export class BackfillCoordinator {
         run: () => Promise<boolean>): Promise<'ok' | 'fail' | 'abort'> => {
         try {
           const ok = await run();
+          // beta 2R B2: an inference can outlive both settle deadlines. After
+          // ANY await, no DB statement may run once shutdown started — the DB
+          // handle may already be closed.
+          if (this.shuttingDown) return 'abort';
           if (ok) { clearStmt.run(kind, targetId); consecutive = 0; return 'ok'; }
           failStmt.run(kind, targetId, currentHash, profileId, 'reembed returned false');
         } catch (e) {
+          if (this.shuttingDown) return 'abort';
           failStmt.run(kind, targetId, currentHash, profileId,
             e instanceof Error ? e.message.slice(0, 300) : String(e));
         }
@@ -466,8 +516,17 @@ export class BackfillCoordinator {
         new Promise(r => setTimeout(r, Math.max(0, deadline - Date.now()))),
       ]);
     }
+    if (this.scanPromise) {
+      await Promise.race([
+        this.scanPromise,
+        new Promise(r => setTimeout(r, Math.max(0, deadline - Date.now()))),
+      ]);
+    }
     while (this.scanning && Date.now() < deadline) {
       await new Promise(r => setTimeout(r, 20));
     }
+    // Past the deadline a scan may still be pending on a slow inference — the
+    // shuttingDown guards inside recordResult() make any late completion a
+    // DB-write no-op (beta 2R B2).
   }
 }

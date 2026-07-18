@@ -102,8 +102,30 @@ process.on('unhandledRejection', () => { unhandled++; });
   assert.equal(g.status.state, 'ready', 'reload did not recover');
   const v2 = await g.embed('post-recovery', { priority: 'interactive' });
   assert.equal(v2.length, 1024);
+  // beta 2R B4: a success resets the detector — one later failure must NOT
+  // instantly re-demote.
+  healthy = false;
+  await g.embed('single-late-failure', { priority: 'bulk' }).catch(() => {});
+  assert.equal(g.status.state, 'ready', 'single failure after recovery re-demoted immediately');
   await g.shutdown();
-  console.log('  OK: systemic inference failure -> failed + reload recovery');
+  console.log('  OK: systemic inference failure -> failed + reload recovery + reset-on-success');
+}
+
+// (i2) distinct-input semantics (beta 2R B4): A→B→A = 2 distinct inputs, no demote
+{
+  const g = new EmbeddingGate({
+    mode: 'lazy', backoffMs: [50],
+    loadModel: async () => async (t) => { throw new Error('boom ' + t); },
+  });
+  await g.start();
+  await g.embed('A', { priority: 'bulk' }).catch(() => {});
+  await g.embed('B', { priority: 'bulk' }).catch(() => {});
+  await g.embed('A', { priority: 'bulk' }).catch(() => {});
+  assert.equal(g.status.state, 'ready', 'A→B→A demoted with only 2 distinct inputs');
+  await g.embed('C', { priority: 'bulk' }).catch(() => {});
+  assert.equal(g.status.state, 'failed', 'third distinct input did not demote');
+  await g.shutdown();
+  console.log('  OK: distinct-input counting (A→B→A stays ready, 3rd distinct demotes)');
 }
 
 // (j) shutdown settles an in-flight load (bounded) instead of ignoring it (beta B1)

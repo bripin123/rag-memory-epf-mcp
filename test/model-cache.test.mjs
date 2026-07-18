@@ -50,5 +50,19 @@ console.log('  OK: stale lock reclaimed');
 assert.ok(!readdirSync(cacheDir).some(f => f.includes('.tmp')), 'marker temp file leaked');
 console.log('  OK: marker temp-rename leaves no residue');
 
+// (h) abort-first (beta 2R B5): an already-aborted waiter must never become an
+// owner or report ready — even when the lock is free and a marker exists.
+{
+  const ac = new AbortController();
+  ac.abort();
+  const l = new ModelDownloadLock(cacheDir, 'abort-' + key); // key has a marker from (e)? no — distinct key, free lock
+  const r = await l.acquireOrWait({ pollMs: 10, timeoutMs: 1000, signal: ac.signal }).catch(e => e);
+  assert.ok(r instanceof Error && /abort/.test(r.message), `aborted waiter proceeded: ${r}`);
+  const l2 = new ModelDownloadLock(cacheDir, key);           // this key DOES have a completion marker
+  const r2 = await l2.acquireOrWait({ pollMs: 10, timeoutMs: 1000, signal: ac.signal }).catch(e => e);
+  assert.ok(r2 instanceof Error && /abort/.test(r2.message), `aborted waiter returned ready despite abort: ${r2}`);
+  console.log('  OK: abort checked before marker/acquire (beta 2R B5)');
+}
+
 rmSync(base, { recursive: true, force: true });
 console.log('MODEL-CACHE OK');

@@ -93,6 +93,21 @@ back to the default, the stored vectors cannot be attributed reliably. Run
   restarting many CLIs at once, the shared cache download happens once (lock),
   but each process that finishes loading holds its own model memory.
 
+## Shutdown semantics
+
+SIGTERM/SIGINT close the MCP transport, settle in-flight work (bounded, 5s),
+close the database cleanly, and exit naturally. One documented exception: if a
+model download/load is still pending after the settle deadline (the fetch
+cannot be aborted through transformers.js), the process performs a bounded
+exit **after** the database is closed — data is never at risk, but if the load
+happened to be inside native session construction you may see an abrupt
+runtime message on termination.
+
+**Stuck download lock recovery**: if a waiter times out it reports the lock
+path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
+is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
+the next start becomes a clean download owner.
+
 ## v3.6 breaking response changes
 
 1. `hybridSearch` returns an envelope: `{results, search_mode, model_state,

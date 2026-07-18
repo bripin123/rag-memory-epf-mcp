@@ -92,6 +92,32 @@ console.log('  OK: second kick reprocesses nothing (DoD 7)');
   console.log('  OK: mutation deletes old vector in the same tx, before inference (beta B2)');
 }
 
+// ---- (a3) write-back CAS (beta 2R B1): a slow inference finishing AFTER a
+// newer mutation must not re-insert a vector for the superseded content.
+{
+  let releaseHang; const hang = new Promise(r => { releaseHang = r; });
+  const orig = gate.embedFn;
+  let hangArmed = true;
+  gate.embedFn = async (text) => {
+    if (text.includes('CAS Target') && hangArmed) { hangArmed = false; await hang; }
+    return orig(text);
+  };
+  const p1 = mgr.createEntities([{ name: 'CAS Target', entityType: 'CONCEPT', observations: ['v1 content'] }]);
+  await new Promise(r => setTimeout(r, 50));      // v1 inference now hanging; entity row committed
+  const p2 = mgr.addObservations([{ entityName: 'CAS Target', contents: ['v2 content'] }]); // queues behind
+  await new Promise(r => setTimeout(r, 50));
+  releaseHang();                                   // stale v1 inference completes AFTER the v2 mutation
+  await Promise.all([p1, p2]);
+  const casRow = db.prepare(`SELECT embedding_text, input_hash FROM entity_embedding_metadata WHERE entity_id='entity_cas_target'`).get();
+  assert.ok(casRow, 'CAS target has no vector at all');
+  assert.ok(casRow.embedding_text.includes('v2 content'),
+    `stale v1 inference re-inserted superseded content: ${casRow.embedding_text.slice(0, 80)}`);
+  assert.equal(casRow.input_hash, mgr.entityInputHash('entity_cas_target'),
+    'stored input_hash does not match current entity content');
+  gate.embedFn = orig;
+  console.log('  OK: write-back CAS discards superseded inference (beta 2R B1)');
+}
+
 // ---- (b) deleteObservations re-embed fix (stale vector regression) ---------
 const oldHash = db.prepare(`SELECT input_hash FROM entity_embedding_metadata WHERE entity_id=?`).get(entityId).input_hash;
 const delRes = await mgr.deleteObservations([{ entityName: 'Alpha Node', observations: db.prepare(`SELECT observations FROM entities WHERE id=?`).get(entityId).observations ? JSON.parse(db.prepare(`SELECT observations FROM entities WHERE id=?`).get(entityId).observations).slice(0, 1) : [] }]);

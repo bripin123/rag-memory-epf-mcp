@@ -28,6 +28,17 @@ export class GateNotReadyError extends Error {
   }
 }
 
+// Configuration incompatibility (e.g. a non-1024-dim custom model): retrying or
+// quarantining the cache cannot fix it — the gate parks in terminal 'failed'
+// with no reload schedule (beta 2R B3).
+export class TerminalConfigError extends Error {
+  readonly terminal = true;
+  constructor(message: string) {
+    super(message);
+    this.name = 'TerminalConfigError';
+  }
+}
+
 const PRIO: Record<EmbedPriority, number> = { interactive: 0, bulk: 1, backfill: 2 };
 const DEFAULT_BACKOFF_MS = [30_000, 120_000, 600_000, 3_600_000];
 
@@ -61,8 +72,14 @@ export class EmbeddingGate {
   private shuttingDown = false;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private attempt = 0;
-  private inferenceFailures = 0;                 // consecutive DISTINCT-input failures; 3 -> failed + reload (beta B6)
-  private lastFailedText: string | null = null;  // same-input retries are data-specific (poison row), not systemic
+  // Systemic-failure detector (beta 2R B4): DISTINCT failed inputs within the
+  // current load epoch (cleared on successful load AND on any inference
+  // success). Same-input retries are data-specific (poison row) and never
+  // demote. `demotions` escalates the reload backoff across repeated
+  // demote-reload cycles and only resets on a real inference success.
+  private failedInputs = new Set<string>();
+  private demotions = 0;
+  private terminalFailure = false;
   readonly abort = new AbortController();        // loader passes this to lock waits / fetches
   private readySince?: string;
   private lastError?: string;
@@ -107,27 +124,40 @@ export class EmbeddingGate {
       this.attempt = 0;
       this.retryAt = undefined;
       this.lastError = undefined;
+      this.failedInputs.clear();                  // fresh load epoch (beta 2R B4)
       this.readySince = new Date().toISOString();
       this.setState('ready');
       this.opts.onReady?.();
       this.pump();
     } catch (e) {
       this.lastError = e instanceof Error ? e.message : String(e);
-      const base = this.backoff[Math.min(this.attempt, this.backoff.length - 1)];
-      const delay = Math.round(base * (0.8 + Math.random() * 0.4)); // jitter ±20%
-      this.attempt++;
-      this.retryAt = new Date(Date.now() + delay).toISOString();
       this.setState('failed');
       this.startPromise = null;
-      if (!this.shuttingDown) {
-        this.retryTimer = setTimeout(() => {
-          this.retryTimer = null;
-          void this.start().catch(() => { /* surfaced via state, not rejection */ });
-        }, delay);
-        this.retryTimer.unref?.();
+      if ((e as TerminalConfigError)?.terminal === true) {
+        // Config incompatibility (beta 2R B3): retrying or quarantining cannot
+        // fix it — no reload schedule; a restart with a fixed config is the
+        // only recovery.
+        this.terminalFailure = true;
+        this.retryAt = undefined;
+        console.error(`❌ embeddings disabled for this run (config): ${this.lastError}`);
+        throw e;
       }
+      this.scheduleRetry(this.attempt++);
       throw e;
     }
+  }
+
+  // Shared retry scheduler with jitter; escalation index picks the backoff slot.
+  private scheduleRetry(escalation: number): void {
+    if (this.shuttingDown || this.terminalFailure) return;
+    const base = this.backoff[Math.min(escalation, this.backoff.length - 1)];
+    const delay = Math.round(base * (0.8 + Math.random() * 0.4)); // jitter ±20%
+    this.retryAt = new Date(Date.now() + delay).toISOString();
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.start().catch(() => { /* surfaced via state, not rejection */ });
+    }, delay);
+    this.retryTimer.unref?.();
   }
 
   embed(text: string, o: { dims?: number; isQuery?: boolean; priority: EmbedPriority }): Promise<Float32Array> {
@@ -154,34 +184,25 @@ export class EmbeddingGate {
     this.running = true;
     void this.embedFn(job.text, job.dims, job.isQuery)
       .then(v => {
-        this.inferenceFailures = 0;
-        this.lastFailedText = null;
+        this.failedInputs.clear();
+        this.demotions = 0;                        // a real success resets escalation
         if (job.gen === this.generation) job.resolve(v);
         else job.reject(new Error('embedding discarded: gate shut down'));
       })
       .catch(e => {
-        // Systemic-failure detection (beta B6): a ready model that keeps
-        // throwing on DIFFERENT inputs must not stay 'ready' forever — after 3
-        // consecutive distinct-input failures transition to failed and re-enter
-        // the load/backoff cycle. Same-input repeats are data-specific (a
-        // poison row) and belong to the backfill attempts cap, not to model
-        // demotion — otherwise one bad row would drive endless reload loops.
-        if (this.lastFailedText !== job.text) {
-          this.inferenceFailures++;
-          this.lastFailedText = job.text;
-        }
-        if (this.inferenceFailures >= 3 && this.state === 'ready' && !this.shuttingDown) {
+        // Systemic-failure detection (beta 2R B4): 3 DISTINCT failed inputs in
+        // this load epoch -> demote to failed + reload with ESCALATING backoff
+        // (demotions counter survives reloads; only an inference success
+        // resets it — so a persistently broken runtime backs off instead of
+        // hot-looping). Same-input repeats (A→A) and A→B→A count 2 distinct.
+        this.failedInputs.add(`${job.text}|${job.dims}|${job.isQuery}`);
+        if (this.failedInputs.size >= 3 && this.state === 'ready' && !this.shuttingDown) {
           this.lastError = e instanceof Error ? e.message : String(e);
           this.embedFn = null;
           this.startPromise = null;
+          this.failedInputs.clear();
           this.setState('failed');
-          const delay = this.backoff[0];
-          this.retryAt = new Date(Date.now() + delay).toISOString();
-          this.retryTimer = setTimeout(() => {
-            this.retryTimer = null;
-            void this.start().catch(() => { /* surfaced via state */ });
-          }, delay);
-          this.retryTimer.unref?.();
+          this.scheduleRetry(this.demotions++);
           for (const j of this.queue.splice(0)) j.reject(new GateNotReadyError('failed'));
         }
         job.reject(e);
