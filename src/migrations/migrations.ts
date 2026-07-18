@@ -616,5 +616,75 @@ export const migrations: Migration[] = [
       // No clean reversal: would need the original document content to recompute
       // UTF-16 indices, and we never recorded which chunks were touched. No-op.
     }
+  },
+
+  // v3.6 (spec 2026-07-18 lite-install v5 §6c): embedding provenance + narrowed FTS trigger.
+  // ADD COLUMN is guarded by PRAGMA table_info so re-runs are idempotent.
+  {
+    version: 12,
+    description: 'Embedding provenance (profiles, input_hash, provenance_state), backfill failures, narrowed chunks_fts_update trigger',
+    up: (db) => {
+      const hasCol = (table: string, col: string) =>
+        (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some(c => c.name === col);
+      for (const table of ['chunk_metadata', 'entity_embedding_metadata']) {
+        if (!hasCol(table, 'input_hash')) db.exec(`ALTER TABLE ${table} ADD COLUMN input_hash TEXT`);
+        if (!hasCol(table, 'profile_id')) db.exec(`ALTER TABLE ${table} ADD COLUMN profile_id INTEGER`);
+        if (!hasCol(table, 'provenance_state')) db.exec(`ALTER TABLE ${table} ADD COLUMN provenance_state TEXT`);
+      }
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS embedding_profiles (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          model_id TEXT NOT NULL,
+          revision TEXT NOT NULL,
+          dtype TEXT NOT NULL,
+          dims INTEGER NOT NULL,
+          pooling TEXT NOT NULL,
+          normalize INTEGER NOT NULL,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(model_id, revision, dtype, dims, pooling, normalize)
+        )
+      `);
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS embedding_backfill_failures (
+          kind TEXT NOT NULL,
+          target_id TEXT NOT NULL,
+          input_hash TEXT,
+          profile_id INTEGER,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(kind, target_id)
+        )
+      `);
+      db.exec(`CREATE TABLE IF NOT EXISTS server_meta (key TEXT PRIMARY KEY, value TEXT)`);
+      // Narrow the broad AFTER UPDATE trigger (installed by v8) so provenance-only
+      // updates do not rewrite the FTS index (advisor 4R must-fix 1).
+      db.exec(`DROP TRIGGER IF EXISTS chunks_fts_update`);
+      db.exec(`
+        CREATE TRIGGER chunks_fts_update AFTER UPDATE OF text, chunk_id ON chunk_metadata BEGIN
+          INSERT INTO chunks_fts(chunks_fts, rowid, text, chunk_id)
+            VALUES ('delete', old.rowid, old.text, old.chunk_id);
+          INSERT INTO chunks_fts(rowid, text, chunk_id)
+            VALUES (new.rowid, new.text, new.chunk_id);
+        END
+      `);
+    },
+    down: (db) => {
+      // Restore the broad v8 trigger; drop v12 tables. Added columns are left in
+      // place (SQLite DROP COLUMN restrictions with dependent objects) — pre-v12
+      // code ignores unknown columns, so rollback stays safe (spec §8-4).
+      db.exec(`DROP TRIGGER IF EXISTS chunks_fts_update`);
+      db.exec(`
+        CREATE TRIGGER chunks_fts_update AFTER UPDATE ON chunk_metadata BEGIN
+          INSERT INTO chunks_fts(chunks_fts, rowid, text, chunk_id)
+            VALUES ('delete', old.rowid, old.text, old.chunk_id);
+          INSERT INTO chunks_fts(rowid, text, chunk_id)
+            VALUES (new.rowid, new.text, new.chunk_id);
+        END
+      `);
+      db.exec(`DROP TABLE IF EXISTS embedding_backfill_failures`);
+      db.exec(`DROP TABLE IF EXISTS embedding_profiles`);
+      db.exec(`DROP TABLE IF EXISTS server_meta`);
+    }
   }
 ];
