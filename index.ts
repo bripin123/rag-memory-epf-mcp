@@ -355,8 +355,77 @@ export class RAGKnowledgeGraphManager {
     }
   }
 
-  // T6 implements chunk re-embedding for the backfill scanner.
-  async reembedChunkByRowid(_rowid: number): Promise<boolean> { return false; }
+  // Mutation-path embedding wrapper (spec §5): CRUD success never depends on
+  // model availability. On not-ready/disabled the stale vector is deleted in
+  // the same breath (dirty = missing, §6a-1) and the coordinator is kicked so
+  // the row is recovered without a restart (§5 kick column).
+  async tryEmbedEntity(entityId: string, priority: EmbedPriority = 'bulk'): Promise<'embedded' | 'queued' | 'disabled'> {
+    try {
+      const ok = await this.embedEntity(entityId, priority);
+      if (ok) {
+        // Success clears any stale backfill-failure record for this target.
+        this.db!.prepare(`DELETE FROM embedding_backfill_failures WHERE kind = 'entity' AND target_id = ?`).run(entityId);
+        this.coordinator?.invalidateCoverage();
+        return 'embedded';
+      }
+      this.invalidateEntityVector(entityId);
+      this.coordinator?.kick();
+      return 'queued';
+    } catch (e) {
+      // Any embedding-layer failure (not-ready, disabled, OR a ready-state
+      // inference error) must not fail the CRUD that already committed. The
+      // vector is invalidated (§6a-1) and recovery is owned by the backfill
+      // scanner with its attempts cap — never by rethrowing here (spec §5).
+      if (!(e instanceof GateNotReadyError) && !(e instanceof GateDisabledError)) {
+        console.error(`⚠️ embedding failed for ${entityId} (queued for backfill): ${e instanceof Error ? e.message : e}`);
+      }
+      this.invalidateEntityVector(entityId);
+      this.coordinator?.kick();
+      return e instanceof GateDisabledError ? 'disabled' : 'queued';
+    }
+  }
+
+  // §6a-1 invariant: when an entity's embedding input changed but re-embedding
+  // is unavailable, its old vector must not stay searchable.
+  invalidateEntityVector(entityId: string): void {
+    if (!this.db) return;
+    const meta = this.db.prepare(`SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?`)
+      .get(entityId) as { rowid: number } | undefined;
+    if (!meta) return;
+    const tx = this.db.transaction(() => {
+      this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(meta.rowid)}`);
+      this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`).run(entityId);
+    });
+    tx();
+    this.coordinator?.invalidateCoverage();
+  }
+
+  // Backfill callback: re-embed one chunk and commit vector + provenance in a
+  // single transaction (§6a-2).
+  async reembedChunkByRowid(rowid: number): Promise<boolean> {
+    if (!this.db) return false;
+    const row = this.db.prepare(`SELECT text FROM chunk_metadata WHERE rowid = ?`)
+      .get(rowid) as { text: string | null } | undefined;
+    if (!row || row.text === null) return false;
+    try {
+      const embedding = await this.generateEmbedding(row.text, 1024, false, 'backfill');
+      const hash = createHash('sha256').update(row.text).digest('hex');
+      const safe = Number(rowid);
+      const tx = this.db.transaction(() => {
+        this.db!.exec(`DELETE FROM chunks WHERE rowid = ${safe}`);
+        this.db!.prepare(`INSERT INTO chunks (rowid, embedding) VALUES (${safe}, ?)`).run(Buffer.from(embedding.buffer));
+        this.db!.prepare(`UPDATE chunk_metadata SET input_hash = ?, profile_id = ?, provenance_state = 'verified' WHERE rowid = ?`)
+          .run(hash, this.currentProfileId, rowid);
+        this.db!.prepare(`DELETE FROM embedding_backfill_failures WHERE kind = 'chunk' AND target_id = ?`).run(String(rowid));
+      });
+      tx();
+      this.coordinator?.invalidateCoverage();
+      return true;
+    } catch (e) {
+      if (e instanceof GateNotReadyError || e instanceof GateDisabledError) return false;
+      throw e;
+    }
+  }
 
   // spec §3 shutdown order: block new batches -> settle coordinator -> settle
   // gate -> close DB -> natural exit (process.exit is forbidden: ONNX mutex).
@@ -437,10 +506,11 @@ export class RAGKnowledgeGraphManager {
       const insertResult = insertStmt.run(entityId, entity.name, entity.entityType, JSON.stringify(timestamped), '{}');
 
       if (insertResult.changes > 0) {
-        // New entity created
-        result.push({ ...entity, observations: timestamped });
+        // New entity created. CRUD success is independent of model readiness
+        // (spec §5): not-ready -> row stays vectorless (queued for backfill).
         console.error(`🔮 Generating embedding for new entity: ${entity.name}`);
-        await this.embedEntity(entityId);
+        const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
+        result.push({ ...entity, observations: timestamped, embedding_status } as Entity);
       } else {
         // Entity already exists — upsert: merge observations and update entityType
         const existing = this.db.prepare(`SELECT observations, entityType FROM entities WHERE id = ?`)
@@ -461,8 +531,8 @@ export class RAGKnowledgeGraphManager {
               .run(JSON.stringify(mergedObs), updatedType, entityId);
 
             console.error(`♻️ Upserted entity: ${entity.name} (+${newObs.length} obs${needsTypeUpdate ? ', type→' + updatedType : ''})`);
-            await this.embedEntity(entityId);
-            result.push({ ...entity, observations: mergedObs });
+            const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
+            result.push({ ...entity, observations: mergedObs, embedding_status } as Entity);
           }
         }
       }
@@ -532,11 +602,13 @@ export class RAGKnowledgeGraphManager {
           UPDATE entities SET observations = ? WHERE id = ?
         `).run(JSON.stringify(updatedObservations), entityId);
         
-        // Regenerate embedding for the updated entity
+        // Regenerate embedding for the updated entity (queued when not ready)
         console.error(`🔮 Regenerating embedding for updated entity: ${obs.entityName}`);
-        await this.embedEntity(entityId);
+        const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
+        results.push({ entityName: obs.entityName, addedObservations: newObservations, embedding_status } as any);
+        continue;
       }
-      
+
       results.push({ entityName: obs.entityName, addedObservations: newObservations });
     }
 
@@ -617,27 +689,44 @@ export class RAGKnowledgeGraphManager {
     console.error(`✅ Entity deletion process completed`);
   }
 
-  async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<void> {
+  // v3.6 (spec §5c, breaking): structured per-entity results + re-embedding.
+  // Pre-3.6 this method silently left STALE entity vectors behind (the input
+  // text changed but the vector was never regenerated) — fixed via
+  // tryEmbedEntity, which also covers the not-ready dirty contract.
+  async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<{
+    results: Array<{ entityName: string; deleted: number; embedding_status: 'embedded' | 'queued' | 'disabled' | 'n/a' }>;
+    total_deleted: number;
+  }> {
     if (!this.db) throw new Error('Database not initialized');
-    
+
+    const results: Array<{ entityName: string; deleted: number; embedding_status: 'embedded' | 'queued' | 'disabled' | 'n/a' }> = [];
+    let total = 0;
     for (const deletion of deletions) {
       const entityId = `entity_${deletion.entityName.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
-      
       const entity = this.db.prepare(`
         SELECT observations FROM entities WHERE id = ?
       `).get(entityId) as { observations: string } | undefined;
-      
-      if (entity) {
-        const currentObservations = JSON.parse(entity.observations);
-        const filteredObservations = currentObservations.filter(
-          (obs: string) => !deletion.observations.includes(obs)
-        );
-        
-        this.db.prepare(`
-          UPDATE entities SET observations = ? WHERE id = ?
-        `).run(JSON.stringify(filteredObservations), entityId);
+
+      if (!entity) {
+        results.push({ entityName: deletion.entityName, deleted: 0, embedding_status: 'n/a' });
+        continue;
       }
+      const currentObservations: string[] = JSON.parse(entity.observations);
+      const filteredObservations = currentObservations.filter(
+        (obs: string) => !deletion.observations.includes(obs)
+      );
+      const deleted = currentObservations.length - filteredObservations.length;
+      if (deleted === 0) {
+        results.push({ entityName: deletion.entityName, deleted: 0, embedding_status: 'n/a' });
+        continue;
+      }
+      this.db.prepare(`UPDATE entities SET observations = ? WHERE id = ?`)
+        .run(JSON.stringify(filteredObservations), entityId);
+      const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
+      total += deleted;
+      results.push({ entityName: deletion.entityName, deleted, embedding_status });
     }
+    return { results, total_deleted: total };
   }
 
   async deleteRelations(relations: Relation[]): Promise<void> {
@@ -1258,27 +1347,26 @@ export class RAGKnowledgeGraphManager {
     );
     
     try {
-      // Delete existing embedding if any
-      const existingMetadata = this.db.prepare(`
-        SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?
-      `).get(entityId) as { rowid: number } | undefined;
-      
-      if (existingMetadata) {
-        this.db.prepare(`DELETE FROM entity_embeddings WHERE rowid = ?`).run(existingMetadata.rowid);
-        this.db.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`).run(entityId);
-      }
-      
-      // Insert new embedding
-      const result = this.db.prepare(`
-        INSERT INTO entity_embeddings (embedding) VALUES (?)
-      `).run(Buffer.from(embedding.buffer));
-      
-      // Store metadata
-      this.db.prepare(`
-        INSERT INTO entity_embedding_metadata (rowid, entity_id, embedding_text)
-        VALUES (?, ?, ?)
-      `).run(result.lastInsertRowid, entityId, embeddingText);
-      
+      // v3.6 (§6a-2): vector replace + provenance stamp commit atomically —
+      // crash leaves either the old verified state or nothing, never a mix.
+      const inputHash = this.hashWithBuilderVersion(embeddingText);
+      const writeTx = this.db.transaction(() => {
+        const existingMetadata = this.db!.prepare(`
+          SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?
+        `).get(entityId) as { rowid: number } | undefined;
+        if (existingMetadata) {
+          this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(existingMetadata.rowid)}`);
+          this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`).run(entityId);
+        }
+        const result = this.db!.prepare(`
+          INSERT INTO entity_embeddings (embedding) VALUES (?)
+        `).run(Buffer.from(embedding.buffer));
+        this.db!.prepare(`
+          INSERT INTO entity_embedding_metadata (rowid, entity_id, embedding_text, input_hash, profile_id, provenance_state)
+          VALUES (?, ?, ?, ?, ?, 'verified')
+        `).run(result.lastInsertRowid, entityId, embeddingText, inputHash, this.currentProfileId);
+      });
+      writeTx();
       return true;
     } catch (error) {
       console.error(`Failed to embed entity ${entityId}:`, error);
@@ -1410,18 +1498,21 @@ export class RAGKnowledgeGraphManager {
 
     for (const chunk of chunks) {
       // Generate embedding
-      const embedding = await this.generateEmbedding(chunk.text);
+      const embedding = await this.generateEmbedding(chunk.text, 1024, false, 'bulk');
       const rowid = safeRowid(chunk.rowid);
 
       try {
-        // Delete existing embedding if any
-        this.db.exec(`DELETE FROM chunks WHERE rowid = ${rowid}`);
-
-        // Insert new embedding - rowid as literal integer for vec0 compatibility
-        this.db.prepare(`
-          INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)
-        `).run(Buffer.from(embedding.buffer));
-
+        // vector + verified provenance in one transaction (§6a-2) — KG chunks
+        // must never become vector-bearing provenance-NULL rows post-recon.
+        const tx = this.db.transaction(() => {
+          this.db!.exec(`DELETE FROM chunks WHERE rowid = ${rowid}`);
+          this.db!.prepare(`
+            INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)
+          `).run(Buffer.from(embedding.buffer));
+          this.db!.prepare(`UPDATE chunk_metadata SET input_hash = ?, profile_id = ?, provenance_state = 'verified' WHERE rowid = ?`)
+            .run(createHash('sha256').update(chunk.text).digest('hex'), this.currentProfileId, chunk.rowid);
+        });
+        tx();
         embeddedCount++;
       } catch (error) {
         const errMsg = `chunk ${chunk.chunk_id} (rowid=${rowid}, type=${typeof chunk.rowid}): ${error instanceof Error ? error.message : String(error)}`;
@@ -1429,6 +1520,7 @@ export class RAGKnowledgeGraphManager {
         errors.push(errMsg);
       }
     }
+    this.coordinator?.invalidateCoverage();
 
     console.error(`✅ Knowledge graph chunks embedded: ${embeddedCount}/${chunks.length}`);
 
@@ -1757,18 +1849,28 @@ export class RAGKnowledgeGraphManager {
 
     console.error(`🔄 syncDocumentFromFile: ${documentId} <- ${filePath} (${bytes} bytes)`);
 
-    // 3. Pre-compute chunks + embeddings BEFORE any DB mutation. If embedding
-    //    throws (model down), the existing document is left completely intact.
+    // 3. Two contracts (spec §5b):
+    //    ready       — pre-compute ALL embeddings BEFORE any DB mutation; if
+    //                  inference throws mid-way the old document stays intact
+    //                  (v3.5.0 atomicity, unchanged).
+    //    not-ready   — intentional lazy sync: store document + chunks + FTS in
+    //                  one transaction with NO vectors (embedding_status:
+    //                  queued); the backfill coordinator recovers them.
     const { maxTokens = 800, overlap = 160 } = options.chunkParams || {};
     const segments = this.chunkText(content, maxTokens, overlap);
-    const embedded: Array<{ seg: typeof segments[number]; embedding: Float32Array }> = [];
-    for (const seg of segments) {
-      const embedding = await this.generateEmbedding(seg.text);
-      embedded.push({ seg, embedding });
+    const lazySync = !this.gate.isReady;
+    const embedded: Array<{ seg: typeof segments[number]; embedding: Float32Array | null }> = [];
+    if (lazySync) {
+      for (const seg of segments) embedded.push({ seg, embedding: null });
+    } else {
+      for (const seg of segments) {
+        const embedding = await this.generateEmbedding(seg.text, 1024, false, 'bulk');
+        embedded.push({ seg, embedding });
+      }
     }
 
-    // 4. Atomic swap: delete old -> insert doc -> insert chunks + embeddings,
-    //    all in a single synchronous better-sqlite3 transaction (all-or-nothing).
+    // 4. Atomic swap: delete old -> insert doc -> insert chunks (+ embeddings
+    //    with verified provenance when ready), one synchronous transaction.
     const applyTx = this.db.transaction(() => {
       const db = this.db!;
       // 4a. cleanup old doc (inlined sync version of cleanupDocument).
@@ -1784,7 +1886,8 @@ export class RAGKnowledgeGraphManager {
       db.prepare(`INSERT INTO documents (id, content, metadata) VALUES (?, ?, ?)`)
         .run(documentId, content, JSON.stringify(metadata));
 
-      // 4c. insert chunk_metadata (FTS5 chunks_fts auto-filled by trigger) + embeddings.
+      // 4c. insert chunk_metadata (FTS5 chunks_fts auto-filled by trigger);
+      //     vectors + provenance only on the ready path (§6a-2).
       for (const { seg, embedding } of embedded) {
         const chunkId = `${documentId}_chunk_${seg.chunk_index}`;
         const info = db.prepare(`
@@ -1792,12 +1895,18 @@ export class RAGKnowledgeGraphManager {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `).run(chunkId, documentId, seg.chunk_index, seg.text, seg.start_pos, seg.end_pos, seg.start_token, seg.end_token);
         const rowid = Number(info.lastInsertRowid);
-        db.prepare(`INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)`).run(Buffer.from(embedding.buffer));
+        if (embedding) {
+          db.prepare(`INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)`).run(Buffer.from(embedding.buffer));
+          db.prepare(`UPDATE chunk_metadata SET input_hash = ?, profile_id = ?, provenance_state = 'verified' WHERE rowid = ?`)
+            .run(createHash('sha256').update(seg.text).digest('hex'), this.currentProfileId, rowid);
+        }
       }
     });
     applyTx();
+    this.coordinator?.invalidateCoverage();
+    if (lazySync) this.coordinator?.kick();
 
-    const embeddedChunks = embedded.length;
+    const embeddedChunks = lazySync ? 0 : embedded.length;
 
     // 5. Entity linking AFTER commit. Non-destructive + idempotent (INSERT OR
     //    IGNORE), so a linking failure cannot corrupt the doc/embeddings.
@@ -1809,12 +1918,13 @@ export class RAGKnowledgeGraphManager {
     }
 
     // 6. Terse summary only (no chunk text / content echo) to keep caller context flat.
-    const result: { documentId: string; bytes: number; chunks: number; embeddedChunks: number; linkedEntities: number; explicitlyLinked?: number; warning?: string; skipped?: boolean; reason?: string } = {
+    const result: { documentId: string; bytes: number; chunks: number; embeddedChunks: number; linkedEntities: number; explicitlyLinked?: number; warning?: string; skipped?: boolean; reason?: string; embedding_status?: string } = {
       documentId,
       bytes,
       chunks: segments.length,
       embeddedChunks,
       linkedEntities,
+      embedding_status: lazySync ? (this.gate.isDisabled ? 'disabled' : 'queued') : 'embedded',
       ...(explicitlyLinked !== undefined ? { explicitlyLinked } : {}),
     };
     if (linkedEntities === 0 && explicitlyLinked === undefined) {
@@ -1895,6 +2005,10 @@ export class RAGKnowledgeGraphManager {
     }
     
     console.error(`✅ Document chunked: ${chunks.length} chunks created`);
+    // Indirect missing-row producer (spec §5): freshly chunked rows have no
+    // vectors yet — let the coordinator recover them without a restart.
+    this.coordinator?.invalidateCoverage();
+    this.coordinator?.kick();
     return { documentId, chunks: resultChunks };
   }
 
@@ -1917,21 +2031,21 @@ export class RAGKnowledgeGraphManager {
     const errors: string[] = [];
 
     for (const chunk of chunks) {
-      // Generate embedding
-      const embedding = await this.generateEmbedding(chunk.text);
+      // Generate embedding (foreground-bulk priority)
+      const embedding = await this.generateEmbedding(chunk.text, 1024, false, 'bulk');
       const rowid = Number(chunk.rowid);
 
-      // Store in vector table
+      // Store in vector table (+ verified provenance, §6a-2 atomic)
       try {
-        // First, delete any existing embedding for this rowid
-        this.db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(rowid)}`);
-
-        // Insert new embedding with explicit rowid to match chunk_metadata
-        // Use parameterized only for embedding blob, rowid as literal integer
-        this.db.prepare(`
-          INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)
-        `).run(Buffer.from(embedding.buffer));
-
+        const tx = this.db.transaction(() => {
+          this.db!.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(rowid)}`);
+          this.db!.prepare(`
+            INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)
+          `).run(Buffer.from(embedding.buffer));
+          this.db!.prepare(`UPDATE chunk_metadata SET input_hash = ?, profile_id = ?, provenance_state = 'verified' WHERE rowid = ?`)
+            .run(createHash('sha256').update(chunk.text).digest('hex'), this.currentProfileId, rowid);
+        });
+        tx();
         embeddedCount++;
       } catch (error) {
         const errMsg = `chunk ${chunk.chunk_id} (rowid=${rowid}, type=${typeof chunk.rowid}): ${error instanceof Error ? error.message : String(error)}`;
@@ -2438,6 +2552,9 @@ export class RAGKnowledgeGraphManager {
 
     console.error(`✅ Import completed: ${imported.entities} entities, ${imported.relations} relations, ${imported.documents} documents imported`);
 
+    // Indirect missing-row producer (spec §5): imported rows may lack vectors.
+    this.coordinator?.invalidateCoverage();
+    this.coordinator?.kick();
     return { imported, skipped };
   }
 

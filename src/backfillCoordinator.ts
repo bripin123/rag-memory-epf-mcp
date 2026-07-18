@@ -236,10 +236,104 @@ export class BackfillCoordinator {
     this.sweepTimer.unref?.();
   }
 
-  // T6 implements the scan; the stub keeps kick()/sweep wiring testable.
+  // Automatic backfill (spec §6c): targets = no vector ∪ input-hash mismatch ∪
+  // compatibility-profile mismatch — but NEVER a vector-bearing provenance-NULL
+  // row (those belong to reconciliation; 5R barrier). Chunks first (hybridSearch
+  // coverage recovers before entity/graph quality). Failures are recorded with
+  // a per-target attempts cap; 3 consecutive DISTINCT-target failures abort the
+  // batch as a systemic model problem (the gate's retry policy owns recovery).
   protected async scanAndBackfill(): Promise<void> {
+    if (this.scanning) return;
     this.scanning = true;
-    try { /* T6 */ } finally { this.scanning = false; }
+    try {
+      const db = this.deps.db();
+      if (!db || !this.eligible) return;
+      const profileId = this.deps.currentProfileId();
+
+      const capStmt = db.prepare(
+        `SELECT attempts, input_hash, profile_id FROM embedding_backfill_failures WHERE kind = ? AND target_id = ?`);
+      const failStmt = db.prepare(
+        `INSERT INTO embedding_backfill_failures (kind, target_id, input_hash, profile_id, attempts, last_error, updated_at)
+         VALUES (?, ?, ?, ?, 1, ?, datetime('now'))
+         ON CONFLICT(kind, target_id) DO UPDATE SET
+           attempts = attempts + 1, input_hash = excluded.input_hash,
+           profile_id = excluded.profile_id, last_error = excluded.last_error, updated_at = datetime('now')`);
+      const clearStmt = db.prepare(`DELETE FROM embedding_backfill_failures WHERE kind = ? AND target_id = ?`);
+      const FAIL_CAP = 5;
+      let consecutive = 0;
+      let lastFailedTarget: string | null = null;
+
+      const shouldSkip = (kind: string, targetId: string, currentHash: string | null): boolean => {
+        const f = capStmt.get(kind, targetId) as { attempts: number; input_hash: string | null; profile_id: number | null } | undefined;
+        if (!f) return false;
+        // Reset-on-change: content or profile moved on -> the failure record is stale.
+        if (f.input_hash !== currentHash || f.profile_id !== profileId) {
+          clearStmt.run(kind, targetId);
+          return false;
+        }
+        return f.attempts >= FAIL_CAP;
+      };
+      const recordResult = async (kind: string, targetId: string, currentHash: string | null,
+        run: () => Promise<boolean>): Promise<'ok' | 'fail' | 'abort'> => {
+        try {
+          const ok = await run();
+          if (ok) { clearStmt.run(kind, targetId); consecutive = 0; return 'ok'; }
+          failStmt.run(kind, targetId, currentHash, profileId, 'reembed returned false');
+        } catch (e) {
+          failStmt.run(kind, targetId, currentHash, profileId,
+            e instanceof Error ? e.message.slice(0, 300) : String(e));
+        }
+        if (lastFailedTarget !== targetId) { consecutive++; lastFailedTarget = targetId; }
+        return consecutive >= 3 ? 'abort' : 'fail';
+      };
+
+      // Phase 1: chunks.
+      const chunkRows = db.prepare(
+        `SELECT m.rowid, m.text, m.input_hash, m.profile_id, m.provenance_state,
+                EXISTS(SELECT 1 FROM chunks v WHERE v.rowid = m.rowid) AS has_vec
+         FROM chunk_metadata m WHERE m.text IS NOT NULL`
+      ).all() as Array<{ rowid: number; text: string; input_hash: string | null; profile_id: number | null; provenance_state: string | null; has_vec: number }>;
+      let processed = 0;
+      for (const row of chunkRows) {
+        if (this.shuttingDown || !this.eligible) return;
+        const currentHash = this.deps.chunkInputHash(row.text);
+        const isTarget = !row.has_vec
+          || (row.provenance_state !== null && (row.profile_id !== profileId || row.input_hash !== currentHash));
+        if (!isTarget) continue;
+        const targetId = String(row.rowid);
+        if (shouldSkip('chunk', targetId, currentHash)) continue;
+        const outcome = await recordResult('chunk', targetId, currentHash,
+          () => this.deps.reembedChunk(row.rowid));
+        if (outcome === 'abort') { console.error('⚠️ backfill aborted: 3 consecutive distinct-target failures (systemic)'); return; }
+        if (++processed % 8 === 0) await new Promise(r => setImmediate(r));
+      }
+
+      // Phase 2: entities.
+      const entityRows = db.prepare(
+        `SELECT e.id, m.input_hash, m.profile_id, m.provenance_state, m.rowid AS meta_rowid
+         FROM entities e LEFT JOIN entity_embedding_metadata m ON m.entity_id = e.id`
+      ).all() as Array<{ id: string; input_hash: string | null; profile_id: number | null; provenance_state: string | null; meta_rowid: number | null }>;
+      for (const row of entityRows) {
+        if (this.shuttingDown || !this.eligible) return;
+        const currentHash = this.deps.buildEntityInputHash(row.id);
+        if (currentHash === null) continue;                      // malformed entity: leave to explicit repair
+        const isTarget = row.meta_rowid === null
+          || (row.provenance_state !== null && (row.profile_id !== profileId || row.input_hash !== currentHash));
+        if (!isTarget) continue;
+        if (shouldSkip('entity', row.id, currentHash)) continue;
+        const outcome = await recordResult('entity', row.id, currentHash,
+          () => this.deps.reembedEntity(row.id));
+        if (outcome === 'abort') { console.error('⚠️ backfill aborted: 3 consecutive distinct-target failures (systemic)'); return; }
+        if (++processed % 8 === 0) await new Promise(r => setImmediate(r));
+      }
+
+      if (processed > 0) {
+        this.snapshot = null;
+        console.error(`✅ backfill pass complete (${processed} rows examined for re-embedding)`);
+      }
+    } finally {
+      this.scanning = false;
+    }
   }
 
   invalidateCoverage(): void { this.snapshot = null; }
