@@ -70,6 +70,19 @@ function printBanner(opts: { model: string; revision: string; dtype: string; cac
   console.error(`🚀 rag-memory-epf-mcp v${PKG_VERSION} | node v${process.versions.node} | model ${opts.model}@${opts.revision} (${opts.dtype}) | cache ${opts.cachePath} | db ${opts.dbPath}`);
 }
 
+// v3.6 (spec §5): ONE FTS5 literal-query compiler shared by chunk and entity
+// search — raw user input can never produce MATCH syntax errors or trigger
+// operators (every term is double-quoted; special characters stripped exactly
+// as the pre-3.6 hybridSearch sanitizer did). Returns null when nothing
+// searchable remains (contract: caller returns empty results + warning).
+export function compileFtsLiteralQuery(q: string): string | null {
+  const sanitized = q.replace(/["\*\(\)\-]/g, ' ').trim();
+  if (!sanitized) return null;
+  const terms = sanitized.split(/\s+/).filter(t => t.length > 0);
+  if (terms.length === 0) return null;
+  return terms.map(t => `"${t}"`).join(' OR ');
+}
+
 // Configure Hugging Face transformers for better compatibility
 if (env.backends?.onnx?.wasm) {
   env.backends.onnx.wasm.wasmPaths = './node_modules/@huggingface/transformers/dist/';
@@ -964,10 +977,29 @@ export class RAGKnowledgeGraphManager {
     return { entities, relations, paths };
   }
 
-  async searchNodes(query: string, limit = 10, since?: string, until?: string): Promise<KnowledgeGraph> {
+  // v3.6 (spec §5·§5c, additive): FTS lexical fallback when vector search is
+  // not eligible, hybrid-partial merge while backfill is catching up, and
+  // top-level state fields on every response.
+  async searchNodes(query: string, limit = 10, since?: string, until?: string): Promise<KnowledgeGraph & {
+    search_mode?: string; model_state?: string; coverage?: { entity_pct: number };
+    degradation_reason?: string; warning?: string;
+  }> {
     if (!this.db) throw new Error('Database not initialized');
 
     console.error(`🔍 Semantic entity search: "${query}"`);
+
+    const covS = this.coordinator?.coverage();
+    const entityPct = covS && covS.entity.total > 0 ? Math.round((covS.entity.embedded / covS.entity.total) * 100) : 100;
+    const stateFields = () => ({
+      model_state: this.gate.status.state,
+      coverage: { entity_pct: entityPct },
+    });
+
+    if (!(this.coordinator?.eligible ?? false)) {
+      // No waiting on the model (spec §5) — lexical entities_fts fallback.
+      return { ...this.searchNodesFts(query, limit, since, until), search_mode: 'fts-only',
+        ...stateFields(), degradation_reason: this.degradationReason() };
+    }
 
     const queryVariants = this.buildCrossLingualVariants(query);
     if (queryVariants.length > 1) {
@@ -1036,39 +1068,80 @@ export class RAGKnowledgeGraphManager {
       });
     }
 
-    if (filteredResults.length === 0) {
-      console.error(`ℹ️ No semantic matches found for "${query}"`);
-      return { entities: [], relations: [] };
-    }
-
     const entities = filteredResults.map(result => ({
       name: result.name,
       entityType: result.entityType,
       observations: JSON.parse(result.observations),
       similarity: Math.max(0, 1 - result.distance / 2) // Convert cosine distance (0-2) to similarity (1-0)
     }));
-    
-    // Get relationships between the found entities
-    const entityNames = entities.map(e => e.name);
-    const relations = this.db.prepare(`
-      SELECT 
+
+    // hybrid-partial (spec §4): entities without vectors must not vanish from
+    // search while backfill catches up — merge lexical FTS hits for the gap.
+    let search_mode: string = 'hybrid';
+    if (entityPct < 100) {
+      search_mode = 'hybrid-partial';
+      const seen = new Set(entities.map(e => e.name));
+      const ftsExtra = this.searchNodesFts(query, limit, since, until);
+      for (const e of ftsExtra.entities) {
+        if (entities.length >= limit) break;
+        if (!seen.has(e.name)) { seen.add(e.name); entities.push(e as any); }
+      }
+    }
+
+    if (entities.length === 0) {
+      console.error(`ℹ️ No semantic matches found for "${query}"`);
+      return { entities: [], relations: [], search_mode, ...stateFields() };
+    }
+
+    const relations = this.relationsAmong(entities.map(e => e.name));
+    console.error(`✅ Found ${entities.length} semantically similar entities with ${relations.length} relationships`);
+
+    return { entities, relations, search_mode, ...stateFields() };
+  }
+
+  // Lexical entity search over entities_fts (spec §5 contract: name /
+  // observations / entityType lexical match — no semantic-equivalence claim).
+  // Temporal filters apply in SQL so LIMIT is not distorted.
+  private searchNodesFts(query: string, limit: number, since?: string, until?: string): KnowledgeGraph & { warning?: string } {
+    const expr = compileFtsLiteralQuery(query);
+    if (expr === null) {
+      return { entities: [], relations: [], warning: 'query has no searchable terms' };
+    }
+    const rows = this.db!.prepare(`
+      SELECT e.name, e.entityType, e.observations
+      FROM entities_fts f
+      JOIN entities e ON f.rowid = e.rowid
+      WHERE entities_fts MATCH @expr
+        ${since ? 'AND e.created_at >= @since' : ''}
+        ${until ? 'AND e.created_at <= @until' : ''}
+      ORDER BY bm25(entities_fts)
+      LIMIT @limit
+    `).all({ expr, since, until, limit }) as Array<{ name: string; entityType: string; observations: string }>;
+    const entities = rows.map(r => ({
+      name: r.name,
+      entityType: r.entityType,
+      observations: JSON.parse(r.observations),
+    }));
+    return { entities, relations: this.relationsAmong(entities.map(e => e.name)) };
+  }
+
+  private relationsAmong(entityNames: string[]): Relation[] {
+    if (entityNames.length === 0) return [];
+    return this.db!.prepare(`
+      SELECT
         e1.name as from_name,
         e2.name as to_name,
         r.relationType
       FROM relationships r
       JOIN entities e1 ON r.source_entity = e1.id
       JOIN entities e2 ON r.target_entity = e2.id
-      WHERE e1.name IN (${entityNames.map(() => '?').join(',')}) 
+      WHERE e1.name IN (${entityNames.map(() => '?').join(',')})
         AND e2.name IN (${entityNames.map(() => '?').join(',')})
     `).all(...entityNames, ...entityNames).map((row: any) => ({
       from: row.from_name,
       to: row.to_name,
       relationType: row.relationType
     }));
-
-    console.error(`✅ Found ${entities.length} semantically similar entities with ${relations.length} relationships`);
-    
-    return { entities, relations };
   }
 
   async openNodes(names: string[]): Promise<KnowledgeGraph> {
@@ -2558,7 +2631,13 @@ export class RAGKnowledgeGraphManager {
     return { imported, skipped };
   }
 
-  async hybridSearch(query: string, limit = 5, useGraph = true): Promise<EnhancedSearchResult[]> {
+  async hybridSearch(query: string, limit = 5, useGraph = true): Promise<{
+    results: EnhancedSearchResult[];
+    search_mode: 'hybrid' | 'hybrid-partial' | 'fts-only';
+    model_state: string;
+    coverage: { chunk_pct: number; graph_coverage_pct: number };
+    degradation_reason?: string;
+  }> {
     if (!this.db) throw new Error('Database not initialized');
     if (!this.encoding) throw new Error('Tokenizer not initialized');
     
@@ -2617,22 +2696,32 @@ export class RAGKnowledgeGraphManager {
     type ChunkSearchResult = ReturnType<typeof searchChunks>[number];
 
     // Search original query plus cross-lingual expansions and keep best match per chunk.
+    // v3.6 eligibility gate (spec §3): vector usage requires model_ready AND
+    // reconciliation settled — otherwise FTS5-only, no waiting.
     const resultMap = new Map<string, ChunkSearchResult>();
-    try {
-      primaryQueryEmbedding = await this.generateEmbedding(queryVariants[0], 1024, true);
-      for (const variant of queryVariants) {
-        const embedding = await this.generateEmbedding(variant, 1024, true);
-        const variantResults = searchChunks(embedding, limit * 3);
-        for (const r of variantResults) {
-          const existing = resultMap.get(r.chunk_id);
-          if (!existing || r.distance < existing.distance) {
-            resultMap.set(r.chunk_id, r);
+    let degradationReason: string | undefined;
+    if (!(this.coordinator?.eligible ?? false)) {
+      vectorDegraded = true;
+      degradationReason = this.degradationReason();
+      console.error(`ℹ️ vector search not eligible (${degradationReason ?? 'unknown'}) — FTS5-only`);
+    } else {
+      try {
+        primaryQueryEmbedding = await this.generateEmbedding(queryVariants[0], 1024, true);
+        for (const variant of queryVariants) {
+          const embedding = await this.generateEmbedding(variant, 1024, true);
+          const variantResults = searchChunks(embedding, limit * 3);
+          for (const r of variantResults) {
+            const existing = resultMap.get(r.chunk_id);
+            if (!existing || r.distance < existing.distance) {
+              resultMap.set(r.chunk_id, r);
+            }
           }
         }
+      } catch (embErr) {
+        vectorDegraded = true;
+        degradationReason = 'model_not_ready';
+        console.error(`⚠️ Vector search unavailable (embedding model down) — degrading to FTS5-only:`, embErr instanceof Error ? embErr.message : embErr);
       }
-    } catch (embErr) {
-      vectorDegraded = true;
-      console.error(`⚠️ Vector search unavailable (embedding model down) — degrading to FTS5-only:`, embErr instanceof Error ? embErr.message : embErr);
     }
     const vectorResults = Array.from(resultMap.values()).sort((a, b) => a.distance - b.distance);
 
@@ -2640,12 +2729,10 @@ export class RAGKnowledgeGraphManager {
     const ftsBoostMap = new Map<string, number>();
     try {
       const ftsSearchQuery = (q: string) => {
-        // Escape FTS5 special characters and build a query with OR between terms
-        const sanitized = q.replace(/["\*\(\)\-]/g, ' ').trim();
-        if (!sanitized) return [];
-        const terms = sanitized.split(/\s+/).filter(t => t.length > 0);
-        if (terms.length === 0) return [];
-        const ftsExpr = terms.map(t => `"${t}"`).join(' OR ');
+        // Shared compiler (spec §5) — same sanitize rules as pre-3.6, extracted
+        // so entity FTS fallback uses identical MATCH-safety guarantees.
+        const ftsExpr = compileFtsLiteralQuery(q);
+        if (ftsExpr === null) return [];
         return this.db!.prepare(`
           SELECT cm.rowid, cm.chunk_id, bm25(chunks_fts) as fts_score
           FROM chunks_fts
@@ -2723,7 +2810,18 @@ export class RAGKnowledgeGraphManager {
 
     if (vectorResults.length === 0) {
       console.error(`ℹ️ No vector or FTS5 matches found for "${query}"`);
-      return [];
+      // Empty results still carry state (spec §5c: envelope exists so callers
+      // can distinguish "nothing matched" from "vector search was degraded").
+      const covE = this.coordinator?.coverage();
+      const chunkPctE = covE && covE.chunk.total > 0 ? Math.round((covE.chunk.embedded / covE.chunk.total) * 100) : 100;
+      const graphPctE = covE && covE.entity.total > 0 ? Math.round((covE.entity.embedded / covE.entity.total) * 100) : 100;
+      return {
+        results: [],
+        search_mode: vectorDegraded ? 'fts-only' : (chunkPctE < 100 ? 'hybrid-partial' : 'hybrid'),
+        model_state: this.gate.status.state,
+        coverage: { chunk_pct: chunkPctE, graph_coverage_pct: graphPctE },
+        ...(degradationReason ? { degradation_reason: degradationReason } : {}),
+      };
     }
 
     // Get entity information for graph enhancement via vector similarity
@@ -2938,24 +3036,46 @@ export class RAGKnowledgeGraphManager {
         fts_boost: ftsBoost > 0 ? ftsBoost : undefined,
         full_context_available: true,
         chunk_type: result.chunk_type as 'document' | 'entity' | 'relationship',
-        source_id: sourceId,
-        search_mode: vectorDegraded ? 'fts-only' : 'hybrid'
+        source_id: sourceId
       });
     }
-    
+
     // Sort by relevance and return top results
     const finalResults = enhancedResults
       .sort((a, b) => b.relevance_score - a.relevance_score)
       .slice(0, limit);
-    
+
     // Log search statistics
     const docResults = finalResults.filter(r => r.chunk_type === 'document').length;
     const entityResults = finalResults.filter(r => r.chunk_type === 'entity').length;
     const relResults = finalResults.filter(r => r.chunk_type === 'relationship').length;
-    
+
     console.error(`✅ Enhanced hybrid search completed: ${finalResults.length} results (${docResults} docs, ${entityResults} entities, ${relResults} relationships)`);
-    
-    return finalResults;
+
+    // v3.6 envelope (spec §5c, breaking): search_mode moved from per-item to
+    // top-level so state is visible even on empty results; coverage tells the
+    // caller how much of the corpus is actually vector-searchable.
+    const cov = this.coordinator?.coverage();
+    const chunkPct = cov && cov.chunk.total > 0 ? Math.round((cov.chunk.embedded / cov.chunk.total) * 100) : 100;
+    const graphPct = cov && cov.entity.total > 0 ? Math.round((cov.entity.embedded / cov.entity.total) * 100) : 100;
+    const search_mode = vectorDegraded ? 'fts-only' : (chunkPct < 100 ? 'hybrid-partial' : 'hybrid');
+    return {
+      results: finalResults,
+      search_mode,
+      model_state: this.gate.status.state,
+      coverage: { chunk_pct: chunkPct, graph_coverage_pct: graphPct },
+      ...(degradationReason ? { degradation_reason: degradationReason } : {}),
+    };
+  }
+
+  // v3.6 (spec §5c / 6R note 2): why is vector search degraded right now?
+  degradationReason(): 'disabled' | 'model_not_ready' | 'reconciling' | 'reconciliation_failed' | undefined {
+    if (this.gate.isDisabled) return 'disabled';
+    if (!this.gate.isReady) return 'model_not_ready';
+    const rs = this.coordinator?.reconState;
+    if (rs === 'failed') return 'reconciliation_failed';
+    if (rs && rs !== 'complete' && rs !== 'n/a') return 'reconciling';
+    return undefined;
   }
 
   // NEW: Get detailed context for a specific chunk
