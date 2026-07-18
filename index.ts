@@ -37,6 +37,7 @@ import { migrations } from './src/migrations/migrations.js';
 import { EmbeddingGate, GateNotReadyError, GateDisabledError } from './src/embeddingGate.js';
 import type { EmbedFn, EmbedPriority } from './src/embeddingGate.js';
 import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock, quarantinePartialCache } from './src/modelCache.js';
+import { BackfillCoordinator } from './src/backfillCoordinator.js';
 import os from 'node:os';
 import { createHash } from 'crypto';
 import { createRequire } from 'module';
@@ -211,7 +212,10 @@ export class RAGKnowledgeGraphManager {
   gate!: EmbeddingGate;
   embeddingsMode: 'lazy' | 'eager' | 'off' = 'lazy';
   currentProfileId = 0;
-  coordinator: any = null; // BackfillCoordinator — wired in initialize (typed loosely to keep the A′ boundary thin here)
+  // Automatic grandfathering of legacy vectors is only allowed under the v3.5
+  // default model config, or with the explicit trust opt-in (spec §6b guard).
+  grandfatherAllowed = IS_DEFAULT_MODEL_CONFIG || process.env.RAG_MEMORY_TRUST_LEGACY_VECTORS === '1';
+  coordinator: BackfillCoordinator | null = null;
   private embeddingCache: Map<string, Float32Array> = new Map();
   private readonly EMBEDDING_CACHE_MAX = 500;
   private dictionaryCache: { nativeToEn: Record<string, string>; enToNative: Record<string, string> } | null = null;
@@ -245,6 +249,21 @@ export class RAGKnowledgeGraphManager {
       mode: this.embeddingsMode,
       loadModel: () => this.buildRealLoader(),
       onReady: () => this.coordinator?.kick(),
+    });
+
+    // Late-bound deps (closures): tests swap manager.gate / flip the guard.
+    this.coordinator = new BackfillCoordinator({
+      db: () => this.db,
+      gateIsReady: () => this.gate.isReady,
+      gateIsDisabled: () => this.gate.isDisabled,
+      mode: () => this.embeddingsMode,
+      grandfatherAllowed: () => this.grandfatherAllowed,
+      currentProfileId: () => this.currentProfileId,
+      buildEntityInputHash: (entityId) => this.entityInputHash(entityId),
+      hashEntityText: (text) => this.hashWithBuilderVersion(text),
+      chunkInputHash: (text) => createHash('sha256').update(text).digest('hex'),
+      reembedEntity: async (entityId) => this.embedEntity(entityId, 'backfill'),
+      reembedChunk: async (rowid) => this.reembedChunkByRowid(rowid),
     });
 
     console.error('✅ RAG-enabled knowledge graph initialized (embedding model deferred)');
@@ -303,8 +322,41 @@ export class RAGKnowledgeGraphManager {
     }
   }
 
-  // Wired to the BackfillCoordinator in Task 5; a stub keeps main() stable.
-  async startReconciliation(): Promise<void> { /* T5 */ }
+  // Background provenance reconciliation (spec §6b). Runs in parallel with the
+  // model load; vector search and automatic backfill stay closed until it
+  // settles (eligibility barrier in the coordinator).
+  async startReconciliation(): Promise<void> {
+    if (!this.coordinator) return;
+    await this.coordinator.runReconciliation();
+    this.coordinator.sweepStart();
+  }
+
+  // sha256 with the entity text-builder version mixed in: a builder change
+  // re-backfills entities only, never chunks (spec §6c N2).
+  hashWithBuilderVersion(text: string): string {
+    return createHash('sha256').update(`${TEXT_BUILDER_VERSION}\n${text}`).digest('hex');
+  }
+
+  // Rebuild the CURRENT embedding input hash for an entity. null = entity gone
+  // or malformed observations — reconciliation fail-closes to missing.
+  entityInputHash(entityId: string): string | null {
+    try {
+      const entity = this.db!.prepare(`SELECT name, entityType, observations FROM entities WHERE id = ?`)
+        .get(entityId) as { name: string; entityType: string; observations: string } | undefined;
+      if (!entity) return null;
+      const built = this.buildEntityEmbeddingText({
+        name: entity.name,
+        entityType: entity.entityType,
+        observations: JSON.parse(entity.observations),
+      });
+      return this.hashWithBuilderVersion(built.text);
+    } catch {
+      return null;
+    }
+  }
+
+  // T6 implements chunk re-embedding for the backfill scanner.
+  async reembedChunkByRowid(_rowid: number): Promise<boolean> { return false; }
 
   // spec §3 shutdown order: block new batches -> settle coordinator -> settle
   // gate -> close DB -> natural exit (process.exit is forbidden: ONNX mutex).
@@ -1174,7 +1226,7 @@ export class RAGKnowledgeGraphManager {
   }
 
   // Generate and store embedding for a single entity
-  private async embedEntity(entityId: string): Promise<boolean> {
+  private async embedEntity(entityId: string, priority: EmbedPriority = 'bulk'): Promise<boolean> {
     if (!this.db) throw new Error('Database not initialized');
     
     // Get entity data
@@ -1199,7 +1251,7 @@ export class RAGKnowledgeGraphManager {
     // char size (identity excluded), and embed duration. `capped` = some observation chars dropped.
     const capped = built.cappedObsChars < built.filteredObsChars;
     const embedStart = Date.now();
-    const embedding = await this.generateEmbedding(embeddingText);
+    const embedding = await this.generateEmbedding(embeddingText, 1024, false, priority);
     const embedMs = Date.now() - embedStart;
     console.error(
       `[embed] ${entity.name}: ${built.selectedObsCount}/${built.totalObsCount} obs, ${built.filteredObsChars}ch -> ${built.cappedObsChars}ch${capped ? ' (capped)' : ''}, ${embedMs}ms`
