@@ -37,6 +37,32 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 const PKG_VERSION: string = require('../package.json').version;
 
+// v3.6: runtime Node floor (engines is advisory only under default npm config).
+// Limitation: static native imports above may fail before this runs on very old
+// Node — documented in docs/UPDATING.md.
+const NODE_MAJOR = Number(process.versions.node.split('.')[0]);
+function assertNodeVersion(): void {
+  if (NODE_MAJOR < 24) {
+    console.error(`❌ rag-memory-epf-mcp v${PKG_VERSION} requires Node >= 24 (current: ${process.versions.node}).`);
+    console.error('   See docs/UPDATING.md for the supported runtime matrix.');
+    process.exitCode = 1;
+    throw new Error('unsupported Node version');
+  }
+}
+
+// v3.6: strip tokens / auth material / long URLs from operator-facing error text.
+function sanitizeErrorMessage(msg: string): string {
+  return msg
+    .replace(/(hf_|api[_-]?key=|authorization:\s*)\S+/gi, '$1[redacted]')
+    .replace(/https?:\/\/\S{60,}/g, '[url]')
+    .slice(0, 500);
+}
+
+// v3.6: startup self-report banner (version reliability — spec §8).
+function printBanner(opts: { model: string; revision: string; dtype: string; cachePath: string; dbPath: string }): void {
+  console.error(`🚀 rag-memory-epf-mcp v${PKG_VERSION} | node v${process.versions.node} | model ${opts.model}@${opts.revision} (${opts.dtype}) | cache ${opts.cachePath} | db ${opts.dbPath}`);
+}
+
 // Configure Hugging Face transformers for better compatibility
 if (env.backends?.onnx?.wasm) {
   env.backends.onnx.wasm.wasmPaths = './node_modules/@huggingface/transformers/dist/';
