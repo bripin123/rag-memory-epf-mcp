@@ -558,30 +558,38 @@ export class RAGKnowledgeGraphManager {
     if (!this.db) throw new Error('Database not initialized');
     
     const newRelations = [];
-    
+
     for (const relation of relations) {
-      // Ensure entities exist
-      await this.createEntities([
+      // Ensure entities exist. v3.6 (spec §5c): auto-created endpoints may be
+      // embedded/queued/disabled independently — report per endpoint; 'n/a'
+      // means the endpoint already existed (no embedding work happened here).
+      const ensured = await this.createEntities([
         { name: relation.from, entityType: 'CONCEPT', observations: [] },
         { name: relation.to, entityType: 'CONCEPT', observations: [] }
       ]);
-      
+      const statusOf = (name: string): 'embedded' | 'queued' | 'disabled' | 'n/a' => {
+        const hit = ensured.find(e => e.name === name) as (Entity & { embedding_status?: 'embedded' | 'queued' | 'disabled' }) | undefined;
+        return hit?.embedding_status ?? 'n/a';
+      };
+      const endpoint_embedding_status = { from: statusOf(relation.from), to: statusOf(relation.to) };
+
       const sourceId = `entity_${relation.from.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
       const targetId = `entity_${relation.to.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
       const relationId = `rel_${sourceId}_${relation.relationType}_${targetId}`.toLowerCase();
-      
+
       const stmt = this.db.prepare(`
-        INSERT OR IGNORE INTO relationships 
+        INSERT OR IGNORE INTO relationships
         (id, source_entity, target_entity, relationType, confidence, metadata)
         VALUES (?, ?, ?, ?, ?, ?)
       `);
-      
+
       const result = stmt.run(relationId, sourceId, targetId, relation.relationType, 1.0, '{}');
       if (result.changes > 0) {
-        newRelations.push(relation);
+        newRelations.push({ ...relation, endpoint_embedding_status } as Relation);
       }
     }
 
+    this.coordinator?.kick();
     return newRelations;
   }
 
@@ -3575,8 +3583,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         await ragKgManager.deleteEntities((validatedArgs as any).entityNames as string[]);
         return { content: [{ type: "text", text: "Entities deleted successfully" }] };
       case "deleteObservations":
-        await ragKgManager.deleteObservations((validatedArgs as any).deletions as { entityName: string; observations: string[] }[]);
-        return { content: [{ type: "text", text: "Observations deleted successfully" }] };
+        // v3.6 (spec §5c, breaking): structured per-entity results replace the
+        // bare success string — mixed embedded/queued/no-op states are visible.
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.deleteObservations((validatedArgs as any).deletions as { entityName: string; observations: string[] }[]), null, 2) }] };
       case "deleteRelations":
         await ragKgManager.deleteRelations((validatedArgs as any).relations as Relation[]);
         return { content: [{ type: "text", text: "Relations deleted successfully" }] };
@@ -3660,9 +3669,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error) {
+    // v3.6 (spec §5c): machine-distinguishable failures. Embedding-gate errors
+    // become structured retryable/terminal payloads; every error response now
+    // sets isError so clients stop parsing "Error: ..." strings.
+    if (error instanceof GateNotReadyError) {
+      return { isError: true, content: [{ type: "text", text: JSON.stringify({
+        code: error.code, state: error.state,
+        ...(error.retryAfterMs !== undefined ? { retry_after_ms: error.retryAfterMs } : {}),
+        message: error.message }) }] };
+    }
+    if (error instanceof GateDisabledError) {
+      return { isError: true, content: [{ type: "text", text: JSON.stringify({
+        code: error.code, state: error.state, message: error.message }) }] };
+    }
     if (error instanceof Error) {
       console.error(`❌ Tool execution error for ${name}:`, error.message);
-      return { content: [{ type: "text", text: `Error: ${error.message}` }] };
+      return { isError: true, content: [{ type: "text", text: `Error: ${error.message}` }] };
     }
     throw error;
   }
