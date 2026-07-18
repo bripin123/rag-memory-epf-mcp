@@ -134,8 +134,18 @@ storeDocument(id, content, metadata)
 |----------|---------|-------------|
 | `DB_FILE_PATH` | `rag-memory.db` (server dir) | Path to project-local SQLite database |
 | `EMBEDDING_MODEL` | `Xenova/bge-m3` | HuggingFace model ID for embeddings |
+| `RAG_MEMORY_EMBEDDINGS` | `lazy` | Boot mode: `lazy` (connect instantly, model loads in background), `eager` (wait for model + reconciliation, pre-3.6 behavior), `off` (never load the model — FTS5-only, zero download) |
+| `RAG_MEMORY_MODEL_CACHE_DIR` | OS user cache | Version-independent model cache location (see `docs/UPDATING.md`) |
+| `RAG_MEMORY_TRUST_LEGACY_VECTORS` | unset | Set `1` to grandfather pre-existing vectors under a **custom** `EMBEDDING_MODEL` (default model configs grandfather automatically) |
 
 ## Changelog
+
+### v3.6.0
+- **Lite install / lazy boot**: the MCP server connects immediately — FTS5 search, knowledge graph and CRUD work from the first second, while the bge-m3 model (~1.2GB) loads or downloads in the background. Hybrid search switches on automatically. Requires Node **>= 24**.
+- **Version-independent model cache** with a cross-process download lock: engine version bumps no longer re-download the model, and concurrent servers on one machine never corrupt a download. Cleaning the npx cache no longer deletes the model.
+- **Embedding provenance + automatic backfill**: every vector records its input hash and model profile; anything missing or stale (including rows written while the model was unavailable) is re-embedded automatically with a per-target retry cap. Fixes a long-standing defect where `deleteObservations` left stale entity vectors behind.
+- **Search state transparency**: responses report `search_mode` (`hybrid` / `hybrid-partial` / `fts-only`), model state, provenance coverage and a `degradation_reason`; `searchNodes` gains a lexical FTS fallback so entities never disappear from search while embeddings catch up. `getKnowledgeGraphStats` gains a `server` block (version, node, states, coverage) for update-reliability checks.
+- **⚠️ BREAKING**: (1) `hybridSearch` now returns an envelope `{results, search_mode, model_state, coverage, degradation_reason?}` instead of a bare array (per-item `search_mode` removed). (2) `deleteObservations` returns `{results: [{entityName, deleted, embedding_status}], total_deleted}` instead of a success string. Error responses now set `isError: true`. Migration/rollback and fleet-rollout guidance: `docs/UPDATING.md`.
 
 ### v3.5.0
 - **Atomic `syncDocumentFromFile`**: embeddings are computed before any DB write, then applied in a single synchronous transaction, so a failed embedding (e.g. model still loading) leaves the existing document fully intact instead of a half-deleted or partially-embedded state.

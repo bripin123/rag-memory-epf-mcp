@@ -97,8 +97,12 @@ const DB_FILE_PATH = process.env.DB_FILE_PATH
   : defaultDbPath;
 
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/bge-m3';
-// T11 pins the default model to a specific upstream commit; custom models stay on 'main'.
-const MODEL_REVISION = 'main';
+// Default model pinned to an upstream commit (spec §6c): a shared version-
+// independent cache must never silently swap weights under 'main'. Verified
+// 2026-07-18 via `git ls-remote https://huggingface.co/Xenova/bge-m3` — the
+// same revision the local v3.5 cache was downloaded from. Custom models stay
+// on 'main' (their vectors are never auto-grandfathered anyway).
+const MODEL_REVISION = process.env.EMBEDDING_MODEL ? 'main' : '4de13258303883538bd53b696b452bf8099f0858';
 const MODEL_DTYPE = 'fp16';
 // Entity embedding text builder version — mixed into entity input hashes so a
 // builder change re-backfills entities without touching chunk vectors (spec §6c).
