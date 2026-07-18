@@ -22,21 +22,30 @@ export async function makeManager() {
 }
 
 // Install a deterministic fake embedder so embedding-dependent paths run without
-// loading bge-m3. TS `private` fields are erased at runtime (compiled JS exposes
-// them as plain properties), so direct assignment works from a .mjs test.
+// loading bge-m3. v3.6: the model lives behind an EmbeddingGate — we swap in a
+// pre-started fake gate (runtime JS exposes TS-private fields, so forcing the
+// ready state keeps this helper synchronous for existing tests).
 export function installFakeEmbedder(manager) {
   const counter = { calls: 0 };
-  manager.embeddingModel = async (_text) => {
+  const gate = manager.gate;
+  gate.state = 'ready';
+  gate.shuttingDown = false;
+  gate.embedFn = async (text) => {
     counter.calls++;
-    return { data: new Float32Array(1024).fill(0.01) }; // bge-m3 is 1024-dim
+    const v = new Float32Array(1024);
+    // Text-sensitive but deterministic — distinct texts get distinct vectors.
+    for (let i = 0; i < text.length; i++) v[i % 1024] += text.charCodeAt(i) / 1000;
+    v[0] += 0.01;
+    return v;
   };
-  manager.modelInitialized = true;
+  manager.embeddingCache = new Map();
   return counter;
 }
 
 export function simulateModelDown(manager) {
-  manager.embeddingModel = null;
-  manager.modelInitialized = false;
+  const gate = manager.gate;
+  gate.state = 'idle';           // not-ready: gate.embed rejects GateNotReadyError
+  gate.embedFn = null;
   manager.embeddingCache = new Map(); // drop cached query embeddings so the down path is actually exercised
 }
 

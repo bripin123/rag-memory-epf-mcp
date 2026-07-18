@@ -32,6 +32,12 @@ import { MigrationManager } from './src/migrations/migration-manager.js';
 // Import chunk text algorithm (extracted for publish-time invariant testing)
 import { chunkText as splitTextIntoChunks } from './src/chunkText.js';
 import { migrations } from './src/migrations/migrations.js';
+
+// v3.6 lite install: model lifecycle + version-independent cache (A′ boundary)
+import { EmbeddingGate, GateNotReadyError, GateDisabledError } from './src/embeddingGate.js';
+import type { EmbedFn, EmbedPriority } from './src/embeddingGate.js';
+import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock, quarantinePartialCache } from './src/modelCache.js';
+import os from 'node:os';
 import { createHash } from 'crypto';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
@@ -77,6 +83,15 @@ const DB_FILE_PATH = process.env.DB_FILE_PATH
   : defaultDbPath;
 
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/bge-m3';
+// T11 pins the default model to a specific upstream commit; custom models stay on 'main'.
+const MODEL_REVISION = 'main';
+const MODEL_DTYPE = 'fp16';
+// Entity embedding text builder version — mixed into entity input hashes so a
+// builder change re-backfills entities without touching chunk vectors (spec §6c).
+const TEXT_BUILDER_VERSION = 'tb1';
+// v3.5 default model config — grandfathering legacy vectors is only automatic
+// when the current config matches this (spec §6b custom-model guard).
+const IS_DEFAULT_MODEL_CONFIG = !process.env.EMBEDDING_MODEL || process.env.EMBEDDING_MODEL === 'Xenova/bge-m3';
 
 // Original MCP interfaces
 interface Entity {
@@ -193,22 +208,22 @@ function safeRowid(value: unknown): number {
 export class RAGKnowledgeGraphManager {
   private db: Database.Database | null = null;
   private encoding: any = null;
-  private embeddingModel: any = null;
-  private modelInitialized: boolean = false;
+  gate!: EmbeddingGate;
+  embeddingsMode: 'lazy' | 'eager' | 'off' = 'lazy';
+  currentProfileId = 0;
+  coordinator: any = null; // BackfillCoordinator — wired in initialize (typed loosely to keep the A′ boundary thin here)
   private embeddingCache: Map<string, Float32Array> = new Map();
   private readonly EMBEDDING_CACHE_MAX = 500;
   private dictionaryCache: { nativeToEn: Record<string, string>; enToNative: Record<string, string> } | null = null;
 
-  async initialize(opts: { skipModel?: boolean } = {}) {
+  // v3.6 (spec §3): initialize = DB + migrations + profile only. The embedding
+  // model is NEVER awaited here — main() connects the MCP server first and the
+  // gate loads in the background (lazy) or is awaited explicitly (eager).
+  async initialize(opts: { skipModel?: boolean; gate?: EmbeddingGate } = {}) {
     console.error('🚀 Initializing RAG Knowledge Graph MCP Server...');
 
-    // Initialize database
     this.db = new Database(DB_FILE_PATH);
-
-    // Load sqlite-vec extension
     sqliteVec.load(this.db);
-
-    // SQLite performance & safety optimizations
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('busy_timeout = 5000');
@@ -216,50 +231,89 @@ export class RAGKnowledgeGraphManager {
     this.db.pragma('temp_store = MEMORY');
     this.db.pragma('mmap_size = 268435456');
     this.db.pragma('foreign_keys = ON');
-
-    // Initialize tiktoken
     this.encoding = get_encoding("cl100k_base");
 
-    // Initialize embedding model (skippable for tests / FTS-only environments)
-    if (!opts.skipModel) {
-      await this.initializeEmbeddingModel();
-    } else {
-      console.error('⏭️  Skipping embedding model load (skipModel=true)');
-    }
-
-    // Run database migrations
     await this.runMigrations();
+    this.currentProfileId = this.ensureCurrentProfile();
 
-    console.error('✅ RAG-enabled knowledge graph initialized');
-    
-    // Log system info
+    this.embeddingsMode = opts.skipModel
+      ? 'off'
+      : ((process.env.RAG_MEMORY_EMBEDDINGS as 'lazy' | 'eager' | 'off') || 'lazy');
+    if (!['lazy', 'eager', 'off'].includes(this.embeddingsMode)) this.embeddingsMode = 'lazy';
+
+    this.gate = opts.gate ?? new EmbeddingGate({
+      mode: this.embeddingsMode,
+      loadModel: () => this.buildRealLoader(),
+      onReady: () => this.coordinator?.kick(),
+    });
+
+    console.error('✅ RAG-enabled knowledge graph initialized (embedding model deferred)');
     const systemInfo = getSystemInfo();
     console.error(`📊 System Info: ${systemInfo.toolCounts.total} tools available (${systemInfo.toolCounts.knowledgeGraph} knowledge graph, ${systemInfo.toolCounts.rag} RAG, ${systemInfo.toolCounts.graphQuery} query)`);
   }
 
-  private async initializeEmbeddingModel() {
-    try {
-      console.error(`🤖 Loading embedding model: ${EMBEDDING_MODEL} (1024-dim, 100+ languages)...`);
+  // Upsert the stored-vector compatibility profile (spec §6c layer 2) and record
+  // retrieval config in server_meta (layer 3 — never a backfill trigger).
+  private ensureCurrentProfile(): number {
+    if (!this.db) throw new Error('Database not initialized');
+    const dims = 1024;
+    if (dims !== 1024) throw new Error('unsupported embedding dims (vec0 tables are fixed at 1024)'); // fail-fast contract
+    this.db.prepare(`INSERT OR IGNORE INTO embedding_profiles
+      (model_id, revision, dtype, dims, pooling, normalize) VALUES (?,?,?,?,?,?)`)
+      .run(EMBEDDING_MODEL, MODEL_REVISION, MODEL_DTYPE, dims, 'cls', 1);
+    const row = this.db.prepare(`SELECT id FROM embedding_profiles
+      WHERE model_id=? AND revision=? AND dtype=? AND dims=? AND pooling=? AND normalize=?`)
+      .get(EMBEDDING_MODEL, MODEL_REVISION, MODEL_DTYPE, dims, 'cls', 1) as { id: number };
+    this.db.prepare(`INSERT INTO server_meta(key,value) VALUES('current_profile_id',?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(String(row.id));
+    this.db.prepare(`INSERT INTO server_meta(key,value) VALUES('query_prefix_version','1')
+      ON CONFLICT(key) DO NOTHING`).run();
+    return row.id;
+  }
 
-      // Configure environment to allow remote model downloads
+  // Real model loader used by the gate: version-independent cache dir with a
+  // cross-process download lock. Preflight failure throws (gate -> failed);
+  // silently falling back to the package-internal cache is forbidden (spec §7).
+  private async buildRealLoader(): Promise<EmbedFn> {
+    const cacheDir = resolveModelCacheDir(process.env, process.platform, os.homedir());
+    const pf = preflightCacheDir(cacheDir);
+    if (!pf.ok) throw new Error(`model cache dir not writable (${cacheDir}): ${pf.error}`);
+    const key = artifactKey(EMBEDDING_MODEL, MODEL_REVISION, MODEL_DTYPE);
+    const lock = new ModelDownloadLock(cacheDir, key);
+    const role = await lock.acquireOrWait({ timeoutMs: 10 * 60_000 });
+    try {
+      this.gate.markDownloading();
       env.allowRemoteModels = true;
       env.allowLocalModels = true;
-
-      this.embeddingModel = await pipeline(
-        'feature-extraction',
-        EMBEDDING_MODEL,
-        { revision: 'main', dtype: 'fp16' }
-      );
-
-      this.modelInitialized = true;
-      console.error(`✅ ${EMBEDDING_MODEL} model loaded successfully (fp16)`);
-
-    } catch (error) {
-      console.error('❌ Failed to load embedding model:', error instanceof Error ? error.message : error);
-      console.error('⚠️  Semantic search will be unavailable. Other tools (CRUD, graph queries) still work.');
-      console.error('💡 Fix: Ensure ONNX model cache is accessible. Try: rm -rf ~/.npm/_onnx_models && restart.');
-      this.modelInitialized = false;
+      console.error(`🤖 Loading embedding model: ${EMBEDDING_MODEL} (1024-dim, cache=${cacheDir})...`);
+      const model = await pipeline('feature-extraction', EMBEDDING_MODEL,
+        { revision: MODEL_REVISION, dtype: MODEL_DTYPE, cache_dir: cacheDir } as any);
+      if (role === 'owner') lock.markComplete();
+      console.error(`✅ ${EMBEDDING_MODEL} model loaded (${MODEL_DTYPE})`);
+      return async (text: string, dims: number, isQuery: boolean) => {
+        const input = isQuery ? `Represent this sentence for searching relevant passages: ${text}` : text;
+        const r = await model(input, { pooling: 'cls', normalize: true });
+        return new Float32Array((r.data as Float32Array).slice(0, dims));
+      };
+    } catch (e) {
+      if (role === 'owner') quarantinePartialCache(cacheDir, EMBEDDING_MODEL);
+      throw e;
+    } finally {
+      lock.release();
     }
+  }
+
+  // Wired to the BackfillCoordinator in Task 5; a stub keeps main() stable.
+  async startReconciliation(): Promise<void> { /* T5 */ }
+
+  // spec §3 shutdown order: block new batches -> settle coordinator -> settle
+  // gate -> close DB -> natural exit (process.exit is forbidden: ONNX mutex).
+  async shutdownAll(): Promise<void> {
+    console.error('\n🧹 Cleaning up...');
+    try { await this.coordinator?.shutdown(); } catch { /* settle best-effort */ }
+    try { await this.gate?.shutdown(5000); } catch { /* settle best-effort */ }
+    try { this.cleanup(); } catch { /* DB close */ }
+    process.exitCode = process.exitCode ?? 0;
   }
 
   async runMigrations(): Promise<{ applied: number; currentVersion: number; appliedMigrations: Array<{ version: number; description: string }> }> {
@@ -297,11 +351,6 @@ export class RAGKnowledgeGraphManager {
     if (this.encoding) {
       this.encoding.free();
       this.encoding = null;
-    }
-    if (this.embeddingModel) {
-      // Clean up the embedding model if it has cleanup methods
-      this.embeddingModel = null;
-      this.modelInitialized = false;
     }
     this.embeddingCache.clear();
     if (this.db) {
@@ -1586,38 +1635,23 @@ export class RAGKnowledgeGraphManager {
 
   // Generate embeddings using sentence transformers
   // isQuery: true for search queries (adds instruction prefix), false for documents/entities
-  private async generateEmbedding(text: string, dimensions = 1024, isQuery = false): Promise<Float32Array> {
+  private async generateEmbedding(text: string, dimensions = 1024, isQuery = false,
+      priority: EmbedPriority = 'interactive'): Promise<Float32Array> {
     // Check cache first (hash-based key to avoid collisions on long texts)
     const cacheKey = createHash('md5').update(`${text}_${dimensions}_${isQuery}`).digest('hex');
     const cached = this.embeddingCache.get(cacheKey);
     if (cached) return cached;
 
-    if (this.modelInitialized && this.embeddingModel) {
-      try {
-        // BGE-M3: instruction prefix improves retrieval quality for queries
-        const inputText = isQuery
-          ? `Represent this sentence for searching relevant passages: ${text}`
-          : text;
-        const result = await this.embeddingModel(inputText, { pooling: 'cls', normalize: true });
-
-        // Extract the embedding array and convert to Float32Array
-        const embedding = result.data;
-        const modelResult = new Float32Array(embedding.slice(0, dimensions));
-        // Cache the result (LRU: evict oldest if full)
-        if (this.embeddingCache.size >= this.EMBEDDING_CACHE_MAX) {
-          const firstKey = this.embeddingCache.keys().next().value;
-          if (firstKey) this.embeddingCache.delete(firstKey);
-        }
-        this.embeddingCache.set(cacheKey, modelResult);
-        return modelResult;
-
-      } catch (error) {
-        console.error(`⚠️ Embedding model failed for text "${text.slice(0, 50)}...":`, error instanceof Error ? error.message : error);
-        throw new Error(`Embedding model not available. Ensure the model is loaded. Original error: ${error instanceof Error ? error.message : error}`);
-      }
+    // v3.6: all inference goes through the gate — state check + execution in one
+    // atomic boundary (TOCTOU-safe). GateNotReadyError / GateDisabledError
+    // propagate so each consumer honors its own not-ready contract (spec §5).
+    const modelResult = await this.gate.embed(text, { dims: dimensions, isQuery, priority });
+    if (this.embeddingCache.size >= this.EMBEDDING_CACHE_MAX) {
+      const firstKey = this.embeddingCache.keys().next().value;
+      if (firstKey) this.embeddingCache.delete(firstKey);
     }
-
-    throw new Error('Embedding model not initialized. The server may still be loading the model — retry in a few seconds.');
+    this.embeddingCache.set(cacheKey, modelResult);
+    return modelResult;
   }
 
   // === NEW SEPARATE TOOLS ===
@@ -3347,25 +3381,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
 
 async function main() {
   try {
+    assertNodeVersion();
     await ragKgManager.initialize();
-    
+    printBanner({
+      model: EMBEDDING_MODEL, revision: MODEL_REVISION, dtype: MODEL_DTYPE,
+      cachePath: resolveModelCacheDir(process.env, process.platform, os.homedir()),
+      dbPath: DB_FILE_PATH,
+    });
+
+    if (ragKgManager.embeddingsMode === 'eager') {
+      // eager = wait for BOTH the first model load attempt and reconciliation to
+      // settle (success or failure) before connecting — v3.5-equivalent boot
+      // extended to legacy DBs (spec §9). Failures fall back to background retry.
+      await Promise.allSettled([ragKgManager.gate.start(), ragKgManager.startReconciliation()]);
+    }
+
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error("🚀 Enhanced RAG Knowledge Graph MCP Server running on stdio");
-    
-    // Cleanup on exit — avoid process.exit() to prevent ONNX runtime mutex crash
-    const shutdown = () => {
-      console.error('\n🧹 Cleaning up...');
-      try { ragKgManager.cleanup(); } catch {}
-    };
+
+    if (ragKgManager.embeddingsMode === 'lazy') {
+      // Background: model load + provenance reconciliation run in parallel.
+      // Failures surface via gate/coordinator state, never as rejections.
+      void ragKgManager.gate.start().catch(() => {});
+      void ragKgManager.startReconciliation().catch(() => {});
+    }
+
+    // Graceful shutdown — avoid process.exit() to prevent ONNX runtime mutex crash.
+    const shutdown = () => { void ragKgManager.shutdownAll(); };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
-    process.on('exit', shutdown);
-    
+    process.on('exit', () => { try { ragKgManager.cleanup(); } catch { /* idempotent */ } });
   } catch (error) {
     console.error("Failed to initialize server:", error);
-    ragKgManager.cleanup();
-    process.exit(1);
+    try { ragKgManager.cleanup(); } catch { /* already down */ }
+    process.exitCode = 1;
   }
 }
 
@@ -3377,7 +3427,7 @@ async function main() {
 if (process.env.RAG_MEMORY_NO_AUTOSTART !== '1') {
   main().catch((error) => {
     console.error("Fatal error in main():", error);
-    ragKgManager.cleanup();
-    process.exit(1);
+    try { ragKgManager.cleanup(); } catch { /* already down */ }
+    process.exitCode = 1;
   });
 }
