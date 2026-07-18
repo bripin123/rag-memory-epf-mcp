@@ -106,7 +106,9 @@ export class BackfillCoordinator {
       + q(`SELECT COUNT(*) c FROM entity_embeddings WHERE rowid NOT IN (SELECT rowid FROM entity_embedding_metadata)`)
       + q(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE rowid NOT IN (SELECT rowid FROM entity_embeddings)`)
       + q(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE provenance_state IS NOT NULL AND profile_id IS NOT ?`, profileId)
-      + q(`SELECT COUNT(*) c FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ?`, profileId);
+      + q(`SELECT COUNT(*) c FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ?`, profileId)
+      // stamped chunk metadata whose vector is gone (beta 3R M3)
+      + q(`SELECT COUNT(*) c FROM chunk_metadata WHERE provenance_state IS NOT NULL AND rowid NOT IN (SELECT rowid FROM chunks)`);
   }
 
   // Batched (beta 2R residual): each batch commits its own transaction and
@@ -116,21 +118,28 @@ export class BackfillCoordinator {
     const profileId = this.deps.currentProfileId();
     let touched = 0;
     const batchTx = db.transaction((fn: () => void) => fn());
-    // Orphan vectors / metadata-without-vector: single set-based statements
-    // (index-backed subqueries — cheap even on large tables).
-    batchTx(() => {
-      touched += db.prepare(
-        `DELETE FROM entity_embeddings WHERE rowid NOT IN (SELECT rowid FROM entity_embedding_metadata)`
-      ).run().changes;
-      touched += db.prepare(
-        `DELETE FROM entity_embedding_metadata WHERE rowid NOT IN (SELECT rowid FROM entity_embeddings)`
-      ).run().changes;
-      touched += db.prepare(
-        `UPDATE chunk_metadata SET input_hash = NULL, profile_id = NULL, provenance_state = NULL
-         WHERE provenance_state IS NOT NULL AND rowid NOT IN (SELECT rowid FROM chunks)`
-      ).run().changes;
-    });
-    await new Promise(r => setImmediate(r));
+    // Split-state cleanup, LIMIT-batched with yields (beta 3R non-blocker): a
+    // pathological DB must not stall the freshly connected server even here.
+    const batchedRun = async (sql: string) => {
+      for (;;) {
+        if (this.shuttingDown) throw new Error('shutdown during sanitation');
+        let changes = 0;
+        batchTx(() => { changes = db.prepare(sql).run().changes; });
+        touched += changes;
+        if (changes < RECON_BATCH) return;
+        await new Promise(r => setImmediate(r));
+      }
+    };
+    await batchedRun(
+      `DELETE FROM entity_embeddings WHERE rowid IN (
+         SELECT rowid FROM entity_embeddings WHERE rowid NOT IN (SELECT rowid FROM entity_embedding_metadata) LIMIT ${RECON_BATCH})`);
+    await batchedRun(
+      `DELETE FROM entity_embedding_metadata WHERE rowid IN (
+         SELECT rowid FROM entity_embedding_metadata WHERE rowid NOT IN (SELECT rowid FROM entity_embeddings) LIMIT ${RECON_BATCH})`);
+    await batchedRun(
+      `UPDATE chunk_metadata SET input_hash = NULL, profile_id = NULL, provenance_state = NULL
+       WHERE rowid IN (
+         SELECT rowid FROM chunk_metadata WHERE provenance_state IS NOT NULL AND rowid NOT IN (SELECT rowid FROM chunks) LIMIT ${RECON_BATCH})`);
     // Old-profile rows: row deletes in bounded batches with yields.
     for (;;) {
       if (this.shuttingDown) throw new Error('shutdown during sanitation');
@@ -342,7 +351,9 @@ export class BackfillCoordinator {
   kick(): void {
     if (this.shuttingDown || this.deps.gateIsDisabled()) return;
     if (!this.eligible) return;
-    if (this.kickTimer) return;
+    // A running scan re-kicks itself via mutation callbacks; scanPromise must
+    // not be overwritten by a no-op second scan (beta 3R non-blocker).
+    if (this.kickTimer || this.scanPromise || this.scanning) return;
     this.kickTimer = setTimeout(() => {
       this.kickTimer = null;
       // Tracked so shutdown can await the whole scan, not just poll `scanning`

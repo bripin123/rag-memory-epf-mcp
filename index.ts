@@ -340,6 +340,7 @@ export class RAGKnowledgeGraphManager {
         throw new TerminalConfigError(`embedding model ${EMBEDDING_MODEL} outputs ${actualDims} dims — this engine's vec0 tables are fixed at 1024. Use a 1024-dim model.`);
       }
       if (role === 'owner') lock.markComplete();
+      lock.clearOwnerFailure();
       console.error(`✅ ${EMBEDDING_MODEL} model loaded (${MODEL_DTYPE})`);
       return async (text: string, dims: number, isQuery: boolean) => {
         const input = isQuery ? `Represent this sentence for searching relevant passages: ${text}` : text;
@@ -347,18 +348,23 @@ export class RAGKnowledgeGraphManager {
         return new Float32Array((r.data as Float32Array).slice(0, dims));
       };
     } catch (e) {
-      // Error classification (beta 2R B3):
+      // Error classification (beta 2R B3 + 3R M1):
       // - TerminalConfigError: cache is fine — no quarantine, no marker change.
-      // - owner-role failure: the download was in OUR hands and did not reach a
-      //   verified state -> quarantine partials (retention keeps 1).
-      // - ready-role failure (marker existed): files MAY be fine (OOM/transient
-      //   errors land here too) -> invalidate the marker only; the next attempt
-      //   becomes a locked owner and re-validates. If THAT owner also fails,
-      //   its own owner-path quarantine cleans the cache — bounded, no
-      //   good-cache trashing on the first transient error.
+      // - owner-role failure: TWO-strike policy — the first failure preserves
+      //   the cache (OOM/session/transient errors would otherwise trash a fine
+      //   1.2GB download on every backoff); only a second consecutive owner
+      //   failure quarantines (persistent corruption).
+      // - ready-role failure (marker existed): invalidate the marker only; the
+      //   next attempt becomes a locked owner and re-validates under the same
+      //   two-strike policy.
       if (!(e instanceof TerminalConfigError)) {
         if (role === 'owner') {
-          quarantinePartialCache(cacheDir, EMBEDDING_MODEL);
+          if (lock.recordOwnerFailure() === 'quarantine') {
+            console.error('🧹 second consecutive owner load failure — quarantining model cache');
+            quarantinePartialCache(cacheDir, EMBEDDING_MODEL);
+          } else {
+            console.error('… first owner load failure — cache preserved for revalidation');
+          }
         } else {
           lock.invalidateMarker();
         }

@@ -94,6 +94,24 @@ export class ModelDownloadLock {
     try { unlinkSync(this.markerPath); } catch { /* already gone */ }
   }
 
+  // Two-strike owner-failure policy (beta 3R M1): quarantining on the FIRST
+  // owner failure trashes a possibly-fine 1.2GB cache on transient OOM/session
+  // errors. A persistent cross-process strike file arms after the first
+  // failure; only a second consecutive owner failure quarantines. Any success
+  // clears the strike.
+  private get strikePath(): string { return this.markerPath.replace('.complete-', '.strike-'); }
+  recordOwnerFailure(): 'preserved' | 'quarantine' {
+    if (existsSync(this.strikePath)) {
+      try { unlinkSync(this.strikePath); } catch { /* reset for next cycle */ }
+      return 'quarantine';
+    }
+    try { writeFileSync(this.strikePath, new Date().toISOString()); } catch { /* best-effort */ }
+    return 'preserved';
+  }
+  clearOwnerFailure(): void {
+    try { unlinkSync(this.strikePath); } catch { /* already gone */ }
+  }
+
   // Returns 'owner' (caller must download, then markComplete + release) or
   // 'ready' (a completed, verified cache already exists). Async polling only —
   // never blocks the event loop (spec §7 / 3R M14).
@@ -113,10 +131,16 @@ export class ModelDownloadLock {
       if (Date.now() > deadline) {
         throw new Error(`model download lock wait timed out — holder pid=${this.holderPid() ?? 'unknown'}, lock=${this.lockPath}. If that process is hung, verify and remove the lock file manually (see docs/UPDATING.md).`);
       }
-      // Abortable sleep: shutdown does not have to ride out the poll interval.
+      // Abortable sleep with symmetric listener cleanup (beta 3R M4): a
+      // 10-minute wait at 500ms polls must not accumulate ~1200 abort
+      // listeners on the shared shutdown signal.
       await new Promise<void>(resolve => {
-        const t = setTimeout(resolve, poll);
-        opts.signal?.addEventListener('abort', () => { clearTimeout(t); resolve(); }, { once: true });
+        const onAbort = () => { clearTimeout(t); resolve(); };
+        const t = setTimeout(() => {
+          opts.signal?.removeEventListener('abort', onAbort);
+          resolve();
+        }, poll);
+        opts.signal?.addEventListener('abort', onAbort, { once: true });
       });
     }
   }

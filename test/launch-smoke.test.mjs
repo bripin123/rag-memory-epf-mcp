@@ -1,7 +1,9 @@
 // Launch smoke (v3.6): the built entry must complete a REAL MCP stdio
 // handshake (initialize + tools/list) within the timeout while the model is
-// completely unavailable (temp cache, HF offline), then shut down gracefully
-// on SIGTERM without process.exit. Spec §3·§10, DoD 1/10/19.
+// completely unavailable, then shut down gracefully on SIGTERM via the
+// NATURAL-exit path (the load settles as 'failed' fast here; the spec §3
+// bounded-exit exception is covered separately in bounded-exit.test.mjs).
+// Spec §3·§10, DoD 1/10/19.
 // Pre-3.6 this test only watched for the first boot log line — it passed even
 // when server.connect() was broken. It also still covers the v3.5.0 entry-point
 // regression (direct launch must boot main(), as npx/bin does).
