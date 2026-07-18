@@ -441,13 +441,22 @@ export class RAGKnowledgeGraphManager {
   }
 
   // spec §3 shutdown order: block new batches -> settle coordinator -> settle
-  // gate -> close DB -> natural exit (process.exit is forbidden: ONNX mutex).
+  // gate -> close DB -> natural exit. process.exit is forbidden while an ONNX
+  // session exists (runtime mutex crash) — but if the model never finished
+  // loading there is NO ONNX session, and an in-flight download fetch would
+  // otherwise hold the event loop indefinitely, so a bounded exit is safe and
+  // required there (advisor 4R M5 / N6 distinction).
   async shutdownAll(): Promise<void> {
     console.error('\n🧹 Cleaning up...');
     try { await this.coordinator?.shutdown(); } catch { /* settle best-effort */ }
+    const modelWasLoading = this.gate && (this.gate.status.state === 'loading' || this.gate.status.state === 'downloading');
     try { await this.gate?.shutdown(5000); } catch { /* settle best-effort */ }
     try { this.cleanup(); } catch { /* DB close */ }
     process.exitCode = process.exitCode ?? 0;
+    if (modelWasLoading) {
+      console.error('… model load/download was in flight (no ONNX session yet) — bounded exit');
+      process.exit(process.exitCode);
+    }
   }
 
   async runMigrations(): Promise<{ applied: number; currentVersion: number; appliedMigrations: Array<{ version: number; description: string }> }> {
@@ -1917,13 +1926,22 @@ export class RAGKnowledgeGraphManager {
         const embCount = (this.db.prepare(`
           SELECT count(*) AS n FROM chunks c JOIN chunk_metadata m ON c.rowid = m.rowid WHERE m.document_id = ?
         `).get(documentId) as { n: number }).n;
+        const linked = (this.db.prepare(`
+          SELECT count(DISTINCT ce.entity_id) AS n FROM chunk_entities ce
+          JOIN chunk_metadata m ON ce.chunk_rowid = m.rowid WHERE m.document_id = ?
+        `).get(documentId) as { n: number }).n;
         if (cmCount > 0 && cmCount === embCount) {
-          const linked = (this.db.prepare(`
-            SELECT count(DISTINCT ce.entity_id) AS n FROM chunk_entities ce
-            JOIN chunk_metadata m ON ce.chunk_rowid = m.rowid WHERE m.document_id = ?
-          `).get(documentId) as { n: number }).n;
           console.error(`⏭️  syncDocumentFromFile: ${documentId} unchanged (hash match, ${cmCount} chunks embedded) — skipped`);
           return { documentId, bytes, chunks: cmCount, embeddedChunks: embCount, linkedEntities: linked, skipped: true, reason: 'unchanged' };
+        }
+        if (cmCount > 0 && embCount < cmCount) {
+          // v3.6 (spec §5b M12): identical content with incomplete/stale vectors
+          // keeps the document, chunks, rowids and entity links — only the
+          // missing vectors are re-queued via the coordinator. Full re-chunking
+          // here would churn rowids and links for no content change.
+          console.error(`♻️ syncDocumentFromFile: ${documentId} unchanged but ${cmCount - embCount} vectors missing — re-queued (chunks preserved)`);
+          this.coordinator?.kick();
+          return { documentId, bytes, chunks: cmCount, embeddedChunks: embCount, linkedEntities: linked, skipped: true, reason: 'unchanged-revectorizing', embedding_status: this.gate.isDisabled ? 'disabled' : 'queued' } as any;
         }
       }
     }
@@ -3738,8 +3756,19 @@ async function main() {
       void ragKgManager.startReconciliation().catch(() => {});
     }
 
-    // Graceful shutdown — avoid process.exit() to prevent ONNX runtime mutex crash.
-    const shutdown = () => { void ragKgManager.shutdownAll(); };
+    // Graceful shutdown (spec §3 order) — transport close FIRST so stdin stops
+    // holding the event loop, then settle coordinator/gate, then DB close.
+    // process.exit() stays forbidden (ONNX runtime mutex crash).
+    let shuttingDown = false;
+    const shutdown = () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      void (async () => {
+        try { await server.close(); } catch { /* transport already gone */ }
+        try { process.stdin.pause(); process.stdin.unref?.(); } catch { /* best-effort */ }
+        await ragKgManager.shutdownAll();
+      })();
+    };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
     process.on('exit', () => { try { ragKgManager.cleanup(); } catch { /* idempotent */ } });
