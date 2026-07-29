@@ -29,6 +29,9 @@ import { getAllMCPTools, validateToolArgs, getSystemInfo } from './src/tools/too
 // Import migration system
 import { MigrationManager } from './src/migrations/migration-manager.js';
 import { backupBeforeMigration } from './src/backup/preflight.js';
+import { rebuildProjection, deleteStaleKgChunks } from './src/observations/projection.js';
+import { addRevision, correctRevision, transitionStatus, linkSources,
+         type SourceInput } from './src/observations/lifecycle.js';
 
 // Import chunk text algorithm (extracted for publish-time invariant testing)
 import { chunkText as splitTextIntoChunks } from './src/chunkText.js';
@@ -435,15 +438,20 @@ export class RAGKnowledgeGraphManager {
   // where another tool call can retrieve the pre-mutation vector, and a crash
   // between mutation and re-embed leaves a clean missing state (backfill
   // target), never a stale-searchable one.
+  // spec §4.5 단계 1: 관찰 변경 · projection 재합성 · entity vector 무효화 ·
+  // stale KG chunk 제거를 한 트랜잭션으로 묶는다. 하나만 되면 검색이 낡은
+  // 사실을 계속 반환한다.
   private mutateEntityAndInvalidate(entityId: string, mutate: () => void): void {
     const tx = this.db!.transaction(() => {
       mutate();
+      rebuildProjection(this.db!, entityId);
       const meta = this.db!.prepare(`SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?`)
         .get(entityId) as { rowid: number } | undefined;
       if (meta) {
         this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(meta.rowid)}`);
         this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`).run(entityId);
       }
+      deleteStaleKgChunks(this.db!, entityId);
     });
     tx();
     this.coordinator?.invalidateCoverage();
@@ -580,54 +588,79 @@ export class RAGKnowledgeGraphManager {
     return `[${today}] ${obs}`;
   }
 
-  async createEntities(entities: Entity[]): Promise<Entity[]> {
+  async createEntities(entities: Array<Entity & {
+    status?: 'active' | 'provisional'; sources?: SourceInput[];
+  }>): Promise<Array<Entity & { created?: boolean; observation_ids?: (string | null)[] }>> {
     if (!this.db) throw new Error('Database not initialized');
 
-    const result: Entity[] = [];
+    const result: Array<Entity & { created?: boolean; observation_ids?: (string | null)[] }> = [];
+    // v13: 관찰은 lifecycle 테이블이 정본이고 entities.observations 는 projection 이다.
+    // 그래서 entity 행은 빈 배열로 만들고 rebuildProjection 이 채우게 한다.
     const insertStmt = this.db.prepare(`
       INSERT OR IGNORE INTO entities (id, name, entityType, observations, metadata)
-      VALUES (?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, '[]', ?)
     `);
+    const stripDate = (s2: string) => s2.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '');
 
     for (const entity of entities) {
       const entityId = `entity_${entity.name.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
-      const timestamped = (entity.observations || []).map(o => this._timestampObservation(o));
+      const insertResult = insertStmt.run(entityId, entity.name, entity.entityType, '{}');
+      const created = insertResult.changes > 0;
 
-      // Try insert first
-      const insertResult = insertStmt.run(entityId, entity.name, entity.entityType, JSON.stringify(timestamped), '{}');
+      const needsTypeUpdate = !created && entity.entityType &&
+        entity.entityType !== 'CONCEPT' &&
+        entity.entityType !== (this.db.prepare(`SELECT entityType FROM entities WHERE id = ?`)
+          .get(entityId) as { entityType: string } | undefined)?.entityType;
 
-      if (insertResult.changes > 0) {
-        // New entity created. CRUD success is independent of model readiness
-        // (spec §5): not-ready -> row stays vectorless (queued for backfill).
-        console.error(`🔮 Generating embedding for new entity: ${entity.name}`);
-        const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
-        result.push({ ...entity, observations: timestamped, embedding_status } as Entity);
-      } else {
-        // Entity already exists — upsert: merge observations and update entityType
-        const existing = this.db.prepare(`SELECT observations, entityType FROM entities WHERE id = ?`)
-          .get(entityId) as { observations: string; entityType: string } | undefined;
+      const ts = new Date().toISOString();
+      const ids: (string | null)[] = [];
+      let addedCount = 0;
 
-        if (existing) {
-          const currentObs: string[] = JSON.parse(existing.observations);
-          // Strip date prefix for dedup comparison
-          const stripDate = (s: string) => s.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '');
-          const currentBare = new Set(currentObs.map(stripDate));
-          const newObs = timestamped.filter(o => !currentBare.has(stripDate(o)));
-          const needsTypeUpdate = entity.entityType && entity.entityType !== 'CONCEPT' && entity.entityType !== existing.entityType;
-
-          if (newObs.length > 0 || needsTypeUpdate) {
-            const mergedObs = [...currentObs, ...newObs];
-            const updatedType = needsTypeUpdate ? entity.entityType : existing.entityType;
-            this.mutateEntityAndInvalidate(entityId, () => {
-              this.db!.prepare(`UPDATE entities SET observations = ?, entityType = ? WHERE id = ?`)
-                .run(JSON.stringify(mergedObs), updatedType, entityId);
-            });
-
-            console.error(`♻️ Upserted entity: ${entity.name} (+${newObs.length} obs${needsTypeUpdate ? ', type→' + updatedType : ''})`);
-            const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
-            result.push({ ...entity, observations: mergedObs, embedding_status } as Entity);
-          }
+      this.mutateEntityAndInvalidate(entityId, () => {
+        if (needsTypeUpdate) {
+          this.db!.prepare(`UPDATE entities SET entityType = ? WHERE id = ?`)
+            .run(entity.entityType, entityId);
         }
+        const activeRows = this.db!.prepare(
+          `SELECT observation_id, content FROM entity_observations
+           WHERE entity_id = ? AND status = 'active'`).all(entityId) as
+          Array<{ observation_id: string; content: string }>;
+        const activeByBare = new Map(activeRows.map(r => [stripDate(r.content), r.observation_id]));
+
+        for (const raw of (entity.observations || [])) {
+          const content = this._timestampObservation(raw);
+          const bare = stripDate(content);
+          const dupId = activeByBare.get(bare);
+          if (dupId) {
+            // 같은 사실이 다른 출처에서 다시 왔다 = evidence 추가, 새 revision 아님.
+            if (entity.sources?.length) linkSources(this.db!, dupId, entity.sources, ts);
+            ids.push(null);
+            continue;
+          }
+          const id = addRevision(this.db!, {
+            entityId, content, status: entity.status ?? 'active', sources: entity.sources, ts
+          });
+          activeByBare.set(bare, id);
+          ids.push(id);
+          addedCount++;
+        }
+      });
+
+      // 반환 계약: observation_ids 는 입력 observations 와 같은 길이·순서.
+      // 새 revision 이 안 생긴 자리는 null (dedup 또는 source-only).
+      const projected = JSON.parse(
+        (this.db.prepare(`SELECT observations FROM entities WHERE id = ?`)
+          .get(entityId) as { observations: string }).observations) as string[];
+
+      if (created || addedCount > 0 || needsTypeUpdate) {
+        console.error(created
+          ? `🔮 Generating embedding for new entity: ${entity.name}`
+          : `♻️ Upserted entity: ${entity.name} (+${addedCount} obs${needsTypeUpdate ? ', type→' + entity.entityType : ''})`);
+        const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
+        result.push({ ...entity, observations: projected, created,
+                      observation_ids: ids, embedding_status } as any);
+      } else {
+        result.push({ ...entity, observations: projected, created, observation_ids: ids } as any);
       }
     }
 
@@ -673,49 +706,138 @@ export class RAGKnowledgeGraphManager {
     return newRelations;
   }
 
-  async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
+  async addObservations(observations: {
+    entityName: string; contents: string[];
+    status?: 'active' | 'provisional';
+    sources?: SourceInput[];
+  }[]): Promise<Array<{ entityName: string; observation_ids: (string | null)[];
+                        addedObservations: string[]; embedding_status?: string }>> {
     if (!this.db) throw new Error('Database not initialized');
-    
-    const results = [];
-    
+
+    const results: Array<{ entityName: string; observation_ids: (string | null)[];
+                           addedObservations: string[]; embedding_status?: string }> = [];
+
     for (const obs of observations) {
       const entityId = `entity_${obs.entityName.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
-      
-      // Get current observations
-      const entity = this.db.prepare(`
-        SELECT observations FROM entities WHERE id = ?
-      `).get(entityId) as { observations: string } | undefined;
-      
-      if (!entity) {
-        throw new Error(`Entity with name ${obs.entityName} not found`);
-      }
-      
-      const currentObservations: string[] = JSON.parse(entity.observations);
-      const stripDate = (s: string) => s.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '');
-      const currentBare = new Set(currentObservations.map(stripDate));
-      const timestamped = obs.contents.map(c => this._timestampObservation(c));
-      const newObservations = timestamped.filter(c => !currentBare.has(stripDate(c)));
+      const entity = this.db.prepare(`SELECT id FROM entities WHERE id = ?`).get(entityId);
+      if (!entity) throw new Error(`Entity with name ${obs.entityName} not found`);
 
-      if (newObservations.length > 0) {
-        const updatedObservations = [...currentObservations, ...newObservations];
+      // dedup 기준은 v3.6 과 같다: 날짜 prefix 를 뗀 본문이 active 에 이미 있으면
+      // 새 revision 을 만들지 않는다. 다만 v13 에서는 같은 사실이 다른 출처에서 다시
+      // 온 것이므로 그 revision 에 source link 를 더한다(spec §8.3 T13).
+      const stripDate = (s2: string) => s2.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '');
+      const activeRows = this.db.prepare(
+        `SELECT observation_id, content FROM entity_observations
+         WHERE entity_id = ? AND status = 'active'`).all(entityId) as
+        Array<{ observation_id: string; content: string }>;
+      const activeByBare = new Map(activeRows.map(r => [stripDate(r.content), r.observation_id]));
 
-        this.mutateEntityAndInvalidate(entityId, () => {
-          this.db!.prepare(`
-            UPDATE entities SET observations = ? WHERE id = ?
-          `).run(JSON.stringify(updatedObservations), entityId);
-        });
+      const ts = new Date().toISOString();
+      const ids: (string | null)[] = [];
+      const added: string[] = [];
 
-        // Regenerate embedding for the updated entity (queued when not ready)
+      this.mutateEntityAndInvalidate(entityId, () => {
+        for (const raw of obs.contents) {
+          const content = this._timestampObservation(raw);
+          const bare = stripDate(content);
+          const dupId = activeByBare.get(bare);
+          if (dupId) {
+            if (obs.sources?.length) linkSources(this.db!, dupId, obs.sources, ts);
+            ids.push(null);
+            continue;
+          }
+          const id = addRevision(this.db!, {
+            entityId, content, status: obs.status ?? 'active', sources: obs.sources, ts
+          });
+          activeByBare.set(bare, id);
+          ids.push(id);
+          added.push(content);
+        }
+      });
+
+      let embedding_status: string | undefined;
+      if (added.length > 0) {
         console.error(`🔮 Regenerating embedding for updated entity: ${obs.entityName}`);
-        const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
-        results.push({ entityName: obs.entityName, addedObservations: newObservations, embedding_status } as any);
-        continue;
+        embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
       }
-
-      results.push({ entityName: obs.entityName, addedObservations: newObservations });
+      results.push({ entityName: obs.entityName, observation_ids: ids,
+                     addedObservations: added, embedding_status });
     }
-
     return results;
+  }
+
+  async correctObservation(
+    observationId: string, content: string,
+    changeKind: 'correction' | 'world_change' = 'correction',
+    reason?: string
+  ): Promise<string> {
+    if (!this.db) throw new Error('Database not initialized');
+    const row = this.db.prepare(`SELECT entity_id FROM entity_observations WHERE observation_id = ?`)
+      .get(observationId) as { entity_id: string } | undefined;
+    if (!row) throw new Error(`observation ${observationId} not found`);
+
+    let newId = '';
+    const ts = new Date().toISOString();
+    this.mutateEntityAndInvalidate(row.entity_id, () => {
+      newId = correctRevision(this.db!, {
+        observationId, content: this._timestampObservation(content),
+        changeKind, reason: reason ?? null, ts
+      });
+    });
+    await this.tryEmbedEntity(row.entity_id, 'bulk');
+    return newId;
+  }
+
+  private async _transition(
+    observationId: string,
+    event: 'retract' | 'restore' | 'approve' | 'decline',
+    reason?: string
+  ): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+    const row = this.db.prepare(`SELECT entity_id FROM entity_observations WHERE observation_id = ?`)
+      .get(observationId) as { entity_id: string } | undefined;
+    if (!row) throw new Error(`observation ${observationId} not found`);
+    const ts = new Date().toISOString();
+    this.mutateEntityAndInvalidate(row.entity_id, () => {
+      transitionStatus(this.db!, { observationId, event, reason: reason ?? null, ts });
+    });
+    await this.tryEmbedEntity(row.entity_id, 'bulk');
+  }
+
+  async retractObservation(observationId: string, reason?: string): Promise<void> {
+    return this._transition(observationId, 'retract', reason);
+  }
+  async restoreObservation(observationId: string, reason?: string): Promise<void> {
+    return this._transition(observationId, 'restore', reason);
+  }
+  async approveObservation(observationId: string, reason?: string): Promise<void> {
+    return this._transition(observationId, 'approve', reason);
+  }
+  async declineObservation(observationId: string, reason: string): Promise<void> {
+    return this._transition(observationId, 'decline', reason);
+  }
+
+  // DESTRUCTIVE. Physically removes a revision (and its sources via CASCADE).
+  // The root row is kept so its projection_order stays reserved — reusing an
+  // order would make a later restore/approve fail on the active-order index.
+  async purgeObservation(observationId: string, confirm: string): Promise<{ purged: number }> {
+    if (!this.db) throw new Error('Database not initialized');
+    if (confirm !== 'PURGE') {
+      throw new Error(
+        `purgeObservation refused: pass confirm='PURGE' to physically delete a revision. ` +
+        `This destroys history — retractObservation() is almost always what you want.`);
+    }
+    const row = this.db.prepare(`SELECT entity_id FROM entity_observations WHERE observation_id = ?`)
+      .get(observationId) as { entity_id: string } | undefined;
+    if (!row) return { purged: 0 };
+
+    let purged = 0;
+    this.mutateEntityAndInvalidate(row.entity_id, () => {
+      purged = this.db!.prepare(`DELETE FROM entity_observations WHERE observation_id = ?`)
+        .run(observationId).changes;
+    });
+    await this.tryEmbedEntity(row.entity_id, 'bulk');
+    return { purged };
   }
 
   async deleteEntities(entityNames: string[]): Promise<void> {
@@ -796,40 +918,69 @@ export class RAGKnowledgeGraphManager {
   // Pre-3.6 this method silently left STALE entity vectors behind (the input
   // text changed but the vector was never regenerated) — fixed via
   // tryEmbedEntity, which also covers the not-ready dirty contract.
+  // DEPRECATED shim (v13, one version only). Content-addressed deletion cannot
+  // express "which revision" — use retractObservation(observation_id) instead.
+  // Semantics: exact-string match against ACTIVE revisions -> soft retract.
+  //
+  // Ambiguity is judged over the WHOLE call before any mutation: if any item
+  // matches 2+ active revisions the entire call aborts with 0 mutations,
+  // because per-item processing would retract earlier items before discovering
+  // the later ambiguity (spec §6.3). That is a deliberate change from v3.6,
+  // which deleted every duplicate and carried on.
   async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<{
-    results: Array<{ entityName: string; deleted: number; embedding_status: 'embedded' | 'queued' | 'disabled' | 'n/a' }>;
+    results: Array<{ entityName: string; deleted: number; embedding_status: string }>;
     total_deleted: number;
   }> {
     if (!this.db) throw new Error('Database not initialized');
 
-    const results: Array<{ entityName: string; deleted: number; embedding_status: 'embedded' | 'queued' | 'disabled' | 'n/a' }> = [];
-    let total = 0;
-    for (const deletion of deletions) {
-      const entityId = `entity_${deletion.entityName.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
-      const entity = this.db.prepare(`
-        SELECT observations FROM entities WHERE id = ?
-      `).get(entityId) as { observations: string } | undefined;
+    // pass 1 — resolve the whole batch, mutate nothing
+    type Hit = { entityName: string; entityId: string; ids: string[] };
+    const plan: Hit[] = [];
+    const ambiguous: Array<{ entityName: string; content: string; matches: number }> = [];
 
-      if (!entity) {
-        results.push({ entityName: deletion.entityName, deleted: 0, embedding_status: 'n/a' });
+    for (const d of deletions) {
+      const entityId = `entity_${d.entityName.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
+      const ids: string[] = [];
+      for (const content of d.observations) {
+        const rows = this.db.prepare(
+          `SELECT observation_id FROM entity_observations
+           WHERE entity_id = ? AND status = 'active' AND content = ?`
+        ).all(entityId, content) as Array<{ observation_id: string }>;
+        if (rows.length > 1) {
+          ambiguous.push({ entityName: d.entityName, content, matches: rows.length });
+          continue;
+        }
+        if (rows.length === 1) ids.push(rows[0].observation_id);
+        // rows.length === 0 -> no-op (v3.6 behaviour, spec §6.3-3)
+      }
+      plan.push({ entityName: d.entityName, entityId, ids });
+    }
+
+    if (ambiguous.length > 0) {
+      throw new Error(
+        `AMBIGUOUS_OBSERVATION_MATCH: ${ambiguous.length} item(s) matched multiple active ` +
+        `revisions; 0 mutations were applied. Use retractObservation(observation_id) instead. ` +
+        `Conflicts: ${JSON.stringify(ambiguous)}`);
+    }
+
+    // pass 2 — mutate
+    const results: Array<{ entityName: string; deleted: number; embedding_status: string }> = [];
+    let total = 0;
+    const ts = new Date().toISOString();
+    for (const p of plan) {
+      if (p.ids.length === 0) {
+        results.push({ entityName: p.entityName, deleted: 0, embedding_status: 'n/a' });
         continue;
       }
-      const currentObservations: string[] = JSON.parse(entity.observations);
-      const filteredObservations = currentObservations.filter(
-        (obs: string) => !deletion.observations.includes(obs)
-      );
-      const deleted = currentObservations.length - filteredObservations.length;
-      if (deleted === 0) {
-        results.push({ entityName: deletion.entityName, deleted: 0, embedding_status: 'n/a' });
-        continue;
-      }
-      this.mutateEntityAndInvalidate(entityId, () => {
-        this.db!.prepare(`UPDATE entities SET observations = ? WHERE id = ?`)
-          .run(JSON.stringify(filteredObservations), entityId);
+      this.mutateEntityAndInvalidate(p.entityId, () => {
+        for (const id of p.ids) {
+          transitionStatus(this.db!, { observationId: id, event: 'retract',
+                                       reason: 'deleteObservations (deprecated shim)', ts });
+        }
       });
-      const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
-      total += deleted;
-      results.push({ entityName: deletion.entityName, deleted, embedding_status });
+      const embedding_status = await this.tryEmbedEntity(p.entityId, 'bulk');
+      results.push({ entityName: p.entityName, deleted: p.ids.length, embedding_status });
+      total += p.ids.length;
     }
     return { results, total_deleted: total };
   }
