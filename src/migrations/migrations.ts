@@ -1,4 +1,5 @@
 import { Migration } from './migration-manager.js';
+import { OBSERVATION_SCHEMA_SQL } from '../observations/schema.js';
 
 export const migrations: Migration[] = [
   {
@@ -685,6 +686,23 @@ export const migrations: Migration[] = [
       db.exec(`DROP TABLE IF EXISTS embedding_backfill_failures`);
       db.exec(`DROP TABLE IF EXISTS embedding_profiles`);
       db.exec(`DROP TABLE IF EXISTS server_meta`);
+    }
+  },
+
+  // v13 (spec 2026-07-30 observation-lifecycle §4): 관찰 생애주기 정규화.
+  // 이 항목은 DDL 만 만든다. 데이터 변환은 후속 단계에서 같은 항목에 덧붙인다.
+  {
+    version: 13,
+    description: 'Observation lifecycle: roots/revisions/sources/events + immutability triggers',
+    up: (db) => {
+      db.exec(OBSERVATION_SCHEMA_SQL);
+    },
+    down: (db) => {
+      // 역순 삭제 (FK 의존 순서). 트리거는 테이블과 함께 사라진다.
+      db.exec(`DROP TABLE IF EXISTS observation_events`);
+      db.exec(`DROP TABLE IF EXISTS observation_sources`);
+      db.exec(`DROP TABLE IF EXISTS entity_observations`);
+      db.exec(`DROP TABLE IF EXISTS observation_roots`);
     }
   }
 ];
