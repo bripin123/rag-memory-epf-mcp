@@ -28,6 +28,7 @@ import { getAllMCPTools, validateToolArgs, getSystemInfo } from './src/tools/too
 
 // Import migration system
 import { MigrationManager } from './src/migrations/migration-manager.js';
+import { backupBeforeMigration } from './src/backup/preflight.js';
 
 // Import chunk text algorithm (extracted for publish-time invariant testing)
 import { chunkText as splitTextIntoChunks } from './src/chunkText.js';
@@ -537,7 +538,12 @@ export class RAGKnowledgeGraphManager {
     
     // Get pending migrations before running them
     const pendingBefore = migrationManager.getPendingMigrations();
-    
+
+    // spec §5.1: 대기 중 마이그레이션이 있으면 먼저 일관 스냅샷을 남긴다.
+    // 실패는 throw = fail-closed (백업 없이 스키마를 바꾸지 않는다).
+    backupBeforeMigration(this.db, DB_FILE_PATH, pendingBefore.map(m => m.version),
+                          migrationManager.getCurrentVersion());
+
     // Run pending migrations
     const result = await migrationManager.runMigrations();
     
