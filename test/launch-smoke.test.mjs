@@ -8,6 +8,12 @@
 // when server.connect() was broken. It also still covers the v3.5.0 entry-point
 // regression (direct launch must boot main(), as npx/bin does).
 import { spawn } from 'node:child_process';
+// 버전을 정규식으로 박아 두면 minor 마다 손으로 고쳐야 하고, 고치는 것을 잊으면
+// 무관한 실패가 난다(실제로 3.7.0 에서 났다). 계약은 "서버가 *이 패키지의* 버전을
+// 자기보고한다"이지 특정 문자열이 아니다 — package.json 을 정본으로 읽는다.
+import { readFileSync } from 'node:fs';
+const PKG_VERSION = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -58,7 +64,8 @@ send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {
   protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'smoke', version: '0' } } });
 await waitFor(() => responses.some(r => r.id === 1 && r.result?.serverInfo), 15_000, 'initialize response');
 const init = responses.find(r => r.id === 1);
-assert.match(init.result.serverInfo.version, /^3\.6\./, 'serverInfo must self-report v3.6');
+assert.equal(init.result.serverInfo.version, PKG_VERSION,
+  `serverInfo must self-report the package version (${PKG_VERSION})`);
 console.log('  OK: MCP initialize handshake (lazy boot, model unavailable)');
 
 // 2) tools/list
@@ -75,7 +82,8 @@ assert.equal(errResp.result?.isError, true, `tool error missing isError: ${JSON.
 console.log('  OK: tool errors set isError=true');
 
 // 4) startup banner self-report on stderr
-assert.ok(/rag-memory-epf-mcp v3\.6\.\d+ \| node v/.test(stderrBuf), `startup banner missing\nstderr: ${stderrBuf.slice(0, 300)}`);
+assert.ok(stderrBuf.includes(`rag-memory-epf-mcp v${PKG_VERSION} | node v`),
+  `startup banner missing or wrong version (expected v${PKG_VERSION})\nstderr: ${stderrBuf.slice(0, 300)}`);
 console.log('  OK: startup banner self-report');
 
 // 5) graceful SIGTERM: natural exit, no hang

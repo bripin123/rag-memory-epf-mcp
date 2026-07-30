@@ -113,6 +113,24 @@ function zodTypeToJsonSchema(zodType: any, fieldName: string): any {
           description: def.description || `${fieldName} record`,
           additionalProperties: true,
         };
+
+      // Enums and literals used to fall through to the string fallback, which dropped the
+      // allowed values from the advertised schema even though parse() still enforced them.
+      // A client that cannot see the values guesses, and the guess is rejected server-side.
+      case 'ZodEnum':
+        return {
+          type: 'string',
+          description: def.description || `${fieldName} parameter`,
+          enum: [...def.values],
+        };
+
+      case 'ZodLiteral':
+        return {
+          type: typeof def.value === 'number' ? 'number'
+            : typeof def.value === 'boolean' ? 'boolean' : 'string',
+          description: def.description || `${fieldName} parameter`,
+          enum: [def.value],
+        };
       
       case 'ZodOptional':
         const innerSchema = zodTypeToJsonSchema(def.innerType, fieldName);

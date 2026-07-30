@@ -207,4 +207,49 @@ console.log('  OK: T4 array<string> preflight (5 cases)');
   console.log('  OK: T12d fresh DB not backed up; re-init survives');
 }
 
+// --- T11: 각 지점 fault injection -> 전체 rollback (commit 전이므로 부분 잔존 불허) ---
+for (const at of ['preflight', 'roots', 'revisions', 'sources', 'gate']) {
+  const { dir: d, dbPath } = await makeV12Db({ Fault: ['f1', 'f2'] });
+  process.env.RAG_MEMORY_FAULT_AT = at;
+  let threw = null;
+  try { const m = await reopen(dbPath); m.cleanup?.(); } catch (e) { threw = String(e.message); }
+  delete process.env.RAG_MEMORY_FAULT_AT;
+  assert.ok(threw, `T11: fault at '${at}' did not fail the migration`);
+  assert.match(threw, new RegExp(`injected fault at '${at}'`),
+    `T11: fault at '${at}' failed for the wrong reason: ${threw}`);
+
+  const raw = new Database(dbPath, { readonly: true });
+  // v13 이 기록되지 않았고, lifecycle 테이블에 부분 데이터가 남지 않았다
+  assert.ok(!raw.prepare(`SELECT 1 FROM schema_migrations WHERE version=13`).get(),
+    `T11: version recorded despite fault at '${at}'`);
+  const tableExists = raw.prepare(`SELECT 1 FROM sqlite_master WHERE name='entity_observations'`).get();
+  if (tableExists) {
+    const n = raw.prepare(`SELECT COUNT(*) c FROM entity_observations`).get().c;
+    assert.equal(n, 0, `T11: partial revisions survived fault at '${at}'`);
+    const r = raw.prepare(`SELECT COUNT(*) c FROM observation_roots`).get().c;
+    assert.equal(r, 0, `T11: partial roots survived fault at '${at}'`);
+  }
+  // 원본 배열은 그대로다
+  const obs = raw.prepare(`SELECT observations FROM entities WHERE id='entity_fault'`).get().observations;
+  raw.close();
+  assert.deepEqual(JSON.parse(obs), ['f1', 'f2'], `T11: source array mutated by fault at '${at}'`);
+
+  // 백업은 남아 있어야 한다 — 롤백이 성공했더라도 운영자가 스냅샷을 잃으면 안 된다.
+  const baks = readdirSync(d).filter(f => f.endsWith('.bak'));
+  assert.equal(baks.length, 1, `T11: backup missing after fault at '${at}': ${JSON.stringify(baks)}`);
+
+  // 그리고 그 .bak 때문에 재시도가 fail-closed 된다 = 의도된 설계다(운영자가 확인해야
+  // 한다). 여기서 고정하는 이유는 이 성질이 fleet 에서 눈에 보이는 결과이기 때문이다:
+  // 자동 재시작 루프가 이 오류로 계속 죽는다.
+  process.env.RAG_MEMORY_FAULT_AT = '';
+  let retryErr = null;
+  try { const m2 = await reopen(dbPath); m2.cleanup?.(); } catch (e) { retryErr = String(e.message); }
+  assert.ok(retryErr, `T11: retry after fault at '${at}' silently proceeded past the stale backup`);
+  assert.match(retryErr, /backup refused|already exists/i,
+    `T11: retry failed for an unexpected reason: ${retryErr}`);
+
+  rmSync(d, { recursive: true, force: true });
+}
+console.log('  OK: T11 fault injection (5 points, rollback + backup retained + fail-closed retry)');
+
 console.log('observation-migration: ALL OK');

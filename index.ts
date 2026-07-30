@@ -259,6 +259,21 @@ export class RAGKnowledgeGraphManager {
     this.db.pragma('temp_store = MEMORY');
     this.db.pragma('mmap_size = 268435456');
     this.db.pragma('foreign_keys = ON');
+    // spec §5.2: 관찰 lifecycle 의 무결성은 전부 FK CASCADE 를 전제한다 — root 를 지우면
+    // revision 이, revision 을 지우면 source 가 따라가야 history 가 고아로 남지 않는다.
+    // FK 가 꺼진 채 돌면 그 계약이 조용히 무효가 되고, 그게 최악이다. 스키마를 건드리기
+    // 전에(= runMigrations 앞에서) 멈춘다.
+    // 트랜잭션 내부에서는 이 pragma 가 no-op 이므로(실측 before=1·during=1·after=1)
+    // 부팅 시점 확인이 유일한 방어 지점이다.
+    if (process.env.RAG_MEMORY_FORCE_FK_OFF === '1') this.db.pragma('foreign_keys = OFF'); // test-only
+    {
+      const fk = this.db.pragma('foreign_keys', { simple: true });
+      if (Number(fk) !== 1) {
+        throw new Error(
+          `foreign_keys is ${fk}, expected 1. The observation lifecycle relies on FK CASCADE ` +
+          `for history integrity; refusing to run migrations without it.`);
+      }
+    }
     this.encoding = get_encoding("cl100k_base");
 
     await this.runMigrations();
@@ -2922,23 +2937,28 @@ export class RAGKnowledgeGraphManager {
     const imported = { entities: 0, relations: 0, documents: 0 };
     const skipped = { entities: 0, relations: 0, documents: 0 };
 
+    // spec §6.4: abort 는 0 mutation 이다. lifecycle 만 트랜잭션으로 감싸면
+    // 충돌로 throw 할 때 그 앞에서 넣은 entity·relation·document 가 살아남는다
+    // (T17b 가 ghost entity 로 실증). import 전체가 한 단위여야 한다.
+    // 내부 transaction() 호출은 better-sqlite3 에서 savepoint 로 중첩된다.
+    const importAll = this.db!.transaction(() => {
     // If merge=false, clear existing data first
     if (options.merge === false) {
-      this.db.exec(`DELETE FROM relationships`);
+      this.db!.exec(`DELETE FROM relationships`);
       // entities 삭제가 FK CASCADE 로 lifecycle 4테이블을 지우지만, 순서를 계약으로
       // 두어 FK 가 꺼진 환경에서도 잔존 행이 남지 않게 한다.
-      this.db.exec(`DELETE FROM observation_events`);
-      this.db.exec(`DELETE FROM observation_sources`);
-      this.db.exec(`DELETE FROM entity_observations`);
-      this.db.exec(`DELETE FROM observation_roots`);
-      this.db.exec(`DELETE FROM entities`);
-      this.db.exec(`DELETE FROM documents`);
+      this.db!.exec(`DELETE FROM observation_events`);
+      this.db!.exec(`DELETE FROM observation_sources`);
+      this.db!.exec(`DELETE FROM entity_observations`);
+      this.db!.exec(`DELETE FROM observation_roots`);
+      this.db!.exec(`DELETE FROM entities`);
+      this.db!.exec(`DELETE FROM documents`);
       console.error('🗑️ Cleared existing data for full import');
     }
 
     // Import entities using INSERT OR IGNORE
     if (data.entities && Array.isArray(data.entities)) {
-      const stmt = this.db.prepare(`
+      const stmt = this.db!.prepare(`
         INSERT OR IGNORE INTO entities (id, name, entityType, observations, metadata, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
       `);
@@ -2963,7 +2983,7 @@ export class RAGKnowledgeGraphManager {
 
     // Import relations using INSERT OR IGNORE
     if (data.relations && Array.isArray(data.relations)) {
-      const stmt = this.db.prepare(`
+      const stmt = this.db!.prepare(`
         INSERT OR IGNORE INTO relationships (id, source_entity, target_entity, relationType, confidence, metadata, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
@@ -2987,7 +3007,7 @@ export class RAGKnowledgeGraphManager {
 
     // Import documents using INSERT OR REPLACE
     if (data.documents && Array.isArray(data.documents)) {
-      const stmt = this.db.prepare(`
+      const stmt = this.db!.prepare(`
         INSERT OR REPLACE INTO documents (id, content, metadata, created_at)
         VALUES (?, ?, ?, ?)
       `);
@@ -3016,7 +3036,7 @@ export class RAGKnowledgeGraphManager {
 
     const hasLifecycle = Array.isArray(data.observation_roots);
     if (hasLifecycle) {
-      const tx = this.db.transaction(() => {
+      const tx = this.db!.transaction(() => {
         for (const r of (data.observation_roots ?? [])) {
           const cur = this.db!.prepare(`SELECT * FROM observation_roots WHERE root_id = ?`)
             .get(r.root_id) as any;
@@ -3088,7 +3108,7 @@ export class RAGKnowledgeGraphManager {
       // 구(舊) 형식 export: lifecycle 필드가 없으므로 entities.observations 를
       // 신규 root 로 승격한다. legacy import 필수 필드값 = spec §6.4.
       const ts = new Date().toISOString();
-      const tx = this.db.transaction(() => {
+      const tx = this.db!.transaction(() => {
         for (const ent of (data.entities ?? [])) {
           const entityId = ent.id ??
             `entity_${String(ent.name).toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
@@ -3108,8 +3128,10 @@ export class RAGKnowledgeGraphManager {
     for (const ent of (data.entities ?? [])) {
       const entityId = ent.id ??
         `entity_${String(ent.name).toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
-      rebuildProjection(this.db, entityId);
+      rebuildProjection(this.db!, entityId);
     }
+    });
+    importAll();
 
     console.error(`✅ Import completed: ${imported.entities} entities, ${imported.relations} relations, ${imported.documents} documents imported`);
 
@@ -4081,11 +4103,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
     switch (name) {
       // Original MCP tools
       case "createEntities":
-        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.createEntities((validatedArgs as any).entities as Entity[]), null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.createEntities((validatedArgs as any).entities as Array<Entity & { status?: 'active' | 'provisional'; sources?: SourceInput[] }>), null, 2) }] };
       case "createRelations":
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.createRelations((validatedArgs as any).relations as Relation[]), null, 2) }] };
       case "addObservations":
-        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.addObservations((validatedArgs as any).observations as { entityName: string; contents: string[] }[]), null, 2) }] };
+        // v13: status·sources 를 그대로 넘긴다. 여기서 떨어뜨리면 스키마가 받아도
+        // 엔진에 도달하지 않아 provenance 가 조용히 사라진다.
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.addObservations((validatedArgs as any).observations as { entityName: string; contents: string[]; status?: 'active' | 'provisional'; sources?: SourceInput[] }[]), null, 2) }] };
+
+      // v13 observation lifecycle (spec §6.1 / §6.2)
+      case "correctObservation":
+        return { content: [{ type: "text", text: JSON.stringify({ observation_id: await ragKgManager.correctObservation(
+          (validatedArgs as any).observation_id as string,
+          (validatedArgs as any).content as string,
+          (validatedArgs as any).change_kind ?? 'correction',
+          (validatedArgs as any).reason
+        ) }, null, 2) }] };
+      case "retractObservation":
+        await ragKgManager.retractObservation((validatedArgs as any).observation_id as string, (validatedArgs as any).reason);
+        return { content: [{ type: "text", text: JSON.stringify({ observation_id: (validatedArgs as any).observation_id, status: 'retracted' }, null, 2) }] };
+      case "restoreObservation":
+        await ragKgManager.restoreObservation((validatedArgs as any).observation_id as string, (validatedArgs as any).reason);
+        return { content: [{ type: "text", text: JSON.stringify({ observation_id: (validatedArgs as any).observation_id, status: 'active' }, null, 2) }] };
+      case "approveObservation":
+        await ragKgManager.approveObservation((validatedArgs as any).observation_id as string, (validatedArgs as any).reason);
+        return { content: [{ type: "text", text: JSON.stringify({ observation_id: (validatedArgs as any).observation_id, status: 'active' }, null, 2) }] };
+      case "declineObservation":
+        await ragKgManager.declineObservation((validatedArgs as any).observation_id as string, (validatedArgs as any).reason as string);
+        return { content: [{ type: "text", text: JSON.stringify({ observation_id: (validatedArgs as any).observation_id, status: 'retracted' }, null, 2) }] };
+      case "purgeObservation":
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.purgeObservation((validatedArgs as any).observation_id as string, (validatedArgs as any).confirm as string), null, 2) }] };
+      case "getObservationHistory":
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.getObservationHistory({
+          entity_name: (validatedArgs as any).entity_name,
+          observation_id: (validatedArgs as any).observation_id,
+          root_id: (validatedArgs as any).root_id,
+        }), null, 2) }] };
+
       case "deleteEntities":
         await ragKgManager.deleteEntities((validatedArgs as any).entityNames as string[]);
         return { content: [{ type: "text", text: "Entities deleted successfully" }] };
