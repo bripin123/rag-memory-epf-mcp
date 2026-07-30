@@ -103,7 +103,30 @@ rmSync(dir, { recursive: true, force: true });
     assert.ok(t.name && t.description, `tool ${t.name}: missing name/description`);
     assert.equal(t.inputSchema.type, 'object', `tool ${t.name}: inputSchema.type`);
     assert.ok(t.inputSchema.properties, `tool ${t.name}: no properties`);
+    // validateToolArgs 가 strict 이므로 광고 스키마도 그렇게 말해야 한다
+    assert.equal(t.inputSchema.additionalProperties, false,
+      `tool ${t.name}: strict validation is not advertised`);
   }
+
+  // 변환기 fallback 이 하나라도 발동하면 광고 스키마가 실제 입력과 다르다.
+  // ZodEnum·ZodLiteral·ZodUnion 이 전부 이 경로로 새고 있었고(type:'string' 으로 광고),
+  // 그러면 클라이언트가 정상 호출을 만들 수 없거나 서버가 거부한다.
+  {
+    const warned = [];
+    const orig = console.warn;
+    console.warn = (...a) => warned.push(a.join(' '));
+    try { getAllMCPTools(); } finally { console.warn = orig; }
+    assert.deepEqual(warned, [],
+      `zod->JSON schema fallback fired, so the advertised contract is wrong:\n${warned.join('\n')}`);
+    // 그리고 "(fallback)" 문구가 광고된 설명에 새어 나오지 않는다
+    const leaked = JSON.stringify(getAllMCPTools()).match(/\(fallback\)/g) ?? [];
+    assert.deepEqual(leaked, [], 'a fallback description leaked into the advertised schema');
+  }
+
+  // 버전은 package.json 이 정본이다 (도구 문서가 옛 버전을 말하면 안 된다)
+  const { getSystemInfo } = await import('../dist/src/tools/tool-registry.js');
+  assert.equal(getSystemInfo().system.version, PKG_VERSION,
+    'advertised system version drifted from package.json');
 
   // enum·literal 이 광고된 스키마에 살아 있는가 (fallback 으로 떨어지면 값 목록이 사라진다)
   const byName = Object.fromEntries(getAllMCPTools().map(t => [t.name, t]));

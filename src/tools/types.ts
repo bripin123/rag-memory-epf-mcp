@@ -44,6 +44,8 @@ export interface MCPTool {
     type: 'object';
     properties: Record<string, any>;
     required: string[];
+    // validateToolArgs 가 최상위를 strict 로 검증하므로 광고 스키마도 그렇게 말한다.
+    additionalProperties?: boolean;
   };
   annotations?: ToolAnnotations;
 }

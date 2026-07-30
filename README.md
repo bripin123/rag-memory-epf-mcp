@@ -181,11 +181,14 @@ the `active` revisions.
   a delete, and a batch where any item matches two or more active revisions **aborts with zero
   mutations** — v3.6 deleted every duplicate and carried on, but a machine cannot tell which
   revision was meant. Use `retractObservation(observation_id)` to say which one.
-- Migration to v13 takes a verified backup first (`<db>.v12.bak`) and **refuses to run if one
-  already exists**, so a failed migration does not get retried over its own snapshot. Conversion
-  runs in one transaction with two gates: `PRAGMA foreign_key_check`, then a byte-exact comparison
-  of the rebuilt projection against the original array. `foreign_keys` is now checked at boot and
-  the server refuses to migrate without it.
+- Migration to v13 takes a verified backup first (`<db>.v12.bak`) and **never overwrites one**. If a
+  backup is already there, it is verified — integrity check, schema version, the database's own
+  instance id, and a content fingerprint — and reused when it is genuinely a snapshot of the current
+  pre-migration state. It is refused when it is not, which keeps a single transient failure from
+  bricking every subsequent restart while still never writing over a recovery point. Conversion runs
+  in one transaction with two gates: `PRAGMA foreign_key_check`, then a byte-exact comparison of the
+  rebuilt projection against the original array. `foreign_keys` is checked at boot and the server
+  refuses to migrate without it.
 
 ### v3.6.0
 - **Lite install / lazy boot**: the MCP server connects immediately — FTS5 search, knowledge graph and CRUD work from the first second, while the bge-m3 model (~1.2GB) loads or downloads in the background. Hybrid search switches on automatically. Requires Node **>= 24**.

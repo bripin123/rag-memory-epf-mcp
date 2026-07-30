@@ -131,7 +131,10 @@ async function freshManager() {
     return { threw, mutated0: before === after, entities0: beforeEnt === afterEnt };
   };
 
-  const revFields = ['root_id', 'entity_id', 'revision_no', 'projection_order', 'content',
+  // projection_order 는 충돌 필드가 아니다 — merge 가 배열 위치를 target 기준으로
+  // 재배정하므로 **target-local** 속성이다. 이걸 충돌로 보면 remap 된 dump 의 동일
+  // 재수입이 실패한다(계약 변경, advisor beta r3 발견 3). 나머지는 그대로 abort 다.
+  const revFields = ['root_id', 'entity_id', 'revision_no', 'content',
                      'status', 'supersedes_id', 'recorded_at', 'superseded_at'];
   for (const f of revFields) {
     const r = await mk(d => {
@@ -143,7 +146,7 @@ async function freshManager() {
     assert.match(r.threw, /import conflict|differs/i, `T17: unclear error for '${f}'`);
     assert.ok(r.mutated0, `T17: mutation applied despite abort for '${f}'`);
   }
-  for (const f of ['entity_id', 'projection_order', 'created_at']) {
+  for (const f of ['entity_id', 'created_at']) {
     const r = await mk(d => {
       d.observation_roots[0][f] =
         typeof d.observation_roots[0][f] === 'number' ? 999 : 'MUTATED';
@@ -151,6 +154,14 @@ async function freshManager() {
     });
     assert.ok(r.threw, `T17: root field '${f}' mismatch not rejected`);
     assert.match(r.threw, /import conflict|differs/i, `T17: unclear error for root '${f}'`);
+  }
+  // projection_order 는 local 이므로 **수용**된다 — 그리고 아무것도 바꾸지 않는다.
+  // (거부하면 remap 된 dump 를 다시 넣을 수 없다)
+  for (const table of ['observation_roots', 'entity_observations']) {
+    const r = await mk(d => { d[table][0].projection_order = 999; return d; });
+    assert.ok(!r.threw,
+      `T17: ${table}.projection_order must be treated as target-local, got: ${r.threw}`);
+    assert.ok(r.mutated0, `T17: ${table}.projection_order re-import changed the revision set`);
   }
   // 동일 = skip
   const same = await mk(d => d);
@@ -290,6 +301,107 @@ for (const merge of [true, false]) {
   process.env.DB_FILE_PATH = join(dir, 'test.db');
 }
 console.log('  OK: import invalidates derived state (merge true/false, non-empty target)');
+
+// --- lifecycle-only import (entities 없이 lifecycle 배열만) ---
+// lifecycle import 는 observation_roots 만 있으면 활성화되지만, 앞의 대조군은 전부
+// full dump 를 쓴다. 그 사각에서 revision 은 들어가는데 projection 이 갱신되지 않아
+// 새 사실이 reader 에 안 보이고 옛 벡터가 남았다(advisor beta r3 발견 2, 실행 재현).
+{
+  const { m, d } = await freshManager();
+  await m.createEntities([{ name: 'LifeOnly', entityType: 'CONCEPT', observations: ['old fact'] }]);
+  const ldb = m.db;
+  ldb.prepare(`INSERT OR REPLACE INTO entity_embedding_metadata (entity_id, embedding_text)
+               VALUES ('entity_lifeonly', 'old fact')`).run();
+
+  // 같은 entity 의 새 관찰을 lifecycle 행으로만 보낸다 (entities 배열 없음)
+  const { m: src, d: sd } = await freshManager();
+  await src.createEntities([{ name: 'LifeOnly', entityType: 'CONCEPT', observations: ['brand new'] }]);
+  const full = await src.exportGraph();
+  src.cleanup?.(); rmSync(sd, { recursive: true, force: true });
+  const lifecycleOnly = {
+    observation_roots: full.observation_roots,
+    entity_observations: full.entity_observations,
+    observation_sources: full.observation_sources,
+    observation_events: full.observation_events,
+  };
+
+  await m.importGraph(lifecycleOnly);
+  const proj = JSON.parse(ldb.prepare(
+    `SELECT observations FROM entities WHERE id='entity_lifeonly'`).get().observations);
+  assert.ok(proj.some(o => o.includes('brand new')),
+    'lifecycle-only import inserted revisions but never rebuilt the projection — readers cannot see it');
+  assert.equal(ldb.prepare(
+    `SELECT COUNT(*) c FROM entity_embedding_metadata WHERE entity_id='entity_lifeonly'`).get().c, 0,
+    'lifecycle-only import left the old vector in place');
+  m.cleanup?.();
+  rmSync(d, { recursive: true, force: true });
+  process.env.DB_FILE_PATH = join(dir, 'test.db');
+  console.log('  OK: lifecycle-only import rebuilds projection and invalidates vectors');
+}
+
+// --- remap 은 재수입 가능하고 결정론적이다 ---
+{
+  // 같은 dump 를 두 번 넣어도 두 번째가 conflict 로 죽지 않는다
+  const { m, d } = await freshManager();
+  await m.createEntities([{ name: 'Remap', entityType: 'CONCEPT', observations: ['local'] }]);
+  const { m: src, d: sd } = await freshManager();
+  await src.createEntities([{ name: 'Remap', entityType: 'CONCEPT', observations: ['incoming'] }]);
+  const dump = await src.exportGraph();
+  src.cleanup?.(); rmSync(sd, { recursive: true, force: true });
+
+  const first = await m.importGraph(dump);
+  const after1 = JSON.parse(m.db.prepare(
+    `SELECT observations FROM entities WHERE id='entity_remap'`).get().observations);
+  assert.equal(first.observation_order_remap.length, 1, 'remap not reported in the response');
+  assert.deepEqual(
+    { from: first.observation_order_remap[0].from, to: first.observation_order_remap[0].to },
+    { from: 0, to: 1 }, 'remap report has the wrong mapping');
+
+  await m.importGraph(dump);            // 두 번째 = 재수입, 죽어서는 안 된다
+  const after2 = JSON.parse(m.db.prepare(
+    `SELECT observations FROM entities WHERE id='entity_remap'`).get().observations);
+  assert.deepEqual(after2, after1, 'a second import of the same dump changed the result');
+  m.cleanup?.(); rmSync(d, { recursive: true, force: true });
+
+  // 입력 배열 순서를 뒤집어도 결과 순서가 같다
+  const build = async (reverse) => {
+    const { m: t, d: td } = await freshManager();
+    await t.createEntities([{ name: 'Remap', entityType: 'CONCEPT', observations: ['local'] }]);
+    const { m: s2, d: sd2 } = await freshManager();
+    await s2.createEntities([{ name: 'Remap', entityType: 'CONCEPT', observations: ['A', 'B'] }]);
+    const dp = await s2.exportGraph();
+    s2.cleanup?.(); rmSync(sd2, { recursive: true, force: true });
+    const input = reverse
+      ? { ...dp, observation_roots: [...dp.observation_roots].reverse(),
+                 entity_observations: [...dp.entity_observations].reverse() }
+      : dp;
+    await t.importGraph(input);
+    const out = JSON.parse(t.db.prepare(
+      `SELECT observations FROM entities WHERE id='entity_remap'`).get().observations);
+    t.cleanup?.(); rmSync(td, { recursive: true, force: true });
+    return out;
+  };
+  const normal = await build(false);
+  const reversed = await build(true);
+  assert.deepEqual(reversed, normal,
+    `remap depends on input array order: ${JSON.stringify(normal)} vs ${JSON.stringify(reversed)}`);
+  process.env.DB_FILE_PATH = join(dir, 'test.db');
+  console.log('  OK: remap is re-importable and order-independent');
+}
+
+// --- 지원하지 않는 dump 키는 거부한다 (조용히 버리지 않는다) ---
+{
+  const { validateToolArgs } = await import('../dist/src/tools/tool-registry.js');
+  const dump = await mgr.exportGraph();
+  // metadata 는 정상 키다
+  assert.ok(validateToolArgs('importGraph', { data: dump }).data.metadata,
+    'exportGraph metadata must survive validation');
+  // 모르는 테이블은 크게 실패해야 한다 — strip 이든 passthrough 든 결국 조용히 사라진다
+  assert.throws(() => validateToolArgs('importGraph',
+    { data: { ...dump, future_table: [{ x: 1 }] } }), /unrecognized|unknown/i,
+    'an unsupported dump table must be rejected, not silently dropped');
+  console.log('  OK: unsupported dump keys rejected');
+}
 
 // --- 계약: 알 수 없는 인자 거부 + history 선택자 정확히 하나 ---
 {

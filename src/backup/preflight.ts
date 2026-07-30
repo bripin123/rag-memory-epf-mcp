@@ -1,6 +1,46 @@
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
+
+// 이 DB 파일의 신원. 백업은 파일 복사이므로 같은 값을 갖는다 — 그래서 남아 있는
+// .bak 이 *이 DB* 의 백업인지 판정할 수 있다. 스키마 버전은 신원이 아니다:
+// 같은 fleet 의 다른 프로젝트 DB 도 v12 이고 quick_check 도 통과한다
+// (advisor beta r3 발견 1, 두 DB 로 실행 재현).
+function dbInstanceId(db: Database.Database, create: boolean): string | null {
+  const hasMeta = db.prepare(
+    `SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_meta'`).get();
+  if (!hasMeta) return null;
+  const row = db.prepare(`SELECT value FROM server_meta WHERE key='db_instance_id'`)
+    .get() as { value: string } | undefined;
+  if (row?.value) return row.value;
+  if (!create) return null;
+  const id = randomUUID();
+  db.prepare(`INSERT OR REPLACE INTO server_meta (key, value) VALUES ('db_instance_id', ?)`).run(id);
+  return id;
+}
+
+// 내용·계보 지문. 롤백된 마이그레이션은 아무것도 바꾸지 않으므로 재시도 시에도
+// 같아야 하고, 그 사이에 실제 쓰기가 있었다면 달라져야 한다. 집계라 큰 DB 에서도 싸다.
+function contentFingerprint(db: Database.Database): string {
+  const parts: string[] = [];
+  for (const t of ['entities', 'relationships', 'documents']) {
+    const exists = db.prepare(
+      `SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(t);
+    if (!exists) { parts.push(`${t}:absent`); continue; }
+    const n = db.prepare(`SELECT COUNT(*) c FROM ${t}`).get() as { c: number };
+    parts.push(`${t}:${n.c}`);
+  }
+  const hasEntities = db.prepare(
+    `SELECT 1 FROM sqlite_master WHERE type='table' AND name='entities'`).get();
+  if (hasEntities) {
+    const agg = db.prepare(
+      `SELECT COALESCE(SUM(LENGTH(observations)), 0) obs, COALESCE(MAX(id), '') maxid,
+              COALESCE(MIN(id), '') minid FROM entities`).get() as
+      { obs: number; maxid: string; minid: string };
+    parts.push(`obs:${agg.obs}`, `id:${agg.minid}..${agg.maxid}`);
+  }
+  return createHash('sha256').update(parts.join('|')).digest('hex');
+}
 
 // spec §5.1: 마이그레이션 전 SQLite-consistent snapshot.
 // 파일 복사는 금지 — WAL 이 반영되지 않는다. better-sqlite3 의 backup() 은
@@ -48,15 +88,19 @@ export function backupBeforeMigration(
   // 남아 있는 .bak 이 (a) 온전하고 (b) 이 DB 와 같은 스키마 버전이면 그 보장은
   // 이미 충족된다 — 새로 만들 이유가 없고, 덮어쓸 이유도 없다. 그래서 **검증 후
   // 재사용**한다. 검증에 실패하면 그때는 거부한다(그건 진짜 사람이 봐야 하는 상태다).
+  // 신원을 먼저 확정한다 — 백업이 이 값을 담아야 나중에 대조할 수 있다.
+  const liveId = dbInstanceId(db, true);
+  const liveFingerprint = contentFingerprint(db);
+
   if (existsSync(target)) {
-    const reused = verifyExistingBackup(target, currentVersion);
+    const reused = verifyExistingBackup(target, currentVersion, liveId, liveFingerprint);
     if (!reused.ok) {
       throw new Error(
         `migration backup refused: ${target} already exists but is not a usable recovery point ` +
-        `(${reused.reason}). Move or remove it deliberately — overwriting it would destroy ` +
-        `whatever it does contain.`);
+        `for this database (${reused.reason}). Move or remove it deliberately — overwriting it ` +
+        `would destroy whatever it does contain.`);
     }
-    console.error(`  ├─ 🛟 reusing verified backup ${target} (schema v${currentVersion})`);
+    console.error(`  ├─ 🛟 reusing verified backup ${target} (schema v${currentVersion}, same database)`);
     return { path: target, sha256: reused.sha256 };
   }
 
@@ -99,7 +143,7 @@ function streamSha256(path: string): string {
 // 파일명이 이미 버전을 담고 있으므로(.vN.bak) 내부 버전이 N 과 다르면 그 파일은
 // 이 자리에 있을 이유가 없다 = 사람이 봐야 하는 상태다.
 function verifyExistingBackup(
-  target: string, expectedVersion: number
+  target: string, expectedVersion: number, liveId: string | null, liveFingerprint: string
 ): { ok: true; sha256: string } | { ok: false; reason: string } {
   try {
     if (statSync(target).size === 0) return { ok: false, reason: 'zero bytes' };
@@ -117,6 +161,22 @@ function verifyExistingBackup(
         : 0;
       if (v !== expectedVersion) {
         return { ok: false, reason: `holds schema v${v}, expected v${expectedVersion}` };
+      }
+      // 신원: 이 백업이 *이 DB* 에서 나왔는가. 같은 경로에 다른 DB 가 놓였거나
+      // 백업 이후 live 가 교체됐으면 여기서 걸린다.
+      if (!liveId) return { ok: false, reason: 'live database has no instance id to compare' };
+      const bakId = dbInstanceId(db, false);
+      if (!bakId) return { ok: false, reason: 'backup carries no instance id' };
+      if (bakId !== liveId) {
+        return { ok: false, reason: `belongs to database ${bakId.slice(0, 8)}…, live is ${liveId.slice(0, 8)}…` };
+      }
+      // 계보: 실패 이후 live 에 실제 쓰기가 있었으면 이 백업은 더 이상 현 상태의
+      // 복구점이 아니다. 그때는 기존 백업을 보존한 채 멈춘다.
+      const bakFingerprint = contentFingerprint(db);
+      if (bakFingerprint !== liveFingerprint) {
+        return { ok: false, reason:
+          `content diverged from live (backup ${bakFingerprint.slice(0, 12)}…, ` +
+          `live ${liveFingerprint.slice(0, 12)}…) — it is no longer a snapshot of the current state` };
       }
     } finally {
       db.close();

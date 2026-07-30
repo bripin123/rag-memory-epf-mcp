@@ -1,6 +1,6 @@
 // v13 migration: 변환 정확성 + 검증 게이트 + backup preflight.
 // spec §5 + §8.2 (T3·T4·T9·T12·T15)
-import { mkdtempSync, rmSync, existsSync, writeFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readdirSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -277,6 +277,55 @@ console.log('  OK: T11 fault injection (5 points: rollback, backup retained, res
   assert.match(err, /not a usable recovery point/i, `unexpected error: ${err}`);
   rmSync(d, { recursive: true, force: true });
   console.log('  OK: corrupt backup refused (reuse is verified, not assumed)');
+}
+
+// --- 다른 DB 의 정상 .bak 은 재사용하지 않는다 ---
+// 손상 파일만 음성 대조군으로 쓰면 "정상 SQLite 이지만 남의 백업"이 통과한다.
+// 스키마 버전은 신원이 아니다 — fleet 의 다른 프로젝트 DB 도 v12 이고 quick_check 도 ok 다
+// (advisor beta r3 발견 1, 두 DB 로 실행 재현).
+{
+  const A = await makeV12Db({ FleetA: ['a1'] });
+  const B = await makeV12Db({ FleetB: ['b1'] });
+  // A 를 실패시켜 A 의 .bak 을 만든다
+  const migMod = await import(`../dist/src/migrations/migrations.js`);
+  migMod.setMigrationFaultPoint('roots');
+  try { const m = await reopen(A.dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
+  migMod.setMigrationFaultPoint(null);
+  const bakA = readdirSync(A.dir).find(f => f.endsWith('.bak'));
+  assert.ok(bakA, 'A produced no backup');
+
+  // 그 .bak 을 B 의 자리로 옮긴다 = 정상 SQLite · 같은 v12 · 다른 DB
+  copyFileSync(join(A.dir, bakA), `${B.dbPath}.v12.bak`);
+  let err = null;
+  try { const m = await reopen(B.dbPath); m.cleanup?.(); } catch (e) { err = String(e.message); }
+  assert.ok(err, "another database's backup was accepted as this one's recovery point");
+  assert.match(err, /belongs to database|instance id/i, `unexpected error: ${err}`);
+  // 그리고 남의 백업을 덮어쓰지 않았다
+  assert.ok(existsSync(`${B.dbPath}.v12.bak`), 'the foreign backup was destroyed');
+  rmSync(A.dir, { recursive: true, force: true });
+  rmSync(B.dir, { recursive: true, force: true });
+  console.log("  OK: another database's backup refused (identity, not just version)");
+}
+
+// --- 실패 후 live 가 변한 뒤에는 옛 .bak 을 현 상태의 복구점으로 인정하지 않는다 ---
+{
+  const { dir: d, dbPath } = await makeV12Db({ Drift: ['d1'] });
+  const migMod = await import(`../dist/src/migrations/migrations.js`);
+  migMod.setMigrationFaultPoint('roots');
+  try { const m = await reopen(dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
+  migMod.setMigrationFaultPoint(null);
+
+  // live 에 실제 쓰기를 넣는다 (백업 이후 상태가 앞서 나간 상황)
+  const raw = new Database(dbPath);
+  raw.prepare(`INSERT INTO entities (id, name, observations) VALUES ('entity_drift2','Drift2','["x"]')`).run();
+  raw.close();
+
+  let err = null;
+  try { const m = await reopen(dbPath); m.cleanup?.(); } catch (e) { err = String(e.message); }
+  assert.ok(err, 'a stale backup was accepted after live diverged');
+  assert.match(err, /diverged|no longer a snapshot/i, `unexpected error: ${err}`);
+  rmSync(d, { recursive: true, force: true });
+  console.log('  OK: diverged live refuses the older backup (content fingerprint)');
 }
 
 console.log('observation-migration: ALL OK');

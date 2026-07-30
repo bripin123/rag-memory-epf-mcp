@@ -35,7 +35,7 @@ src/tools/              MCP tool *declarations* only (no behaviour)
   tool-registry.ts      allTools = spread of the five groups; convertToMCPTool; validateToolArgs
   types.ts              ToolDefinition · ToolCapabilityInfo · ToolRegistrationDescription
 
-src/backup/preflight.ts   pre-migration backup (VACUUM INTO) + verify + refuse-if-exists
+src/backup/preflight.ts   pre-migration backup (VACUUM INTO) + verify + verified reuse (never overwrite)
 src/embeddingGate.ts      embedding admission control
 src/backfillCoordinator.ts  background embedding backfill
 src/modelCache.ts         version-independent model cache (v3.6)

@@ -2949,13 +2949,16 @@ export class RAGKnowledgeGraphManager {
     };
   }
 
-  async importGraph(data: { entities?: any[]; relations?: any[]; documents?: any[]; observation_roots?: any[]; entity_observations?: any[]; observation_sources?: any[]; observation_events?: any[] }, options: { merge?: boolean } = { merge: true }): Promise<{ imported: { entities: number; relations: number; documents: number }; skipped: { entities: number; relations: number; documents: number } }> {
+  async importGraph(data: { entities?: any[]; relations?: any[]; documents?: any[]; observation_roots?: any[]; entity_observations?: any[]; observation_sources?: any[]; observation_events?: any[] }, options: { merge?: boolean } = { merge: true }): Promise<{ imported: { entities: number; relations: number; documents: number }; skipped: { entities: number; relations: number; documents: number }; observation_order_remap: Array<{ root_id: string; entity_id: string; from: number; to: number }> }> {
     if (!this.db) throw new Error('Database not initialized');
 
     console.error(`📥 Importing knowledge graph (merge: ${options.merge !== false})...`);
 
     const imported = { entities: 0, relations: 0, documents: 0 };
     const skipped = { entities: 0, relations: 0, documents: 0 };
+    // merge 로 배열 위치가 재배정된 관찰. 조용히 순서를 바꾸면 호출자가 알 수 없으므로
+    // 응답으로 내보낸다(advisor beta r3 발견 3).
+    const remapReport: Array<{ root_id: string; entity_id: string; from: number; to: number }> = [];
 
     // spec §6.4: abort 는 0 mutation 이다. lifecycle 만 트랜잭션으로 감싸면
     // 충돌로 throw 할 때 그 앞에서 넣은 entity·relation·document 가 살아남는다
@@ -3079,13 +3082,25 @@ export class RAGKnowledgeGraphManager {
         // "더한다"이므로 들어오는 root 에 다음 빈 순번을 준다 — 남의 관찰을 덮지 않고,
         // 배열 끝에 붙는다. remap 은 그 root 의 revision 들에도 그대로 적용해야 한다
         // (trg_obs_matches_root 가 둘의 일치를 요구한다).
+        // 입력 순서에 결과가 의존하면 같은 dump 를 두 번 넣었을 때 배열 순서가 달라진다.
+        // (entity_id, projection_order, root_id) 로 정렬해 결정론을 만든다.
+        const incomingRoots = [...(data.observation_roots ?? [])].sort((a, b) =>
+          String(a.entity_id).localeCompare(String(b.entity_id)) ||
+          (a.projection_order - b.projection_order) ||
+          String(a.root_id).localeCompare(String(b.root_id)));
+
         const remappedOrder = new Map<string, number>();
-        for (const r of (data.observation_roots ?? [])) {
+        for (const r of incomingRoots) {
           const cur = this.db!.prepare(`SELECT * FROM observation_roots WHERE root_id = ?`)
             .get(r.root_id) as any;
           if (cur) {
-            if (!sameRow(cur, r, ['entity_id', 'projection_order', 'created_at']))
+            // projection_order 는 **target-local** 속성이다: merge 는 배열 위치를
+            // 이 DB 기준으로 재배정하므로, 이미 remap 된 root 를 같은 dump 로 다시
+            // 넣으면 dump 의 옛 순번과 다를 수밖에 없다. 그걸 충돌로 보면 동일
+            // 재수입이 실패한다(advisor beta r3 발견 3, 실행 재현).
+            if (!sameRow(cur, r, ['entity_id', 'created_at']))
               throw new Error(`import conflict: observation_roots ${r.root_id} differs from the existing row`);
+            remappedOrder.set(r.root_id, cur.projection_order);
             continue;
           }
           let order = r.projection_order;
@@ -3095,6 +3110,8 @@ export class RAGKnowledgeGraphManager {
           if (taken) {
             order = nextProjectionOrder(this.db!, r.entity_id);
             remappedOrder.set(r.root_id, order);
+            remapReport.push({ root_id: r.root_id, entity_id: r.entity_id,
+                               from: r.projection_order, to: order });
             console.error(
               `  ├─ ↪️ import: ${r.entity_id} position ${r.projection_order} is held by ` +
               `${taken.root_id}; appending imported observation at ${order}`);
@@ -3104,7 +3121,8 @@ export class RAGKnowledgeGraphManager {
             .run(r.root_id, r.entity_id, order, r.created_at);
         }
 
-        const revCols = ['root_id','entity_id','revision_no','projection_order','content',
+        // projection_order 는 root 와 같은 이유로 비교 대상이 아니다(target-local).
+        const revCols = ['root_id','entity_id','revision_no','content',
                          'status','supersedes_id','recorded_at','superseded_at'];
         const revs = [...(data.entity_observations ?? [])]
           .sort((a, b) => a.root_id === b.root_id
@@ -3180,13 +3198,23 @@ export class RAGKnowledgeGraphManager {
       tx();
     }
 
-    // projection 재합성 + 파생 상태 무효화: import 된 entity 전부.
+    // projection 재합성 + 파생 상태 무효화.
     // 무효화가 없으면 이미 있던 entity 를 덮어쓴 뒤에도 옛 벡터·옛 KG chunk 가
     // 검색에 남는다. import 는 관찰을 바꾸는 writer 이므로 다른 writer 와 같은
     // 계약을 져야 한다(advisor beta 발견 2).
+    //
+    // 대상은 `data.entities` 가 아니라 **영향받은 entity 전부**다. lifecycle import 는
+    // observation_roots 만 있어도 활성화되므로, entities 없이 lifecycle 배열만 보내면
+    // revision 은 들어가는데 projection 이 갱신되지 않아 새 사실이 reader 에 안 보이고
+    // 옛 벡터가 남는다(advisor beta r3 발견 2, 실행 재현).
+    const affected = new Set<string>();
     for (const ent of (data.entities ?? [])) {
-      const entityId = ent.id ??
-        `entity_${String(ent.name).toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
+      affected.add(ent.id ??
+        `entity_${String(ent.name).toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`);
+    }
+    for (const r of (data.observation_roots ?? [])) if (r.entity_id) affected.add(r.entity_id);
+    for (const v of (data.entity_observations ?? [])) if (v.entity_id) affected.add(v.entity_id);
+    for (const entityId of affected) {
       rebuildProjection(this.db!, entityId);
       this.invalidateDerivedForEntity(entityId);
     }
@@ -3198,7 +3226,7 @@ export class RAGKnowledgeGraphManager {
     // Indirect missing-row producer (spec §5): imported rows may lack vectors.
     this.coordinator?.invalidateCoverage();
     this.coordinator?.kick();
-    return { imported, skipped };
+    return { imported, skipped, observation_order_remap: remapReport };
   }
 
   async hybridSearch(query: string, limit = 5, useGraph = true): Promise<{

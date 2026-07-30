@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { readFileSync } from 'node:fs';
 import { ToolDefinition, MCPTool } from './types.js';
 import { knowledgeGraphTools } from './knowledge-graph-tools.js';
 import { ragTools } from './rag-tools.js';
@@ -15,9 +16,14 @@ export const allTools = {
   ...migrationTools,
 };
 
-// Global settings for tool descriptions
+// Global settings for tool descriptions.
+// version 은 package.json 이 정본이다. 하드코딩하면 릴리스마다 이 값만 옛 버전으로
+// 남아 도구 문서가 거짓을 말한다(실제로 3.1.0 에 멈춰 있었다 — advisor beta r3 남은 P2).
+const PKG = JSON.parse(
+  readFileSync(new URL('../../../package.json', import.meta.url), 'utf8')) as { version: string };
+
 export const globalSettings = {
-  version: '3.1.0',
+  version: PKG.version,
   systemName: 'RAG Knowledge Graph MCP Server',
   defaultTimeout: 60,
 };
@@ -48,6 +54,10 @@ export function convertToMCPTool(name: string, toolDef: ToolDefinition): MCPTool
       type: 'object',
       properties,
       required,
+      // validateToolArgs 가 최상위를 strict 로 검증한다. 광고 스키마가 그걸 말하지
+      // 않으면 클라이언트는 여분 필드가 허용된다고 읽고 서버에서 거부당한다
+      // (advisor beta r3: 계약 표현 불일치).
+      additionalProperties: false,
     },
     ...(toolDef.annotations && { annotations: toolDef.annotations }),
   };
@@ -132,6 +142,15 @@ function zodTypeToJsonSchema(zodType: any, fieldName: string): any {
           enum: [def.value],
         };
       
+      // union 도 같은 fallback 함정이었다: deleteDocuments 의 documentIds 는
+      // string | string[] 인데 광고 스키마에 type:'string' 으로 나가 배열을 보내면
+      // 클라이언트가 계약 위반이라고 읽는다. anyOf 로 정직하게 노출한다.
+      case 'ZodUnion':
+        return {
+          description: def.description || `${fieldName} parameter`,
+          anyOf: (def.options as any[]).map((o, i) => zodTypeToJsonSchema(o, `${fieldName} option ${i}`)),
+        };
+
       case 'ZodOptional':
         const innerSchema = zodTypeToJsonSchema(def.innerType, fieldName);
         return {

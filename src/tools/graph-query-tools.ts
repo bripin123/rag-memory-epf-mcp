@@ -628,27 +628,36 @@ Supports both merge (additive) and replace (clear + import) modes.
 - Entities only: {"data": {"entities": [{"id": "abc", "name": "Test", "entityType": "CONCEPT", "observations": ["fact1"]}]}}
 </examples>`;
 
+// dump 의 행은 객체다. z.any() 로 두면 광고 스키마에 type:'string' fallback 으로 나가
+// listTools 계약이 실제 입력과 어긋난다. z.record 는 "문자열 키를 가진 객체"로 광고되고
+// 비객체 입력을 거부한다(advisor beta r3 남은 P2).
+const dumpRow = () => z.record(z.any());
+
 const importGraphSchema: z.ZodRawShape = {
   data: z.object({
-    entities: z.array(z.any()).optional().describe('Array of entity objects to import'),
-    relations: z.array(z.any()).optional().describe('Array of relation objects to import'),
-    documents: z.array(z.any()).optional().describe('Array of document objects to import'),
+    entities: z.array(dumpRow()).optional().describe('Array of entity objects to import'),
+    relations: z.array(dumpRow()).optional().describe('Array of relation objects to import'),
+    documents: z.array(dumpRow()).optional().describe('Array of document objects to import'),
     // v13: 이 네 배열이 스키마에 없으면 z.object().parse() 가 조용히 버린다. 그러면
     // exportGraph 가 낸 완전한 dump 를 MCP 로 되돌릴 때 revision history·provenance·
     // event log 가 전부 사라지고 legacy 관찰로 재생성된다 — 백업/복원이 조용히
     // 손실 연산이 된다(advisor beta 발견 1, MCP 왕복으로 실측).
-    observation_roots: z.array(z.any()).optional()
+    observation_roots: z.array(dumpRow()).optional()
       .describe('Array of observation root rows (v13 lifecycle). Required to preserve history on restore'),
-    entity_observations: z.array(z.any()).optional()
+    entity_observations: z.array(dumpRow()).optional()
       .describe('Array of observation revision rows (v13 lifecycle)'),
-    observation_sources: z.array(z.any()).optional()
+    observation_sources: z.array(dumpRow()).optional()
       .describe('Array of observation provenance rows (v13 lifecycle)'),
-    observation_events: z.array(z.any()).optional()
+    observation_events: z.array(dumpRow()).optional()
       .describe('Array of observation event rows (v13 lifecycle)'),
-  // passthrough: dump 는 `metadata` 같은 정상 키를 더 갖고 있고 앞으로 더 늘어난다.
-  // strict 면 실제 dump 를 거부하고, 기본 strip 이면 모르는 테이블을 조용히 버린다
-  // (그게 lifecycle 4배열에서 실제로 일어난 일이다). 통과시켜 manager 가 판단하게 둔다.
-  }).passthrough().describe('A graph dump as produced by exportGraph, including the v13 observation lifecycle tables'),
+    metadata: z.record(z.any()).optional()
+      .describe('Export metadata (exportedAt, version, counts). Ignored on import'),
+  // strict: dump 의 모든 정상 키를 위에 열거했으므로, 모르는 키는 **거부**한다.
+  // 기본 strip 은 모르는 테이블을 조용히 버리고(그게 lifecycle 4배열에서 실제로
+  // 일어난 일이다), passthrough 는 그것을 manager 까지 흘려보내 거기서 다시 조용히
+  // 무시된다 — 둘 다 같은 미래 데이터 손실 경로다. 지원하지 않는 dump 는 크게 실패해야
+  // 운영자가 엔진을 올린다(advisor beta r3).
+  }).strict().describe('A graph dump as produced by exportGraph, including the v13 observation lifecycle tables'),
   merge: z.boolean().optional().default(true).describe('If true (default), merge with existing data. If false, clear existing data first.'),
 };
 

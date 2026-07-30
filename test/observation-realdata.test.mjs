@@ -7,6 +7,7 @@ import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 // entity_embeddings 는 vec0 가상 테이블이라 raw 연결에도 확장을 로드해야 읽힌다.
 import * as sqliteVec from 'sqlite-vec';
+import { createHash } from 'node:crypto';
 const openRo = (p) => { const d = new Database(p, { readonly: true }); sqliteVec.load(d); return d; };
 
 const REAL = process.env.RAG_MEMORY_REALDATA_DB;
@@ -36,9 +37,18 @@ const preChunks = pre.prepare(`SELECT COUNT(*) c FROM chunk_metadata`).get().c;
 const preVectorJoin = pre.prepare(
   `SELECT COUNT(*) c FROM entity_embedding_metadata m
    JOIN entity_embeddings v ON v.rowid = m.rowid`).get().c;
-const preVectorFingerprint = pre.prepare(
-  `SELECT COUNT(*) n, SUM(LENGTH(v.embedding)) bytes, SUM(m.rowid) rowsum
-   FROM entity_embedding_metadata m JOIN entity_embeddings v ON v.rowid = m.rowid`).get();
+// 실제 바이트를 해시한다. COUNT + SUM(LENGTH) + SUM(rowid) 는 **같은 길이의 다른 벡터**를
+// 통과시킨다(advisor beta r3 가 01020304 -> 09090909 로 재현). 지문이 값을 안 보면 지문이 아니다.
+const vectorDigest = (d) => {
+  const h = createHash('sha256');
+  for (const r of d.prepare(
+    `SELECT m.entity_id, v.embedding FROM entity_embedding_metadata m
+     JOIN entity_embeddings v ON v.rowid = m.rowid ORDER BY m.entity_id`).iterate()) {
+    h.update(r.entity_id).update(Buffer.from(r.embedding));
+  }
+  return h.digest('hex');
+};
+const preVectorDigest = vectorDigest(pre);
 const preHashes = pre.prepare(
   `SELECT entity_id, input_hash FROM entity_embedding_metadata ORDER BY entity_id`).all();
 pre.close();
@@ -95,11 +105,8 @@ assert.equal(db.prepare(
   `SELECT COUNT(*) c FROM entity_embedding_metadata m
    JOIN entity_embeddings v ON v.rowid = m.rowid`).get().c, preVectorJoin,
   'a metadata row lost its vector (row survived, embedding did not)');
-const postVectorFingerprint = db.prepare(
-  `SELECT COUNT(*) n, SUM(LENGTH(v.embedding)) bytes, SUM(m.rowid) rowsum
-   FROM entity_embedding_metadata m JOIN entity_embeddings v ON v.rowid = m.rowid`).get();
-assert.deepEqual(postVectorFingerprint, preVectorFingerprint,
-  'vector bytes or rowid mapping changed — the stored embeddings are not the same ones');
+assert.equal(vectorDigest(db), preVectorDigest,
+  'stored embedding bytes changed — the vectors are not the same ones');
 assert.deepEqual(db.prepare(
   `SELECT entity_id, input_hash FROM entity_embedding_metadata ORDER BY entity_id`).all(), preHashes,
   'embedding provenance hashes changed, so the backfill will consider vectors stale');
