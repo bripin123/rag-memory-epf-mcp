@@ -78,6 +78,15 @@ const createEntitiesSchema: z.ZodRawShape = {
     name: z.string().describe('The unique name/identifier of the entity'),
     entityType: z.string().describe('The category or type of the entity (e.g., PERSON, CONCEPT, TECHNOLOGY)'),
     observations: z.array(z.string()).describe('Array of contextual observations about the entity'),
+    // v13: 아래 두 필드는 addObservations 와 같은 의미다. 스키마에 없으면 전달되지 않는다.
+    status: z.enum(['active', 'provisional']).optional()
+      .describe("'provisional' hides the observations from search until approveObservation. Default 'active'"),
+    sources: z.array(z.object({
+      source_kind: z.enum(['document', 'conversation', 'decision', 'import'])
+        .describe('What kind of thing these observations came from'),
+      source_ref: z.string().describe('Identifier of the source'),
+      source_hash: z.string().optional().describe('Optional content hash of the source'),
+    })).optional().describe('Provenance. Omit if genuinely unknown - do not invent a source'),
   })).describe('Array of entities to create in the knowledge graph'),
 };
 
@@ -203,8 +212,10 @@ Observations provide the factual foundation that supports entity existence and p
 
 <importantNotes>
 - (!important!) **Entity must exist** - this tool only adds to existing entities
-- (!important!) Only new observations are added - duplicates are automatically filtered
-- (!important!) Observations are cumulative - they build the entity's knowledge base
+- (!important!) Duplicates are filtered - repeating existing text with a **new** sources entry
+  adds evidence to the existing revision and returns null for that position
+- (!important!) Observations are cumulative. **This tool never replaces anything** - use
+  correctObservation to supersede and retractObservation to withdraw
 - (!important!) **Be specific and factual** - observations should be verifiable statements
 </importantNotes>
 
@@ -214,21 +225,24 @@ Observations provide the factual foundation that supports entity existence and p
 - When updating entity knowledge from new sources
 - When refining and expanding entity descriptions
 - **Before making knowledge-based decisions** - ensure entities have sufficient context
-- When correcting or expanding incomplete entity information
+- When *expanding* incomplete entity information. **To correct a wrong observation use
+  correctObservation** - adding a second, contradicting observation leaves both in search
 </whenToUseThisTool>
 
 <features>
 - Batch addition of observations to multiple entities
 - Automatic duplicate filtering - no redundant observations
 - Supports rich textual observations with context
-- Maintains observation history and chronology
+- Stable observation ids returned in observation_ids, aligned 1:1 with contents
+- Real revision history: see correctObservation and getObservationHistory
 - Integrates with document processing workflows
 - Enables incremental knowledge building
 </features>
 
 <bestPractices>
 - Keep observations factual and specific rather than general
-- Include source context when possible ("According to paper X...")
+- Put provenance in the sources field, not in the text. A source written in prose cannot be
+  queried, deduplicated, or attached to a later revision
 - Use consistent terminology across observations
 - Add complementary observations that provide different perspectives
 - Include temporal information when relevant ("As of 2024...")
@@ -247,10 +261,23 @@ Observations provide the factual foundation that supports entity existence and p
 - Technology evolution: {"observations": [{"entityName": "React", "contents": ["React 18 introduced concurrent features", "Widely adopted for enterprise applications"]}]}
 </examples>`;
 
+// v13: provenance 와 status 는 스키마에 있어야 실제로 전달된다. validateToolArgs 가
+// z.object(...).parse() 로 검증하므로 스키마에 없는 키는 조용히 버려진다.
+const sourceInputSchema = z.object({
+  source_kind: z.enum(['document', 'conversation', 'decision', 'import'])
+    .describe('What kind of thing this observation came from'),
+  source_ref: z.string().describe('Identifier of the source (document id, decision id, ...)'),
+  source_hash: z.string().optional().describe('Optional content hash of the source'),
+}).describe('Where this observation came from');
+
 const addObservationsSchema: z.ZodRawShape = {
   observations: z.array(z.object({
     entityName: z.string().describe('Name of the existing entity to add observations to'),
     contents: z.array(z.string()).describe('Array of new observation strings to add'),
+    status: z.enum(['active', 'provisional']).optional()
+      .describe("'provisional' hides it from search until approveObservation. Default 'active'"),
+    sources: z.array(sourceInputSchema).optional()
+      .describe('Provenance. Omit if genuinely unknown - do not invent a source'),
   })).describe('Array of observation additions for specific entities'),
 };
 
@@ -575,6 +602,222 @@ export const updateRelationsTool: ToolDefinition = {
   annotations: { idempotentHint: true },
 };
 
+// === OBSERVATION LIFECYCLE TOOLS (v13, spec §6.1 / §6.2) ===
+
+// 상태 전이 4종은 인자와 형태가 같다. 같은 문장을 네 번 복사하면 한 곳만 고치는
+// drift 가 생기므로 팩토리로 만든다.
+const transitionTool = (a: {
+  verb: string; from: string; to: string; reasonRequired: boolean; extra: string;
+}): ToolDefinition => ({
+  capability: {
+    description: `${a.verb} an observation revision (${a.from} -> ${a.to})`,
+    parameters: {
+      type: 'object',
+      properties: {
+        observation_id: { type: 'string', description: 'The revision to transition' },
+        reason: { type: 'string', description: 'Why this transition happened' },
+      },
+      required: a.reasonRequired ? ['observation_id', 'reason'] : ['observation_id'],
+    },
+  },
+  description: () => `<description>
+${a.verb} an observation revision: status '${a.from}' becomes '${a.to}'.
+**This is a state change, not a deletion** - the revision and its text survive and stay
+visible through getObservationHistory.
+</description>
+
+<importantNotes>
+- (!important!) Only '${a.from}' revisions can be ${a.to === 'active' ? 'moved to active' : a.to}; the transition table rejects anything else
+- (!important!) 'superseded' is terminal - correct it into a new revision instead
+- (!important!) Ordinary search returns only 'active' revisions, so this changes what search sees
+- (!important!) ${a.extra}
+</importantNotes>
+
+<whenToUseThisTool>
+- ${a.extra}
+- When you need the record of the change to survive, not just the current text
+</whenToUseThisTool>
+
+<parameters>
+- observation_id: The revision id, from addObservations/createEntities or getObservationHistory (string, required)
+- reason: Why (string, ${a.reasonRequired ? 'required' : 'optional but strongly recommended'})
+</parameters>`,
+  schema: {
+    observation_id: z.string().describe('The observation revision id to transition'),
+    ...(a.reasonRequired
+      ? { reason: z.string().describe('Why this transition happened') }
+      : { reason: z.string().optional().describe('Why this transition happened') }),
+  } as z.ZodRawShape,
+});
+
+export const retractObservationTool = transitionTool({
+  verb: 'Retract', from: 'active', to: 'retracted', reasonRequired: false,
+  extra: 'Use this when a fact turned out to be wrong or no longer holds and there is no replacement text',
+});
+export const restoreObservationTool = transitionTool({
+  verb: 'Restore', from: 'retracted', to: 'active', reasonRequired: false,
+  extra: 'Use this when a retraction itself was a mistake',
+});
+export const approveObservationTool = transitionTool({
+  verb: 'Approve', from: 'provisional', to: 'active', reasonRequired: false,
+  extra: 'Use this to accept a provisional observation so search starts returning it',
+});
+export const declineObservationTool = transitionTool({
+  verb: 'Decline', from: 'provisional', to: 'retracted', reasonRequired: true,
+  extra: 'Use this to reject a provisional observation while keeping the fact that it was proposed',
+});
+
+const correctObservationDescription: ToolRegistrationDescription = () => `<description>
+Replace the text of an observation while keeping the previous version as history.
+**This is the tool to use when a stored fact is wrong.** Overwriting loses the correction;
+this supersedes the old revision so both the mistake and the fix stay retrievable.
+</description>
+
+<importantNotes>
+- (!important!) The old revision becomes 'superseded' and the new one becomes 'active'
+- (!important!) The new revision keeps the old one's position in the entity's observation array
+- (!important!) Only an 'active' revision can be corrected
+- (!important!) Ordinary search returns only the new text; the old text is reachable through getObservationHistory
+</importantNotes>
+
+<whenToUseThisTool>
+- When an observation states something that is now known to be false (change_kind: 'correction')
+- When the world changed and the old statement was true at the time (change_kind: 'world_change')
+- **Instead of deleting and re-adding** - that loses the link between the two
+</whenToUseThisTool>
+
+<parameters>
+- observation_id: The active revision to correct (string, required)
+- content: The corrected text (string, required)
+- change_kind: 'correction' (it was wrong) or 'world_change' (it stopped being true). Default 'correction'
+- reason: Why (string, optional but strongly recommended)
+</parameters>
+
+<examples>
+- {"observation_id": "…", "content": "Uses FTS5 for keyword search", "change_kind": "correction", "reason": "verified in source"}
+</examples>`;
+
+export const correctObservationTool: ToolDefinition = {
+  capability: {
+    description: 'Supersede an observation revision with corrected text, keeping the old one as history',
+    parameters: {
+      type: 'object',
+      properties: {
+        observation_id: { type: 'string', description: 'The active revision to correct' },
+        content: { type: 'string', description: 'The corrected text' },
+        change_kind: { type: 'string', description: "'correction' or 'world_change'" },
+        reason: { type: 'string', description: 'Why this correction happened' },
+      },
+      required: ['observation_id', 'content'],
+    },
+  },
+  description: correctObservationDescription,
+  schema: {
+    observation_id: z.string().describe('The active observation revision to correct'),
+    content: z.string().describe('The corrected observation text'),
+    change_kind: z.enum(['correction', 'world_change']).optional()
+      .describe("'correction' = it was wrong; 'world_change' = it stopped being true. Default 'correction'"),
+    reason: z.string().optional().describe('Why this correction happened'),
+  },
+};
+
+const purgeObservationDescription: ToolRegistrationDescription = () => `<description>
+**DESTRUCTIVE.** Physically delete an observation revision and every later revision of the same
+root. History is gone afterwards - there is no undo.
+</description>
+
+<importantNotes>
+- (!important!) **retractObservation is almost always what you want.** It hides the fact from
+  search while keeping the record
+- (!important!) You must pass confirm='PURGE'; any other value refuses
+- (!important!) This is a **suffix purge**: purging revision 2 of a 3-revision chain removes 3 then 2
+- (!important!) The root row is kept so the observation's array position stays reserved
+- (!important!) Events for purged revisions are removed too
+</importantNotes>
+
+<whenToUseThisTool>
+- When content must be erased for legal or privacy reasons, not because it is wrong
+- **Never** as the normal way to remove an observation
+</whenToUseThisTool>
+
+<parameters>
+- observation_id: The revision to purge from (string, required)
+- confirm: Must be exactly 'PURGE' (string, required)
+</parameters>`;
+
+export const purgeObservationTool: ToolDefinition = {
+  capability: {
+    description: 'DESTRUCTIVE: physically delete an observation revision and its successors',
+    parameters: {
+      type: 'object',
+      properties: {
+        observation_id: { type: 'string', description: 'The revision to purge from' },
+        confirm: { type: 'string', description: "Must be exactly 'PURGE'" },
+      },
+      required: ['observation_id', 'confirm'],
+    },
+  },
+  description: purgeObservationDescription,
+  schema: {
+    observation_id: z.string().describe('The observation revision to purge from'),
+    confirm: z.literal('PURGE').describe("Must be exactly 'PURGE' - this destroys history"),
+  },
+  annotations: { destructiveHint: true },
+};
+
+const getObservationHistoryDescription: ToolRegistrationDescription = () => `<description>
+Return the full revision history of observations: every version, its status, its provenance, and
+the events that changed it.
+**Past versions come out here and nowhere else - ordinary search returns only 'active' revisions.**
+</description>
+
+<importantNotes>
+- (!important!) The response is always \`{ roots: [...] }\` - one root per logical observation
+- (!important!) Each root holds its revisions in order (revision_no ascending), oldest first
+- (!important!) Use this to answer "was this ever different?" or "where did this come from?"
+- (!important!) Exactly one selector is required
+</importantNotes>
+
+<whenToUseThisTool>
+- When you need to know whether a fact was corrected, and what it used to say
+- When you need the provenance (which document or decision) behind an observation
+- Before trusting a surprising fact - check whether it was already retracted or superseded
+- When auditing what changed in an entity's knowledge over time
+</whenToUseThisTool>
+
+<parameters>
+- entity_name: All observations of this entity (string, optional)
+- observation_id: The root that this revision belongs to (string, optional)
+- root_id: One specific logical observation (string, optional)
+</parameters>
+
+<examples>
+- {"entity_name": "claude-mem"}
+- {"observation_id": "…"}
+</examples>`;
+
+export const getObservationHistoryTool: ToolDefinition = {
+  capability: {
+    description: 'Full revision history of observations - the only surface for non-active revisions',
+    parameters: {
+      type: 'object',
+      properties: {
+        entity_name: { type: 'string', description: 'All observations of this entity' },
+        observation_id: { type: 'string', description: 'The root this revision belongs to' },
+        root_id: { type: 'string', description: 'One specific logical observation' },
+      },
+      required: [],
+    },
+  },
+  description: getObservationHistoryDescription,
+  schema: {
+    entity_name: z.string().optional().describe('All observations of this entity'),
+    observation_id: z.string().optional().describe('The root that this revision belongs to'),
+    root_id: z.string().optional().describe('One specific logical observation'),
+  },
+  annotations: { readOnlyHint: true },
+};
+
 // Export all knowledge graph tools
 export const knowledgeGraphTools = {
   createEntities: createEntitiesTool,
@@ -584,4 +827,12 @@ export const knowledgeGraphTools = {
   hybridSearch: hybridSearchTool,
   embedAllEntities: embedAllEntitiesTool,
   getDetailedContext: getDetailedContextTool,
+  // v13 observation lifecycle
+  correctObservation: correctObservationTool,
+  retractObservation: retractObservationTool,
+  restoreObservation: restoreObservationTool,
+  approveObservation: approveObservationTool,
+  declineObservation: declineObservationTool,
+  purgeObservation: purgeObservationTool,
+  getObservationHistory: getObservationHistoryTool,
 };

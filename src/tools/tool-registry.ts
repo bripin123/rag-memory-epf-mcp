@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { readFileSync } from 'node:fs';
 import { ToolDefinition, MCPTool } from './types.js';
 import { knowledgeGraphTools } from './knowledge-graph-tools.js';
 import { ragTools } from './rag-tools.js';
@@ -15,9 +16,14 @@ export const allTools = {
   ...migrationTools,
 };
 
-// Global settings for tool descriptions
+// Global settings for tool descriptions.
+// version 은 package.json 이 정본이다. 하드코딩하면 릴리스마다 이 값만 옛 버전으로
+// 남아 도구 문서가 거짓을 말한다(실제로 3.1.0 에 멈춰 있었다 — advisor beta r3 남은 P2).
+const PKG = JSON.parse(
+  readFileSync(new URL('../../../package.json', import.meta.url), 'utf8')) as { version: string };
+
 export const globalSettings = {
-  version: '3.1.0',
+  version: PKG.version,
   systemName: 'RAG Knowledge Graph MCP Server',
   defaultTimeout: 60,
 };
@@ -48,6 +54,10 @@ export function convertToMCPTool(name: string, toolDef: ToolDefinition): MCPTool
       type: 'object',
       properties,
       required,
+      // validateToolArgs 가 최상위를 strict 로 검증한다. 광고 스키마가 그걸 말하지
+      // 않으면 클라이언트는 여분 필드가 허용된다고 읽고 서버에서 거부당한다
+      // (advisor beta r3: 계약 표현 불일치).
+      additionalProperties: false,
     },
     ...(toolDef.annotations && { annotations: toolDef.annotations }),
   };
@@ -105,6 +115,10 @@ function zodTypeToJsonSchema(zodType: any, fieldName: string): any {
           description: def.description || `${fieldName} object`,
           properties: objectProperties,
           required: objectRequired,
+          // 런타임이 strict 면 광고도 strict 라고 말해야 한다. 안 그러면 클라이언트가
+          // 여분 키를 허용된다고 읽고 서버에서 거부당한다 — importGraph.data 가
+          // 정확히 그 상태였다(advisor beta r4 남은 P2).
+          ...(def.unknownKeys === 'strict' && { additionalProperties: false }),
         };
       
       case 'ZodRecord':
@@ -113,7 +127,34 @@ function zodTypeToJsonSchema(zodType: any, fieldName: string): any {
           description: def.description || `${fieldName} record`,
           additionalProperties: true,
         };
+
+      // Enums and literals used to fall through to the string fallback, which dropped the
+      // allowed values from the advertised schema even though parse() still enforced them.
+      // A client that cannot see the values guesses, and the guess is rejected server-side.
+      case 'ZodEnum':
+        return {
+          type: 'string',
+          description: def.description || `${fieldName} parameter`,
+          enum: [...def.values],
+        };
+
+      case 'ZodLiteral':
+        return {
+          type: typeof def.value === 'number' ? 'number'
+            : typeof def.value === 'boolean' ? 'boolean' : 'string',
+          description: def.description || `${fieldName} parameter`,
+          enum: [def.value],
+        };
       
+      // union 도 같은 fallback 함정이었다: deleteDocuments 의 documentIds 는
+      // string | string[] 인데 광고 스키마에 type:'string' 으로 나가 배열을 보내면
+      // 클라이언트가 계약 위반이라고 읽는다. anyOf 로 정직하게 노출한다.
+      case 'ZodUnion':
+        return {
+          description: def.description || `${fieldName} parameter`,
+          anyOf: (def.options as any[]).map((o, i) => zodTypeToJsonSchema(o, `${fieldName} option ${i}`)),
+        };
+
       case 'ZodOptional':
         const innerSchema = zodTypeToJsonSchema(def.innerType, fieldName);
         return {
@@ -169,7 +210,11 @@ export function validateToolArgs<T>(toolName: string, args: any): T {
     throw new Error(`Unknown tool: ${toolName}`);
   }
   
-  const schema = z.object(toolDef.schema);
+  // strict: 알 수 없는 최상위 인자는 거부한다. 기본 strip 은 오래된 호출자를
+  // **조용히** 통과시킨다 — v3.6 의 index 기반 관찰 지정(`{observation_id, index}`,
+  // `{observation_index}`)이 아무 오류 없이 무시되고, 호출자는 자기가 지정한
+  // revision 이 아닌 다른 것이 처리됐다는 사실을 모른다(spec T6, advisor beta 발견 4-1).
+  const schema = z.object(toolDef.schema).strict();
   return schema.parse(args) as T;
 }
 

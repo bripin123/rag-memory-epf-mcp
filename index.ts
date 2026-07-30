@@ -28,6 +28,11 @@ import { getAllMCPTools, validateToolArgs, getSystemInfo } from './src/tools/too
 
 // Import migration system
 import { MigrationManager } from './src/migrations/migration-manager.js';
+import { backupBeforeMigration } from './src/backup/preflight.js';
+import { rebuildProjection, deleteStaleKgChunks } from './src/observations/projection.js';
+import { addRevision, correctRevision, transitionStatus, linkSources,
+         nextProjectionOrder, type SourceInput } from './src/observations/lifecycle.js';
+import { getObservationHistory } from './src/observations/history.js';
 
 // Import chunk text algorithm (extracted for publish-time invariant testing)
 import { chunkText as splitTextIntoChunks } from './src/chunkText.js';
@@ -242,7 +247,10 @@ export class RAGKnowledgeGraphManager {
   // v3.6 (spec §3): initialize = DB + migrations + profile only. The embedding
   // model is NEVER awaited here — main() connects the MCP server first and the
   // gate loads in the background (lazy) or is awaited explicitly (eager).
-  async initialize(opts: { skipModel?: boolean; gate?: EmbeddingGate } = {}) {
+  // __testForceFkOff: 음성 대조군 전용. FK 게이트가 실제로 부팅을 막는지 시험한다.
+  // 이름에 __test 를 박아 둔 이유는 이것이 프로덕션 설정 표면이 아니라는 것을
+  // 호출부에서 읽히게 하기 위해서다.
+  async initialize(opts: { skipModel?: boolean; gate?: EmbeddingGate; __testForceFkOff?: boolean } = {}) {
     console.error('🚀 Initializing RAG Knowledge Graph MCP Server...');
 
     this.db = new Database(DB_FILE_PATH);
@@ -254,6 +262,26 @@ export class RAGKnowledgeGraphManager {
     this.db.pragma('temp_store = MEMORY');
     this.db.pragma('mmap_size = 268435456');
     this.db.pragma('foreign_keys = ON');
+    // spec §5.2: 관찰 lifecycle 의 무결성은 전부 FK CASCADE 를 전제한다 — root 를 지우면
+    // revision 이, revision 을 지우면 source 가 따라가야 history 가 고아로 남지 않는다.
+    // FK 가 꺼진 채 돌면 그 계약이 조용히 무효가 되고, 그게 최악이다. 스키마를 건드리기
+    // 전에(= runMigrations 앞에서) 멈춘다.
+    // 트랜잭션 내부에서는 이 pragma 가 no-op 이므로(실측 before=1·during=1·after=1)
+    // 부팅 시점 확인이 유일한 방어 지점이다.
+    //
+    // 음성 대조군 주입은 **인자로만** 받는다. 환경변수로 두면 프로덕션 경로에
+    // "부팅을 막는 스위치"가 상시 존재하게 되고, 오설정 한 줄로 서버가 안 뜬다
+    // (advisor beta 자기의심 2 = "더 나쁘다"). 테스트는 manager 를 직접 만들므로
+    // 인자 주입으로 충분하다.
+    if (opts.__testForceFkOff) this.db.pragma('foreign_keys = OFF');
+    {
+      const fk = this.db.pragma('foreign_keys', { simple: true });
+      if (Number(fk) !== 1) {
+        throw new Error(
+          `foreign_keys is ${fk}, expected 1. The observation lifecycle relies on FK CASCADE ` +
+          `for history integrity; refusing to run migrations without it.`);
+      }
+    }
     this.encoding = get_encoding("cl100k_base");
 
     await this.runMigrations();
@@ -434,18 +462,43 @@ export class RAGKnowledgeGraphManager {
   // where another tool call can retrieve the pre-mutation vector, and a crash
   // between mutation and re-embed leaves a clean missing state (backfill
   // target), never a stale-searchable one.
-  private mutateEntityAndInvalidate(entityId: string, mutate: () => void): void {
+  // spec §4.5 단계 1: 관찰 변경 · projection 재합성 · entity vector 무효화 ·
+  // stale KG chunk 제거를 한 트랜잭션으로 묶는다. 하나만 되면 검색이 낡은
+  // 사실을 계속 반환한다.
+  // mutate 가 명시적으로 false 를 반환하면 "아무것도 바꾸지 않았다"는 뜻이고
+  // projection 재합성·벡터 무효화·KG 정리를 건너뛴다. 이 경로가 없으면
+  // 무변경 upsert 나 dedup-only add 가 **정상 벡터를 지우고 재임베딩도 안 해서**
+  // 검색 품질만 깎는다(advisor 구현리뷰 r1 발견 1, 실행 재현).
+  // 반환값 = 실제로 변경이 있었는가.
+  private mutateEntityAndInvalidate(entityId: string, mutate: () => boolean | void): boolean {
+    let changed = false;
     const tx = this.db!.transaction(() => {
-      mutate();
-      const meta = this.db!.prepare(`SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?`)
-        .get(entityId) as { rowid: number } | undefined;
-      if (meta) {
-        this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(meta.rowid)}`);
-        this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`).run(entityId);
-      }
+      changed = mutate() !== false;
+      if (!changed) return;
+      rebuildProjection(this.db!, entityId);
+      this.invalidateDerivedForEntity(entityId);
     });
     tx();
-    this.coordinator?.invalidateCoverage();
+    if (changed) this.coordinator?.invalidateCoverage();
+    return changed;
+  }
+
+  // 관찰이 바뀐 entity 의 파생 상태를 무효화한다: entity vector + stale KG chunk.
+  // **트랜잭션을 열지 않는다** — 호출자가 이미 하나의 단위 안에 있다고 가정한다.
+  //
+  // importGraph 가 이 단계를 건너뛰고 있었다: projection 만 재합성하고 파생 상태를
+  // 그대로 둬서, 이미 존재하는 entity 를 import 로 덮으면 옛 벡터·옛 KG chunk 가
+  // 계속 검색에 나왔다(advisor beta 발견 2, hybridSearch 로 실측 재현).
+  // 그래서 "모든 관찰 변경은 mutateEntityAndInvalidate 를 통한다"는 규칙에
+  // 예외가 하나 있었고, 그 예외가 정확히 그 규칙이 막으려던 결함을 만들었다.
+  private invalidateDerivedForEntity(entityId: string): void {
+    const meta = this.db!.prepare(`SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?`)
+      .get(entityId) as { rowid: number } | undefined;
+    if (meta) {
+      this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(meta.rowid)}`);
+      this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`).run(entityId);
+    }
+    deleteStaleKgChunks(this.db!, entityId);
   }
 
   // §6a-1 invariant: when an entity's embedding input changed but re-embedding
@@ -537,7 +590,14 @@ export class RAGKnowledgeGraphManager {
     
     // Get pending migrations before running them
     const pendingBefore = migrationManager.getPendingMigrations();
-    
+
+    // spec §5.1: 대기 중 마이그레이션이 있으면 먼저 일관 스냅샷을 남긴다.
+    // 실패는 throw = fail-closed (백업 없이 스키마를 바꾸지 않는다).
+    // await: 백업은 Online Backup API 를 쓰므로 비동기다. 여기서 await 를 빠뜨리면
+    // 백업이 끝나기 전에 마이그레이션이 시작한다 = 백업 없이 스키마를 바꾸는 것이다.
+    await backupBeforeMigration(this.db, DB_FILE_PATH, pendingBefore.map(m => m.version),
+                                migrationManager.getCurrentVersion());
+
     // Run pending migrations
     const result = await migrationManager.runMigrations();
     
@@ -574,54 +634,88 @@ export class RAGKnowledgeGraphManager {
     return `[${today}] ${obs}`;
   }
 
-  async createEntities(entities: Entity[]): Promise<Entity[]> {
+  async createEntities(entities: Array<Entity & {
+    status?: 'active' | 'provisional'; sources?: SourceInput[];
+  }>): Promise<Array<Entity & { created?: boolean; observation_ids?: (string | null)[] }>> {
     if (!this.db) throw new Error('Database not initialized');
 
-    const result: Entity[] = [];
+    const result: Array<Entity & { created?: boolean; observation_ids?: (string | null)[] }> = [];
+    // v13: 관찰은 lifecycle 테이블이 정본이고 entities.observations 는 projection 이다.
+    // entity 행은 빈 배열로 만들고 rebuildProjection 이 채운다.
     const insertStmt = this.db.prepare(`
       INSERT OR IGNORE INTO entities (id, name, entityType, observations, metadata)
-      VALUES (?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, '[]', ?)
     `);
+    const stripDate = (s2: string) => s2.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '');
 
     for (const entity of entities) {
       const entityId = `entity_${entity.name.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
-      const timestamped = (entity.observations || []).map(o => this._timestampObservation(o));
+      const ts = new Date().toISOString();
+      const ids: (string | null)[] = [];
+      let created = false;
+      let addedCount = 0;
+      let typeUpdated = false;
 
-      // Try insert first
-      const insertResult = insertStmt.run(entityId, entity.name, entity.entityType, JSON.stringify(timestamped), '{}');
+      // entity INSERT 도 같은 트랜잭션 안이다. 밖에 두면 lifecycle INSERT 가
+      // 실패할 때 entity 행만 남는 split state 가 생긴다
+      // (advisor 구현리뷰 r1 발견 2, 실행 재현).
+      const changed = this.mutateEntityAndInvalidate(entityId, () => {
+        created = insertStmt.run(entityId, entity.name, entity.entityType, '{}').changes > 0;
 
-      if (insertResult.changes > 0) {
-        // New entity created. CRUD success is independent of model readiness
-        // (spec §5): not-ready -> row stays vectorless (queued for backfill).
-        console.error(`🔮 Generating embedding for new entity: ${entity.name}`);
-        const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
-        result.push({ ...entity, observations: timestamped, embedding_status } as Entity);
-      } else {
-        // Entity already exists — upsert: merge observations and update entityType
-        const existing = this.db.prepare(`SELECT observations, entityType FROM entities WHERE id = ?`)
-          .get(entityId) as { observations: string; entityType: string } | undefined;
-
-        if (existing) {
-          const currentObs: string[] = JSON.parse(existing.observations);
-          // Strip date prefix for dedup comparison
-          const stripDate = (s: string) => s.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '');
-          const currentBare = new Set(currentObs.map(stripDate));
-          const newObs = timestamped.filter(o => !currentBare.has(stripDate(o)));
-          const needsTypeUpdate = entity.entityType && entity.entityType !== 'CONCEPT' && entity.entityType !== existing.entityType;
-
-          if (newObs.length > 0 || needsTypeUpdate) {
-            const mergedObs = [...currentObs, ...newObs];
-            const updatedType = needsTypeUpdate ? entity.entityType : existing.entityType;
-            this.mutateEntityAndInvalidate(entityId, () => {
-              this.db!.prepare(`UPDATE entities SET observations = ?, entityType = ? WHERE id = ?`)
-                .run(JSON.stringify(mergedObs), updatedType, entityId);
-            });
-
-            console.error(`♻️ Upserted entity: ${entity.name} (+${newObs.length} obs${needsTypeUpdate ? ', type→' + updatedType : ''})`);
-            const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
-            result.push({ ...entity, observations: mergedObs, embedding_status } as Entity);
+        if (!created && entity.entityType && entity.entityType !== 'CONCEPT') {
+          const cur = this.db!.prepare(`SELECT entityType FROM entities WHERE id = ?`)
+            .get(entityId) as { entityType: string } | undefined;
+          if (cur && cur.entityType !== entity.entityType) {
+            this.db!.prepare(`UPDATE entities SET entityType = ? WHERE id = ?`)
+              .run(entity.entityType, entityId);
+            typeUpdated = true;
           }
         }
+
+        const activeRows = this.db!.prepare(
+          `SELECT observation_id, content FROM entity_observations
+           WHERE entity_id = ? AND status = 'active'`).all(entityId) as
+          Array<{ observation_id: string; content: string }>;
+        const activeByBare = new Map(activeRows.map(r => [stripDate(r.content), r.observation_id]));
+
+        let sourcesAdded = 0;
+        for (const raw of (entity.observations || [])) {
+          const content = this._timestampObservation(raw);
+          const bare = stripDate(content);
+          const dupId = activeByBare.get(bare);
+          if (dupId) {
+            // 같은 사실이 다른 출처에서 다시 왔다 = evidence 추가, 새 revision 아님.
+            if (entity.sources?.length) sourcesAdded += linkSources(this.db!, dupId, entity.sources, ts);
+            ids.push(null);
+            continue;
+          }
+          const id = addRevision(this.db!, {
+            entityId, content, status: entity.status ?? 'active', sources: entity.sources, ts
+          });
+          activeByBare.set(bare, id);
+          ids.push(id);
+          addedCount++;
+        }
+
+        // 아무것도 안 바뀌었으면 projection·벡터·KG 를 건드리지 않는다.
+        return created || typeUpdated || addedCount > 0 || sourcesAdded > 0;
+      });
+
+      const projected = JSON.parse(
+        (this.db.prepare(`SELECT observations FROM entities WHERE id = ?`)
+          .get(entityId) as { observations: string }).observations) as string[];
+
+      // 재임베딩은 무효화가 실제로 일어났을 때만. 조건이 갈리면
+      // "벡터를 지우고 다시 만들지 않는" 창이 생긴다.
+      if (changed) {
+        console.error(created
+          ? `🔮 Generating embedding for new entity: ${entity.name}`
+          : `♻️ Upserted entity: ${entity.name} (+${addedCount} obs${typeUpdated ? ', type→' + entity.entityType : ''})`);
+        const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
+        result.push({ ...entity, observations: projected, created,
+                      observation_ids: ids, embedding_status } as any);
+      } else {
+        result.push({ ...entity, observations: projected, created, observation_ids: ids } as any);
       }
     }
 
@@ -667,49 +761,173 @@ export class RAGKnowledgeGraphManager {
     return newRelations;
   }
 
-  async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
+  async addObservations(observations: {
+    entityName: string; contents: string[];
+    status?: 'active' | 'provisional';
+    sources?: SourceInput[];
+  }[]): Promise<Array<{ entityName: string; observation_ids: (string | null)[];
+                        addedObservations: string[]; embedding_status?: string }>> {
     if (!this.db) throw new Error('Database not initialized');
-    
-    const results = [];
-    
+
+    const results: Array<{ entityName: string; observation_ids: (string | null)[];
+                           addedObservations: string[]; embedding_status?: string }> = [];
+
     for (const obs of observations) {
       const entityId = `entity_${obs.entityName.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
-      
-      // Get current observations
-      const entity = this.db.prepare(`
-        SELECT observations FROM entities WHERE id = ?
-      `).get(entityId) as { observations: string } | undefined;
-      
-      if (!entity) {
-        throw new Error(`Entity with name ${obs.entityName} not found`);
-      }
-      
-      const currentObservations: string[] = JSON.parse(entity.observations);
-      const stripDate = (s: string) => s.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '');
-      const currentBare = new Set(currentObservations.map(stripDate));
-      const timestamped = obs.contents.map(c => this._timestampObservation(c));
-      const newObservations = timestamped.filter(c => !currentBare.has(stripDate(c)));
+      const entity = this.db.prepare(`SELECT id FROM entities WHERE id = ?`).get(entityId);
+      if (!entity) throw new Error(`Entity with name ${obs.entityName} not found`);
 
-      if (newObservations.length > 0) {
-        const updatedObservations = [...currentObservations, ...newObservations];
+      // dedup 기준은 v3.6 과 같다: 날짜 prefix 를 뗀 본문이 active 에 이미 있으면
+      // 새 revision 을 만들지 않는다. 다만 v13 에서는 같은 사실이 다른 출처에서 다시
+      // 온 것이므로 그 revision 에 source link 를 더한다(spec §8.3 T13).
+      const stripDate = (s2: string) => s2.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '');
+      const activeRows = this.db.prepare(
+        `SELECT observation_id, content FROM entity_observations
+         WHERE entity_id = ? AND status = 'active'`).all(entityId) as
+        Array<{ observation_id: string; content: string }>;
+      const activeByBare = new Map(activeRows.map(r => [stripDate(r.content), r.observation_id]));
 
-        this.mutateEntityAndInvalidate(entityId, () => {
-          this.db!.prepare(`
-            UPDATE entities SET observations = ? WHERE id = ?
-          `).run(JSON.stringify(updatedObservations), entityId);
-        });
+      const ts = new Date().toISOString();
+      const ids: (string | null)[] = [];
+      const added: string[] = [];
 
-        // Regenerate embedding for the updated entity (queued when not ready)
+      let sourcesAdded = 0;
+      const changed = this.mutateEntityAndInvalidate(entityId, () => {
+        for (const raw of obs.contents) {
+          const content = this._timestampObservation(raw);
+          const bare = stripDate(content);
+          const dupId = activeByBare.get(bare);
+          if (dupId) {
+            if (obs.sources?.length) sourcesAdded += linkSources(this.db!, dupId, obs.sources, ts);
+            ids.push(null);
+            continue;
+          }
+          const id = addRevision(this.db!, {
+            entityId, content, status: obs.status ?? 'active', sources: obs.sources, ts
+          });
+          activeByBare.set(bare, id);
+          ids.push(id);
+          added.push(content);
+        }
+        // 아무것도 안 바뀌었으면 projection·벡터·KG 를 건드리지 않는다.
+        // 이 반환이 없으면 빈 contents 나 dedup-only add 가 정상 벡터를
+        // 지우고 재임베딩도 안 한다(advisor 구현리뷰 r1 발견 1).
+        return added.length > 0 || sourcesAdded > 0;
+      });
+
+      let embedding_status: string | undefined;
+      if (changed) {
         console.error(`🔮 Regenerating embedding for updated entity: ${obs.entityName}`);
-        const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
-        results.push({ entityName: obs.entityName, addedObservations: newObservations, embedding_status } as any);
-        continue;
+        embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
       }
-
-      results.push({ entityName: obs.entityName, addedObservations: newObservations });
+      results.push({ entityName: obs.entityName, observation_ids: ids,
+                     addedObservations: added, embedding_status });
     }
-
     return results;
+  }
+
+  async correctObservation(
+    observationId: string, content: string,
+    changeKind: 'correction' | 'world_change' = 'correction',
+    reason?: string
+  ): Promise<string> {
+    if (!this.db) throw new Error('Database not initialized');
+    const row = this.db.prepare(`SELECT entity_id FROM entity_observations WHERE observation_id = ?`)
+      .get(observationId) as { entity_id: string } | undefined;
+    if (!row) throw new Error(`observation ${observationId} not found`);
+
+    let newId = '';
+    const ts = new Date().toISOString();
+    this.mutateEntityAndInvalidate(row.entity_id, () => {
+      newId = correctRevision(this.db!, {
+        observationId, content: this._timestampObservation(content),
+        changeKind, reason: reason ?? null, ts
+      });
+    });
+    await this.tryEmbedEntity(row.entity_id, 'bulk');
+    return newId;
+  }
+
+  private async _transition(
+    observationId: string,
+    event: 'retract' | 'restore' | 'approve' | 'decline',
+    reason?: string
+  ): Promise<void> {
+    if (!this.db) throw new Error('Database not initialized');
+    const row = this.db.prepare(`SELECT entity_id FROM entity_observations WHERE observation_id = ?`)
+      .get(observationId) as { entity_id: string } | undefined;
+    if (!row) throw new Error(`observation ${observationId} not found`);
+    const ts = new Date().toISOString();
+    this.mutateEntityAndInvalidate(row.entity_id, () => {
+      transitionStatus(this.db!, { observationId, event, reason: reason ?? null, ts });
+    });
+    await this.tryEmbedEntity(row.entity_id, 'bulk');
+  }
+
+  async retractObservation(observationId: string, reason?: string): Promise<void> {
+    return this._transition(observationId, 'retract', reason);
+  }
+  async restoreObservation(observationId: string, reason?: string): Promise<void> {
+    return this._transition(observationId, 'restore', reason);
+  }
+  async approveObservation(observationId: string, reason?: string): Promise<void> {
+    return this._transition(observationId, 'approve', reason);
+  }
+  async declineObservation(observationId: string, reason: string): Promise<void> {
+    return this._transition(observationId, 'decline', reason);
+  }
+
+  // DESTRUCTIVE. Physically removes revisions (and their sources via CASCADE).
+  //
+  // Chain contract (advisor 구현리뷰 r1 발견 4): a revision chain is
+  // rev1 <- rev2 <- ... and purging a middle revision would either fail on the
+  // supersedes_id FK or leave a chain pointing at a deleted row, plus events
+  // whose from_id/to_id dangle. So purge is defined as **suffix purge from the
+  // target to the newest revision of that root**, newest-first:
+  //   - purging the newest revision removes exactly it
+  //   - purging rev2 of a 3-revision chain removes rev3 then rev2
+  //   - purging rev1 removes the whole chain
+  // Events for purged revisions are removed too, so no event dangles.
+  // The root row is always kept: its projection_order stays reserved, because
+  // reusing an order would make a later restore/approve fail on the
+  // active-order index.
+  async purgeObservation(observationId: string, confirm: string): Promise<{ purged: number }> {
+    if (!this.db) throw new Error('Database not initialized');
+    if (confirm !== 'PURGE') {
+      throw new Error(
+        `purgeObservation refused: pass confirm='PURGE' to physically delete a revision. ` +
+        `This destroys history — retractObservation() is almost always what you want.`);
+    }
+    const row = this.db.prepare(
+      `SELECT entity_id, root_id, revision_no FROM entity_observations WHERE observation_id = ?`)
+      .get(observationId) as { entity_id: string; root_id: string; revision_no: number } | undefined;
+    if (!row) return { purged: 0 };
+
+    let purged = 0;
+    this.mutateEntityAndInvalidate(row.entity_id, () => {
+      // newest-first so each DELETE has no successor referencing it
+      const victims = this.db!.prepare(
+        `SELECT observation_id FROM entity_observations
+         WHERE root_id = ? AND revision_no >= ?
+         ORDER BY revision_no DESC`
+      ).all(row.root_id, row.revision_no) as Array<{ observation_id: string }>;
+      for (const v of victims) {
+        this.db!.prepare(
+          `DELETE FROM observation_events WHERE from_id = ? OR to_id = ?`)
+          .run(v.observation_id, v.observation_id);
+        purged += this.db!.prepare(`DELETE FROM entity_observations WHERE observation_id = ?`)
+          .run(v.observation_id).changes;
+      }
+      return purged > 0;
+    });
+    await this.tryEmbedEntity(row.entity_id, 'bulk');
+    return { purged };
+  }
+
+  // spec §6.2: 과거 판본은 여기서만 나온다. 일반 검색은 active 만 반환한다.
+  async getObservationHistory(sel: { entity_name?: string; observation_id?: string; root_id?: string }) {
+    if (!this.db) throw new Error('Database not initialized');
+    return getObservationHistory(this.db, sel);
   }
 
   async deleteEntities(entityNames: string[]): Promise<void> {
@@ -790,40 +1008,98 @@ export class RAGKnowledgeGraphManager {
   // Pre-3.6 this method silently left STALE entity vectors behind (the input
   // text changed but the vector was never regenerated) — fixed via
   // tryEmbedEntity, which also covers the not-ready dirty contract.
+  // DEPRECATED shim (v13, one version only). Content-addressed deletion cannot
+  // express "which revision" — use retractObservation(observation_id) instead.
+  // Semantics: exact-string match against ACTIVE revisions -> soft retract.
+  //
+  // The whole call is one transaction and ambiguity is judged before any
+  // mutation: if any item matches 2+ active revisions the call aborts with 0
+  // mutations (spec §6.3). That is a deliberate change from v3.6, which deleted
+  // every duplicate and carried on — a machine cannot pick which revision was meant.
+  //
+  // Duplicate ids across items are collapsed. Without that, listing the same
+  // (entity, content) twice retracted it once and then failed on an illegal
+  // transition, returning an error *after* committing part of the batch
+  // (advisor 구현리뷰 r1 발견 3, 실행 재현). Embedding runs after the commit.
   async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<{
-    results: Array<{ entityName: string; deleted: number; embedding_status: 'embedded' | 'queued' | 'disabled' | 'n/a' }>;
+    results: Array<{ entityName: string; deleted: number; embedding_status: string }>;
     total_deleted: number;
   }> {
     if (!this.db) throw new Error('Database not initialized');
 
-    const results: Array<{ entityName: string; deleted: number; embedding_status: 'embedded' | 'queued' | 'disabled' | 'n/a' }> = [];
-    let total = 0;
-    for (const deletion of deletions) {
-      const entityId = `entity_${deletion.entityName.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
-      const entity = this.db.prepare(`
-        SELECT observations FROM entities WHERE id = ?
-      `).get(entityId) as { observations: string } | undefined;
+    // pass 1 — resolve the whole batch, mutate nothing
+    type Hit = { entityName: string; entityId: string; ids: string[] };
+    const plan: Hit[] = [];
+    const ambiguous: Array<{ entityName: string; content: string; matches: number }> = [];
+    const claimed = new Set<string>();   // 항목 간 중복 id 흡수
 
-      if (!entity) {
-        results.push({ entityName: deletion.entityName, deleted: 0, embedding_status: 'n/a' });
-        continue;
+    for (const d of deletions) {
+      const entityId = `entity_${d.entityName.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
+      const ids: string[] = [];
+      for (const content of d.observations) {
+        const rows = this.db.prepare(
+          `SELECT observation_id FROM entity_observations
+           WHERE entity_id = ? AND status = 'active' AND content = ?`
+        ).all(entityId, content) as Array<{ observation_id: string }>;
+        if (rows.length > 1) {
+          ambiguous.push({ entityName: d.entityName, content, matches: rows.length });
+          continue;
+        }
+        if (rows.length === 1 && !claimed.has(rows[0].observation_id)) {
+          claimed.add(rows[0].observation_id);
+          ids.push(rows[0].observation_id);
+        }
+        // rows.length === 0 -> no-op (v3.6 behaviour, spec §6.3-3)
       }
-      const currentObservations: string[] = JSON.parse(entity.observations);
-      const filteredObservations = currentObservations.filter(
-        (obs: string) => !deletion.observations.includes(obs)
-      );
-      const deleted = currentObservations.length - filteredObservations.length;
-      if (deleted === 0) {
-        results.push({ entityName: deletion.entityName, deleted: 0, embedding_status: 'n/a' });
-        continue;
-      }
-      this.mutateEntityAndInvalidate(entityId, () => {
-        this.db!.prepare(`UPDATE entities SET observations = ? WHERE id = ?`)
-          .run(JSON.stringify(filteredObservations), entityId);
+      plan.push({ entityName: d.entityName, entityId, ids });
+    }
+
+    if (ambiguous.length > 0) {
+      throw new Error(
+        `AMBIGUOUS_OBSERVATION_MATCH: ${ambiguous.length} item(s) matched multiple active ` +
+        `revisions; 0 mutations were applied. Use retractObservation(observation_id) instead. ` +
+        `Conflicts: ${JSON.stringify(ambiguous)}`);
+    }
+
+    // pass 2 — mutate everything in ONE transaction so a failure anywhere
+    // leaves zero mutations. Per-plan transactions plus an awaited embedding
+    // in between made a partial commit observable.
+    const touched = plan.filter(p => p.ids.length > 0);
+    const ts = new Date().toISOString();
+    if (touched.length > 0) {
+      const tx = this.db.transaction(() => {
+        for (const p of touched) {
+          for (const id of p.ids) {
+            transitionStatus(this.db!, { observationId: id, event: 'retract',
+                                         reason: 'deleteObservations (deprecated shim)', ts });
+          }
+          rebuildProjection(this.db!, p.entityId);
+          const meta = this.db!.prepare(
+            `SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?`)
+            .get(p.entityId) as { rowid: number } | undefined;
+          if (meta) {
+            this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(meta.rowid)}`);
+            this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`)
+              .run(p.entityId);
+          }
+          deleteStaleKgChunks(this.db!, p.entityId);
+        }
       });
-      const embedding_status = await this.tryEmbedEntity(entityId, 'bulk');
-      total += deleted;
-      results.push({ entityName: deletion.entityName, deleted, embedding_status });
+      tx();
+      this.coordinator?.invalidateCoverage();
+    }
+
+    // pass 3 — embedding after the commit
+    const results: Array<{ entityName: string; deleted: number; embedding_status: string }> = [];
+    let total = 0;
+    for (const p of plan) {
+      if (p.ids.length === 0) {
+        results.push({ entityName: p.entityName, deleted: 0, embedding_status: 'n/a' });
+        continue;
+      }
+      const embedding_status = await this.tryEmbedEntity(p.entityId, 'bulk');
+      results.push({ entityName: p.entityName, deleted: p.ids.length, embedding_status });
+      total += p.ids.length;
     }
     return { results, total_deleted: total };
   }
@@ -2607,7 +2883,7 @@ export class RAGKnowledgeGraphManager {
     return { documents };
   }
 
-  async exportGraph(): Promise<{ entities: any[]; relations: any[]; documents: any[]; metadata: { exportedAt: string; version: string; entityCount: number; relationCount: number; documentCount: number } }> {
+  async exportGraph(): Promise<{ entities: any[]; relations: any[]; documents: any[]; observation_roots: any[]; entity_observations: any[]; observation_sources: any[]; observation_events: any[]; metadata: { exportedAt: string; version: string; entityCount: number; relationCount: number; documentCount: number } }> {
     if (!this.db) throw new Error('Database not initialized');
 
     console.error('📦 Exporting knowledge graph...');
@@ -2646,10 +2922,25 @@ export class RAGKnowledgeGraphManager {
 
     console.error(`✅ Export completed: ${entities.length} entities, ${relations.length} relations, ${documents.length} documents`);
 
+    // spec §6.4: lifecycle 정본을 함께 내보낸다. 이게 없으면 export->import 뒤
+    // 관찰의 신원·출처·이력이 사라지고 projection 만 남는다.
+    const observation_roots = this.db.prepare(
+      `SELECT * FROM observation_roots ORDER BY entity_id, projection_order`).all();
+    const entity_observations = this.db.prepare(
+      `SELECT * FROM entity_observations ORDER BY root_id, revision_no`).all();
+    const observation_sources = this.db.prepare(
+      `SELECT * FROM observation_sources ORDER BY observation_id, source_kind, source_ref`).all();
+    const observation_events = this.db.prepare(
+      `SELECT * FROM observation_events ORDER BY root_id, recorded_at, event_id`).all();
+
     return {
       entities,
       relations,
       documents,
+      observation_roots,
+      entity_observations,
+      observation_sources,
+      observation_events,
       metadata: {
         exportedAt: new Date().toISOString(),
         version: PKG_VERSION,
@@ -2660,25 +2951,54 @@ export class RAGKnowledgeGraphManager {
     };
   }
 
-  async importGraph(data: { entities?: any[]; relations?: any[]; documents?: any[] }, options: { merge?: boolean } = { merge: true }): Promise<{ imported: { entities: number; relations: number; documents: number }; skipped: { entities: number; relations: number; documents: number } }> {
+  async importGraph(data: { entities?: any[]; relations?: any[]; documents?: any[]; observation_roots?: any[]; entity_observations?: any[]; observation_sources?: any[]; observation_events?: any[] }, options: { merge?: boolean } = { merge: true }): Promise<{ imported: { entities: number; relations: number; documents: number }; skipped: { entities: number; relations: number; documents: number }; observation_order_remap: Array<{ root_id: string; entity_id: string; from: number; to: number }> }> {
     if (!this.db) throw new Error('Database not initialized');
 
     console.error(`📥 Importing knowledge graph (merge: ${options.merge !== false})...`);
 
     const imported = { entities: 0, relations: 0, documents: 0 };
     const skipped = { entities: 0, relations: 0, documents: 0 };
+    // merge 로 배열 위치가 재배정된 관찰. 조용히 순서를 바꾸면 호출자가 알 수 없으므로
+    // 응답으로 내보낸다(advisor beta r3 발견 3).
+    const remapReport: Array<{ root_id: string; entity_id: string; from: number; to: number }> = [];
 
+    // spec §6.4: abort 는 0 mutation 이다. lifecycle 만 트랜잭션으로 감싸면
+    // 충돌로 throw 할 때 그 앞에서 넣은 entity·relation·document 가 살아남는다
+    // (T17b 가 ghost entity 로 실증). import 전체가 한 단위여야 한다.
+    // 내부 transaction() 호출은 better-sqlite3 에서 savepoint 로 중첩된다.
+    const importAll = this.db!.transaction(() => {
     // If merge=false, clear existing data first
     if (options.merge === false) {
-      this.db.exec(`DELETE FROM relationships`);
-      this.db.exec(`DELETE FROM entities`);
-      this.db.exec(`DELETE FROM documents`);
+      this.db!.exec(`DELETE FROM relationships`);
+      // entities 삭제가 FK CASCADE 로 lifecycle 4테이블을 지우지만, 순서를 계약으로
+      // 두어 FK 가 꺼진 환경에서도 잔존 행이 남지 않게 한다.
+      this.db!.exec(`DELETE FROM observation_events`);
+      this.db!.exec(`DELETE FROM observation_sources`);
+      this.db!.exec(`DELETE FROM entity_observations`);
+      this.db!.exec(`DELETE FROM observation_roots`);
+      this.db!.exec(`DELETE FROM entities`);
+      this.db!.exec(`DELETE FROM documents`);
+      // entities 를 지워도 파생 데이터는 따라오지 않는다: chunk_metadata 에는
+      // entities 로 가는 FK 가 없고 entity_embedding_metadata.entity_id 는 UNIQUE 일
+      // 뿐이다. 그래서 replace-import 뒤에 **사라진 entity 의 벡터와 KG chunk 가
+      // 검색에 남았다**(advisor beta 발견 2). document chunk 는 documents 의
+      // CASCADE 로 이미 정리되므로 여기서는 entity·relationship chunk 만 지운다.
+      const orphanChunks = this.db!.prepare(
+        `SELECT rowid FROM chunk_metadata WHERE chunk_type IN ('entity','relationship')`)
+        .all() as Array<{ rowid: number }>;
+      for (const c of orphanChunks) {
+        this.db!.exec(`DELETE FROM chunks WHERE rowid = ${Number(c.rowid)}`);
+        this.db!.prepare(`DELETE FROM chunk_metadata WHERE rowid = ?`).run(c.rowid);
+      }
+      this.db!.exec(
+        `DELETE FROM entity_embeddings WHERE rowid IN (SELECT rowid FROM entity_embedding_metadata)`);
+      this.db!.exec(`DELETE FROM entity_embedding_metadata`);
       console.error('🗑️ Cleared existing data for full import');
     }
 
     // Import entities using INSERT OR IGNORE
     if (data.entities && Array.isArray(data.entities)) {
-      const stmt = this.db.prepare(`
+      const stmt = this.db!.prepare(`
         INSERT OR IGNORE INTO entities (id, name, entityType, observations, metadata, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
       `);
@@ -2687,7 +3007,9 @@ export class RAGKnowledgeGraphManager {
           entity.id,
           entity.name,
           entity.entityType || 'CONCEPT',
-          JSON.stringify(entity.observations || []),
+          // v13: observations 는 projection 이다. lifecycle 행을 넣은 뒤
+          // rebuildProjection 이 채운다 — 여기서 배열을 심으면 정본과 갈라진다.
+          '[]',
           JSON.stringify(entity.metadata || {}),
           entity.created_at || new Date().toISOString()
         );
@@ -2701,7 +3023,7 @@ export class RAGKnowledgeGraphManager {
 
     // Import relations using INSERT OR IGNORE
     if (data.relations && Array.isArray(data.relations)) {
-      const stmt = this.db.prepare(`
+      const stmt = this.db!.prepare(`
         INSERT OR IGNORE INTO relationships (id, source_entity, target_entity, relationType, confidence, metadata, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
@@ -2725,7 +3047,7 @@ export class RAGKnowledgeGraphManager {
 
     // Import documents using INSERT OR REPLACE
     if (data.documents && Array.isArray(data.documents)) {
-      const stmt = this.db.prepare(`
+      const stmt = this.db!.prepare(`
         INSERT OR REPLACE INTO documents (id, content, metadata, created_at)
         VALUES (?, ?, ?, ?)
       `);
@@ -2744,12 +3066,169 @@ export class RAGKnowledgeGraphManager {
       }
     }
 
+    // ---- spec §6.4: lifecycle import ----
+    // 순서가 계약이다: entities -> roots -> revisions(root별 revision_no ↑)
+    // -> sources/events. §4.1 트리거가 root 선행과 체인 연속성을 요구하므로
+    // importer 는 입력 순서와 무관하게 재정렬한다 (역순 export 를 그대로
+    // 스트리밍하면 'immediately preceding revision' 으로 죽는다).
+    const sameRow = (a: any, b: any, cols: string[]) =>
+      cols.every(c => (a[c] ?? null) === (b[c] ?? null));
+
+    const hasLifecycle = Array.isArray(data.observation_roots);
+    if (hasLifecycle) {
+      const tx = this.db!.transaction(() => {
+        // 새 root 가 이미 점유된 (entity_id, projection_order) 슬롯을 요구할 수 있다:
+        // 두 DB 가 같은 entity 이름을 갖고 서로 다른 관찰을 배열 0번에 두면 그렇다.
+        // 이건 §6.4 의 "같은 키 다른 값" 충돌이 아니라 **슬롯 충돌**이고, 규칙이 없어서
+        // raw UNIQUE 오류로 터졌다(내 MCP 왕복 테스트가 잡았다). merge 의 뜻은
+        // "더한다"이므로 들어오는 root 에 다음 빈 순번을 준다 — 남의 관찰을 덮지 않고,
+        // 배열 끝에 붙는다. remap 은 그 root 의 revision 들에도 그대로 적용해야 한다
+        // (trg_obs_matches_root 가 둘의 일치를 요구한다).
+        // 입력 순서에 결과가 의존하면 같은 dump 를 두 번 넣었을 때 배열 순서가 달라진다.
+        // (entity_id, projection_order, root_id) 로 정렬해 결정론을 만든다.
+        const incomingRoots = [...(data.observation_roots ?? [])].sort((a, b) =>
+          String(a.entity_id).localeCompare(String(b.entity_id)) ||
+          (a.projection_order - b.projection_order) ||
+          String(a.root_id).localeCompare(String(b.root_id)));
+
+        const remappedOrder = new Map<string, number>();
+        for (const r of incomingRoots) {
+          const cur = this.db!.prepare(`SELECT * FROM observation_roots WHERE root_id = ?`)
+            .get(r.root_id) as any;
+          if (cur) {
+            // projection_order 는 **target-local** 속성이다: merge 는 배열 위치를
+            // 이 DB 기준으로 재배정하므로, 이미 remap 된 root 를 같은 dump 로 다시
+            // 넣으면 dump 의 옛 순번과 다를 수밖에 없다. 그걸 충돌로 보면 동일
+            // 재수입이 실패한다(advisor beta r3 발견 3, 실행 재현).
+            if (!sameRow(cur, r, ['entity_id', 'created_at']))
+              throw new Error(`import conflict: observation_roots ${r.root_id} differs from the existing row`);
+            remappedOrder.set(r.root_id, cur.projection_order);
+            continue;
+          }
+          let order = r.projection_order;
+          const taken = this.db!.prepare(
+            `SELECT root_id FROM observation_roots WHERE entity_id = ? AND projection_order = ?`)
+            .get(r.entity_id, order) as { root_id: string } | undefined;
+          if (taken) {
+            order = nextProjectionOrder(this.db!, r.entity_id);
+            remappedOrder.set(r.root_id, order);
+            remapReport.push({ root_id: r.root_id, entity_id: r.entity_id,
+                               from: r.projection_order, to: order });
+            console.error(
+              `  ├─ ↪️ import: ${r.entity_id} position ${r.projection_order} is held by ` +
+              `${taken.root_id}; appending imported observation at ${order}`);
+          }
+          this.db!.prepare(`INSERT INTO observation_roots
+            (root_id, entity_id, projection_order, created_at) VALUES (?, ?, ?, ?)`)
+            .run(r.root_id, r.entity_id, order, r.created_at);
+        }
+
+        // projection_order 는 root 와 같은 이유로 비교 대상이 아니다(target-local).
+        const revCols = ['root_id','entity_id','revision_no','content',
+                         'status','supersedes_id','recorded_at','superseded_at'];
+        const revs = [...(data.entity_observations ?? [])]
+          .sort((a, b) => a.root_id === b.root_id
+            ? a.revision_no - b.revision_no
+            : String(a.root_id).localeCompare(String(b.root_id)));
+        for (const v of revs) {
+          const cur = this.db!.prepare(`SELECT * FROM entity_observations WHERE observation_id = ?`)
+            .get(v.observation_id) as any;
+          if (cur) {
+            if (!sameRow(cur, v, revCols))
+              throw new Error(`import conflict: entity_observations ${v.observation_id} differs from the existing row`);
+            continue;
+          }
+          const order = remappedOrder.has(v.root_id)
+            ? remappedOrder.get(v.root_id)! : v.projection_order;
+          this.db!.prepare(`INSERT INTO entity_observations
+            (observation_id, root_id, entity_id, revision_no, projection_order,
+             content, status, supersedes_id, recorded_at, superseded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(v.observation_id, v.root_id, v.entity_id, v.revision_no, order,
+                 v.content, v.status, v.supersedes_id ?? null, v.recorded_at, v.superseded_at ?? null);
+        }
+
+        for (const so of (data.observation_sources ?? [])) {
+          const cur = this.db!.prepare(`SELECT * FROM observation_sources
+            WHERE observation_id=? AND source_kind=? AND source_ref=?`)
+            .get(so.observation_id, so.source_kind, so.source_ref) as any;
+          if (cur) {
+            if (!sameRow(cur, so, ['source_hash', 'recorded_at']))
+              throw new Error(`import conflict: observation_sources ` +
+                `${so.observation_id}/${so.source_kind}/${so.source_ref} differs from the existing row`);
+            continue;
+          }
+          this.db!.prepare(`INSERT INTO observation_sources
+            (observation_id, source_kind, source_ref, source_hash, recorded_at) VALUES (?, ?, ?, ?, ?)`)
+            .run(so.observation_id, so.source_kind, so.source_ref, so.source_hash ?? null, so.recorded_at);
+        }
+
+        const evCols = ['root_id','from_id','to_id','event','change_kind','reason','actor','batch_id','recorded_at'];
+        for (const e of (data.observation_events ?? [])) {
+          const cur = this.db!.prepare(`SELECT * FROM observation_events WHERE event_id = ?`)
+            .get(e.event_id) as any;
+          if (cur) {
+            if (!sameRow(cur, e, evCols))
+              throw new Error(`import conflict: observation_events ${e.event_id} differs from the existing row`);
+            continue;
+          }
+          this.db!.prepare(`INSERT INTO observation_events
+            (event_id, root_id, from_id, to_id, event, change_kind, reason, actor, batch_id, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(e.event_id, e.root_id, e.from_id ?? null, e.to_id ?? null, e.event,
+                 e.change_kind ?? null, e.reason ?? null, e.actor ?? null, e.batch_id ?? null, e.recorded_at);
+        }
+      });
+      tx();
+    } else {
+      // 구(舊) 형식 export: lifecycle 필드가 없으므로 entities.observations 를
+      // 신규 root 로 승격한다. legacy import 필수 필드값 = spec §6.4.
+      const ts = new Date().toISOString();
+      const tx = this.db!.transaction(() => {
+        for (const ent of (data.entities ?? [])) {
+          const entityId = ent.id ??
+            `entity_${String(ent.name).toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
+          for (const content of (ent.observations ?? [])) {
+            addRevision(this.db!, {
+              entityId, content, status: 'active',
+              sources: [{ source_kind: 'import', source_ref: 'legacy-export', source_hash: null }],
+              actor: 'import', ts, event: 'import'
+            });
+          }
+        }
+      });
+      tx();
+    }
+
+    // projection 재합성 + 파생 상태 무효화.
+    // 무효화가 없으면 이미 있던 entity 를 덮어쓴 뒤에도 옛 벡터·옛 KG chunk 가
+    // 검색에 남는다. import 는 관찰을 바꾸는 writer 이므로 다른 writer 와 같은
+    // 계약을 져야 한다(advisor beta 발견 2).
+    //
+    // 대상은 `data.entities` 가 아니라 **영향받은 entity 전부**다. lifecycle import 는
+    // observation_roots 만 있어도 활성화되므로, entities 없이 lifecycle 배열만 보내면
+    // revision 은 들어가는데 projection 이 갱신되지 않아 새 사실이 reader 에 안 보이고
+    // 옛 벡터가 남는다(advisor beta r3 발견 2, 실행 재현).
+    const affected = new Set<string>();
+    for (const ent of (data.entities ?? [])) {
+      affected.add(ent.id ??
+        `entity_${String(ent.name).toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`);
+    }
+    for (const r of (data.observation_roots ?? [])) if (r.entity_id) affected.add(r.entity_id);
+    for (const v of (data.entity_observations ?? [])) if (v.entity_id) affected.add(v.entity_id);
+    for (const entityId of affected) {
+      rebuildProjection(this.db!, entityId);
+      this.invalidateDerivedForEntity(entityId);
+    }
+    });
+    importAll();
+
     console.error(`✅ Import completed: ${imported.entities} entities, ${imported.relations} relations, ${imported.documents} documents imported`);
 
     // Indirect missing-row producer (spec §5): imported rows may lack vectors.
     this.coordinator?.invalidateCoverage();
     this.coordinator?.kick();
-    return { imported, skipped };
+    return { imported, skipped, observation_order_remap: remapReport };
   }
 
   async hybridSearch(query: string, limit = 5, useGraph = true): Promise<{
@@ -3714,11 +4193,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
     switch (name) {
       // Original MCP tools
       case "createEntities":
-        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.createEntities((validatedArgs as any).entities as Entity[]), null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.createEntities((validatedArgs as any).entities as Array<Entity & { status?: 'active' | 'provisional'; sources?: SourceInput[] }>), null, 2) }] };
       case "createRelations":
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.createRelations((validatedArgs as any).relations as Relation[]), null, 2) }] };
       case "addObservations":
-        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.addObservations((validatedArgs as any).observations as { entityName: string; contents: string[] }[]), null, 2) }] };
+        // v13: status·sources 를 그대로 넘긴다. 여기서 떨어뜨리면 스키마가 받아도
+        // 엔진에 도달하지 않아 provenance 가 조용히 사라진다.
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.addObservations((validatedArgs as any).observations as { entityName: string; contents: string[]; status?: 'active' | 'provisional'; sources?: SourceInput[] }[]), null, 2) }] };
+
+      // v13 observation lifecycle (spec §6.1 / §6.2)
+      case "correctObservation":
+        return { content: [{ type: "text", text: JSON.stringify({ observation_id: await ragKgManager.correctObservation(
+          (validatedArgs as any).observation_id as string,
+          (validatedArgs as any).content as string,
+          (validatedArgs as any).change_kind ?? 'correction',
+          (validatedArgs as any).reason
+        ) }, null, 2) }] };
+      case "retractObservation":
+        await ragKgManager.retractObservation((validatedArgs as any).observation_id as string, (validatedArgs as any).reason);
+        return { content: [{ type: "text", text: JSON.stringify({ observation_id: (validatedArgs as any).observation_id, status: 'retracted' }, null, 2) }] };
+      case "restoreObservation":
+        await ragKgManager.restoreObservation((validatedArgs as any).observation_id as string, (validatedArgs as any).reason);
+        return { content: [{ type: "text", text: JSON.stringify({ observation_id: (validatedArgs as any).observation_id, status: 'active' }, null, 2) }] };
+      case "approveObservation":
+        await ragKgManager.approveObservation((validatedArgs as any).observation_id as string, (validatedArgs as any).reason);
+        return { content: [{ type: "text", text: JSON.stringify({ observation_id: (validatedArgs as any).observation_id, status: 'active' }, null, 2) }] };
+      case "declineObservation":
+        await ragKgManager.declineObservation((validatedArgs as any).observation_id as string, (validatedArgs as any).reason as string);
+        return { content: [{ type: "text", text: JSON.stringify({ observation_id: (validatedArgs as any).observation_id, status: 'retracted' }, null, 2) }] };
+      case "purgeObservation":
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.purgeObservation((validatedArgs as any).observation_id as string, (validatedArgs as any).confirm as string), null, 2) }] };
+      case "getObservationHistory":
+        return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.getObservationHistory({
+          entity_name: (validatedArgs as any).entity_name,
+          observation_id: (validatedArgs as any).observation_id,
+          root_id: (validatedArgs as any).root_id,
+        }), null, 2) }] };
+
       case "deleteEntities":
         await ragKgManager.deleteEntities((validatedArgs as any).entityNames as string[]);
         return { content: [{ type: "text", text: "Entities deleted successfully" }] };

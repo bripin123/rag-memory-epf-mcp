@@ -1,4 +1,18 @@
 import { Migration } from './migration-manager.js';
+import { OBSERVATION_SCHEMA_SQL } from '../observations/schema.js';
+import { randomUUID } from 'node:crypto';
+
+// v13 변환의 단계 경계에서 의도적으로 실패시키는 지점. 마이그레이션이 정말로
+// all-or-nothing 인지는 각 경계에서 끊어 봐야만 알 수 있다(spec §8.2 T11).
+//
+// 환경변수가 아니라 명시적 setter 인 이유: 환경변수는 프로덕션 경로에 상시
+// 존재하는 스위치가 되고, 오설정 한 줄이 마이그레이션을 깨서 .bak 을 남기고
+// 그 .bak 이 재시작을 막는다. 이 setter 는 dist 를 import 한 테스트만 부를 수 있다.
+export type MigrationFaultPoint = 'preflight' | 'roots' | 'revisions' | 'sources' | 'gate';
+let faultPoint: MigrationFaultPoint | null = null;
+export function setMigrationFaultPoint(point: MigrationFaultPoint | null): void {
+  faultPoint = point;
+}
 
 export const migrations: Migration[] = [
   {
@@ -685,6 +699,118 @@ export const migrations: Migration[] = [
       db.exec(`DROP TABLE IF EXISTS embedding_backfill_failures`);
       db.exec(`DROP TABLE IF EXISTS embedding_profiles`);
       db.exec(`DROP TABLE IF EXISTS server_meta`);
+    }
+  },
+
+  // v13 (spec 2026-07-30 observation-lifecycle §4): 관찰 생애주기 정규화.
+  // 이 항목은 DDL 만 만든다. 데이터 변환은 후속 단계에서 같은 항목에 덧붙인다.
+  {
+    version: 13,
+    description: 'Observation lifecycle: roots/revisions/sources/events + immutability triggers',
+    up: (db) => {
+      db.exec(OBSERVATION_SCHEMA_SQL);
+
+      // ---- spec §5.3 변환 ----
+      // MIGRATION_TS = 이 DB 의 v12->v13 트랜잭션 시작시각 하나 (전 행 공유).
+      // entities.created_at 을 복사하지 않는다 — 그것은 entity 생성시각을
+      // 관찰 기록시각으로 단정하는 것이고, import event 는 실제로 지금 발생했다.
+      // 원래 관찰 시각은 unknown 으로 둔다 (v13 은 기록시간 축만 다룬다).
+      const MIGRATION_TS = new Date().toISOString();
+      const BATCH_ID = randomUUID();
+
+      // 단계 경계 fault injection. 주입은 setMigrationFaultPoint() 로만 하며
+      // 환경변수를 보지 않는다 — 환경변수로 두면 프로덕션에 "마이그레이션을 깨는
+      // 스위치"가 상시 존재하고, 오설정 한 줄이 .bak 을 남겨 재시작을 막는다
+      // (advisor beta 자기의심 2 = "더 나쁘다").
+      const fault = (point: string) => {
+        if (faultPoint === point) throw new Error(`injected fault at '${point}' (test-only)`);
+      };
+
+      // 1) 읽기 전용 preflight: array<string> 검증.
+      //    JSON.parse 만으로는 객체·숫자·null 요소가 통과한다.
+      const rows = db.prepare(`SELECT id, observations FROM entities`).all() as
+        Array<{ id: string; observations: string }>;
+      const parsed = new Map<string, string[]>();
+      for (const r of rows) {
+        let val: unknown;
+        try { val = JSON.parse(r.observations ?? '[]'); }
+        catch { throw new Error(`v13 preflight: entity ${r.id} observations is not JSON`); }
+        if (!Array.isArray(val))
+          throw new Error(`v13 preflight: entity ${r.id} observations is not an array<string>`);
+        for (const el of val) {
+          if (typeof el !== 'string')
+            throw new Error(`v13 preflight: entity ${r.id} observations contains a non-string ` +
+                            `element (${el === null ? 'null' : typeof el}) — array<string> required`);
+        }
+        parsed.set(r.id, val as string[]);
+      }
+      fault('preflight');
+
+      // 2~4) roots -> revisions -> sources/events.
+      //      이 순서가 계약이다: trg_obs_matches_root 가 root 선행을 요구한다.
+      //      3패스로 나눈 이유 = 지점별 fault injection 을 검증 가능하게 하려면
+      //      단계 경계가 실제로 존재해야 한다(T11).
+      const insRoot = db.prepare(`INSERT INTO observation_roots
+        (root_id, entity_id, projection_order, created_at) VALUES (?, ?, ?, ?)`);
+      const insRev = db.prepare(`INSERT INTO entity_observations
+        (observation_id, root_id, entity_id, revision_no, projection_order,
+         content, status, supersedes_id, recorded_at, superseded_at)
+        VALUES (?, ?, ?, 1, ?, ?, 'active', NULL, ?, NULL)`);
+      const insSrc = db.prepare(`INSERT INTO observation_sources
+        (observation_id, source_kind, source_ref, source_hash, recorded_at)
+        VALUES (?, 'import', 'v12-migration', NULL, ?)`);
+      const insEv = db.prepare(`INSERT INTO observation_events
+        (event_id, root_id, from_id, to_id, event, change_kind, reason, actor, batch_id, recorded_at)
+        VALUES (?, ?, NULL, ?, 'import', NULL, NULL, 'v12-migration', ?, ?)`);
+
+      // pass 1: roots
+      type Plan = { entityId: string; rootId: string; obsId: string; order: number; content: string };
+      const plan: Plan[] = [];
+      for (const [entityId, arr] of parsed) {
+        arr.forEach((content, order) => {
+          const rootId = randomUUID();
+          insRoot.run(rootId, entityId, order, MIGRATION_TS);
+          plan.push({ entityId, rootId, obsId: randomUUID(), order, content });
+        });
+      }
+      fault('roots');
+
+      // pass 2: revisions
+      for (const p of plan) insRev.run(p.obsId, p.rootId, p.entityId, p.order, p.content, MIGRATION_TS);
+      fault('revisions');
+
+      // pass 3: sources + events
+      for (const p of plan) {
+        insSrc.run(p.obsId, MIGRATION_TS);
+        insEv.run(randomUUID(), p.rootId, p.obsId, BATCH_ID, MIGRATION_TS);
+      }
+      fault('sources');
+
+      // 6) 검증 게이트 (a): FK 무결성.
+      //    FK 가 켜져 있어도 방어층으로 확인한다.
+      const fkBad = db.prepare(`PRAGMA foreign_key_check`).all();
+      if (fkBad.length > 0)
+        throw new Error(`v13 gate: foreign_key_check reported ${fkBad.length} violation(s)`);
+      fault('gate');
+
+      // 7) 검증 게이트 (b): 합성 배열 == 원본 배열 (중복·순서 포함 byte 동일)
+      const synthStmt = db.prepare(`SELECT content FROM entity_observations
+        WHERE entity_id = ? AND status = 'active' ORDER BY projection_order`);
+      for (const [entityId, arr] of parsed) {
+        const rebuilt = JSON.stringify(
+          (synthStmt.all(entityId) as Array<{ content: string }>).map(x => x.content));
+        const original = JSON.stringify(arr);
+        if (rebuilt !== original)
+          throw new Error(`v13 gate: projection mismatch for entity ${entityId}\n` +
+                          `  original: ${original}\n  rebuilt:  ${rebuilt}`);
+      }
+    },
+    down: (db) => {
+      // 역순 삭제 (FK 의존 순서). 트리거는 테이블과 함께 사라진다.
+      db.exec(`DROP TABLE IF EXISTS observation_events`);
+      db.exec(`DROP TABLE IF EXISTS observation_sources`);
+      db.exec(`DROP TABLE IF EXISTS entity_observations`);
+      db.exec(`DROP TABLE IF EXISTS observation_roots`);
     }
   }
 ];
