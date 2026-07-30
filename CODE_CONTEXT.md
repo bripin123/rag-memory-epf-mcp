@@ -1,0 +1,179 @@
+# CODE_CONTEXT.md — rag-memory-epf-mcp
+
+> Curated SSOT for coding conventions in this repo. Read before writing or modifying code.
+> Not generated: every claim here was measured against the tree, not inferred. Update it when a
+> pattern changes, and say what you measured.
+>
+> This repo has no markdown frontmatter and no commit trailers. Do not introduce either.
+
+---
+
+## 1. Architecture
+
+Single MCP stdio server. One SQLite file per project is the whole persistence layer — there is no
+external service, no daemon, no second store.
+
+```
+index.ts                        ~4,200 lines. The engine class + the MCP server, one file.
+  class RAGKnowledgeGraphManager   all engine behaviour (writers, readers, search, documents)
+  server.setRequestHandler(ListToolsRequestSchema)   tool listing  (~4063)
+  server.setRequestHandler(CallToolRequestSchema)    one switch, one case per tool  (~4070)
+
+src/observations/               v13 observation lifecycle
+  schema.ts       OBSERVATION_SCHEMA_SQL — the DDL string shared by migration and tests
+  lifecycle.ts    addRevision · correctRevision · transitionStatus · linkSources · recordEvent
+  projection.ts   rebuildProjection (active rows -> entities.observations) · deleteStaleKgChunks
+  history.ts      getObservationHistory — the only surface that returns non-active revisions
+
+src/migrations/
+  migrations.ts         the migration list. Each entry = { version, description, up, down }
+  migration-manager.ts  applies them in order and records schema_migrations
+
+src/tools/              MCP tool *declarations* only (no behaviour)
+  knowledge-graph-tools.ts · rag-tools.ts · graph-query-tools.ts
+  graph-analytics-tools.ts · migration-tools.ts
+  tool-registry.ts      allTools = spread of the five groups; convertToMCPTool; validateToolArgs
+  types.ts              ToolDefinition · ToolCapabilityInfo · ToolRegistrationDescription
+
+src/backup/preflight.ts   pre-migration backup (VACUUM INTO) + verify + refuse-if-exists
+src/embeddingGate.ts      embedding admission control
+src/backfillCoordinator.ts  background embedding backfill
+src/modelCache.ts         version-independent model cache (v3.6)
+src/chunkText.ts          document chunking
+
+test/*.test.mjs           plain node scripts. No framework. They import ../dist/index.js.
+```
+
+### Tables (13)
+
+`entities` · `relationships` · `documents` · `chunk_metadata` · `chunk_entities` ·
+`entity_embedding_metadata` · `embedding_profiles` · `embedding_backfill_failures` ·
+`server_meta` · and the v13 lifecycle four: `observation_roots` · `entity_observations` ·
+`observation_sources` · `observation_events`.
+
+Vectors live in sqlite-vec `vec0` virtual tables (`entity_embeddings`, chunk embeddings), fixed
+at **1024 dimensions** (`index.ts` fails fast on a mismatch). FTS5 provides BM25.
+
+### Adding a tool — all four edits are required
+
+1. `src/tools/<group>-tools.ts` — capability + description + zod schema + `export const xTool`
+2. the group's export map at the bottom of that file
+3. `index.ts` `CallToolRequestSchema` switch — a `case "x":` that calls the manager method
+4. `README.md` tool count and the group list
+
+Skipping (3) makes the tool listable but uncallable. Skipping (2) makes it invisible. Both fail
+silently — there is no test that cross-checks the registry against the switch.
+
+---
+
+## 2. Patterns
+
+**Entity id derivation.** Always
+`` `entity_${name.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}` ``. The `u` flag and `\p{L}`
+matter: Korean entity names are normal here. Do not write a new variant of this expression —
+there are already several copies, and they must stay identical.
+
+**Every observation mutation goes through `mutateEntityAndInvalidate(entityId, mutate)`**
+(`index.ts:450`). It runs `mutate()` inside one transaction and then, **only if `mutate()` did not
+return `false`**, rebuilds the projection, invalidates the entity vector, and drops stale KG
+chunks. Returning `false` means *nothing changed*.
+
+> This is not optional bookkeeping. Invalidating without re-embedding leaves an entity with no
+> vector and no queue entry — search quality silently degrades and no test cries. A writer that
+> may be a no-op (empty input, dedup-only, relation endpoint check) **must** report it.
+
+**Re-embedding happens after the transaction, never inside it**, and only when the helper reported
+a change: `if (changed) await this.tryEmbedEntity(entityId, 'bulk')`.
+
+**Dedup adds evidence, not revisions.** If the date-stripped content already exists as an `active`
+revision, do not insert; link the incoming sources to the existing `observation_id` and push `null`
+into the returned `observation_ids`. Build the lookup as `Map<bareContent, observation_id>` — do
+not try to strip the `[YYYY-MM-DD]` prefix in SQL.
+
+**Integrity is enforced by SQLite, not by code.** Triggers, partial UNIQUE indexes and
+`CHECK (typeof(x) = ...)` carry the invariants. When you add a rule, add it to the DDL in
+`schema.ts`, not to a TypeScript guard — a guard only covers the paths that call it.
+
+**Trigger message order is a contract.** BEFORE-INSERT triggers fire top to bottom, and tests
+assert on the message text. Reordering `SELECT RAISE(...)` statements changes which error a given
+bad row produces.
+
+**Tool declarations carry no logic.** `src/tools/*` is descriptions and zod schemas; behaviour is a
+manager method. Keep it that way — `validateToolArgs` is the only bridge.
+
+---
+
+## 3. Conventions
+
+- **ESM only.** `"module": "ESNext"`, `.js` extensions in relative imports (`'./src/x.js'`) even
+  though the sources are `.ts`. `require()` throws `ERR_AMBIGUOUS_MODULE_SYNTAX`.
+- **`strict: true`.** `this.db` is nullable; the established idiom is a guard
+  (`if (!this.db) throw new Error('Database not initialized')`) at the top of a public method and
+  `this.db!` inside nested closures.
+- Naming: `camelCase` methods, `snake_case` SQL columns and table names, `SCREAMING_SNAKE` for
+  exported SQL/DDL constants, `kebab-case.ts` filenames in `src/`, `kebab-case.test.mjs` in `test/`.
+- Column names cross the API boundary as-is (`observation_id`, `revision_no`, `projection_order`).
+  Do not camelCase them on the way out — export/import round-trips compare rows directly.
+- Comments explain **why**, in the imperative, and cite the spec section or the review finding when
+  one exists. Existing v13 comments are the reference for tone.
+- Commit messages: `type(scope): summary`, then a body of prose paragraphs explaining the reasoning.
+  Conventional-commit types, `!` for breaking. **No trailers.**
+
+---
+
+## 4. Constraints
+
+- **`npm test` = `build → verify:invariants → verify:engine`.** Tests import `dist/`, so testing
+  without building verifies the previous compile.
+- **Never pipe the verification command.** `npm test | tail` and `| tee` both swallow the exit
+  code in zsh (`PIPESTATUS` comes back empty). Redirect to a file and check `$?` separately.
+- **Every new `test/*.test.mjs` must be appended to `verify:engine` in `package.json`.** Nothing
+  discovers test files; an unwired test never runs again.
+- **`PRAGMA foreign_keys` cannot be toggled inside a transaction** — it is a silent no-op there
+  (measured: `before=1 · during=1 · after=1`). Anything relying on FK CASCADE must assume FK is on
+  from boot.
+- `INTEGER NOT NULL` is **not** type enforcement in SQLite (`'2x'` inserts fine) — pair it with
+  `CHECK (typeof(col) = 'integer')`.
+- `TEXT PRIMARY KEY` **permits NULL** in SQLite — write `NOT NULL` explicitly.
+- Embedding dimension is **1024, fixed**. Changing the model means a migration, not a config edit.
+- Use `VACUUM INTO` for synchronous copies. `db.backup()` returns a Promise and does not fit the
+  synchronous migration flow.
+- Node **>= 24** (`engines`). Published to npm as `rag-memory-epf-mcp`; **31 projects consume it**,
+  so a schema or tool-contract change is a fleet event, not a local one.
+- A migration must be all-or-nothing: one transaction, and gates (`PRAGMA foreign_key_check`, plus
+  a byte-exact projection comparison) inside it before it commits.
+- **A fail-closed guard that blocks the normal path is not a guard.** The backup preflight learned
+  this by breaking re-initialisation on a fresh database.
+
+---
+
+## 5. Tech Stack Quick Reference
+
+TypeScript 5.6 (ES2022, ESM) · better-sqlite3 12 · sqlite-vec 0.1 · FTS5 ·
+`@modelcontextprotocol/sdk` 1.27 · `@huggingface/transformers` (Xenova/bge-m3, 1024d) ·
+graphology (+ communities-louvain, metrics, shortest-path) · tiktoken · zod 3 ·
+tests = `node:assert/strict` in `.test.mjs`, no runner.
+
+---
+
+## 6. Common Tasks
+
+| Task | Where |
+|---|---|
+| Add a migration | `src/migrations/migrations.ts` — new `{ version, description, up, down }`; DDL goes in a shared constant if a test needs it |
+| Add an MCP tool | the four edits in §1 |
+| Change observation behaviour | `src/observations/lifecycle.ts` + the calling writer in `index.ts`, always inside `mutateEntityAndInvalidate` |
+| Add a test | new `test/*.test.mjs` + wire into `verify:engine` |
+| Verify | `cd ~/Development/rag-memory-epf-mcp && npm test > /tmp/t.log 2>&1; echo "EXIT:$?"` |
+
+---
+
+## 7. File References
+
+- `src/observations/schema.ts` — the DDL, and the clearest statement of the v13 invariants
+- `index.ts:450` `mutateEntityAndInvalidate` — the transaction contract every writer obeys
+- `src/tools/knowledge-graph-tools.ts` `addObservationsTool` — the tool-declaration template
+- `test/observation-schema.test.mjs` — how to test a trigger, including isolated-schema controls
+- `docs/UPDATING.md` — version-update reliability runbook (v3.6)
+- Design spec and plan for v13 live in the framework repo, not here:
+  `RAGMemory-Claude-memory-management-and-optimised-workflow/docs/superpowers/{specs,plans}/2026-07-30-*`
