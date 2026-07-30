@@ -35,7 +35,7 @@ src/tools/              MCP tool *declarations* only (no behaviour)
   tool-registry.ts      allTools = spread of the five groups; convertToMCPTool; validateToolArgs
   types.ts              ToolDefinition · ToolCapabilityInfo · ToolRegistrationDescription
 
-src/backup/preflight.ts   pre-migration backup (VACUUM INTO) + verify + verified reuse (never overwrite)
+src/backup/preflight.ts   pre-migration backup (VACUUM INTO) + logicalDigest/digestSections + reuse-if-state-identical (never overwrite)
 src/embeddingGate.ts      embedding admission control
 src/backfillCoordinator.ts  background embedding backfill
 src/modelCache.ts         version-independent model cache (v3.6)
@@ -153,6 +153,10 @@ manager method. Keep it that way — `validateToolArgs` is the only bridge.
   a byte-exact projection comparison) inside it before it commits.
 - **A fail-closed guard that blocks the normal path is not a guard.** The backup preflight learned
   this by breaking re-initialisation on a fresh database.
+- **Do not hash a vec0 or FTS5 virtual table's rows.** A virtual table is a view over its shadow
+  tables, and an unconstrained full scan is not stable across connection modes — the same state
+  hashed differently from a read-write and a read-only handle. Hash the shadow tables (`*_data`,
+  `*_vector_chunks00`, `*_rowids`), which are ordinary tables and hold the actual bytes.
 
 ---
 

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
+import * as sqliteVec from 'sqlite-vec';
 
 process.env.RAG_MEMORY_NO_AUTOSTART = '1';
 
@@ -371,6 +372,77 @@ console.log('  OK: T11 fault injection (5 points: rollback, backup retained, res
   rmSync(A.dir, { recursive: true, force: true });
   rmSync(B.dir, { recursive: true, force: true });
   console.log('  OK: cloned DB — identical state reusable, diverged state refused');
+}
+
+// --- 행은 같고 스키마 객체만 빠진 백업은 거부한다 ---
+// 이게 r5 의 P0 였다: `DROP TABLE embedding_profiles` 한 백업이 quick_check ok +
+// digest 동일로 승인됐고, 복원 후 부팅이 `no such table: embedding_profiles` 로 죽었다.
+// 행만 해시하면 스키마 topology 가 검사 밖에 남는다.
+{
+  const { dir: d, dbPath } = await makeV12Db({ SchemaGap: ['s1'] });
+  const migMod = await import(`../dist/src/migrations/migrations.js`);
+  migMod.setMigrationFaultPoint('roots');
+  try { const m = await reopen(dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
+  migMod.setMigrationFaultPoint(null);
+  const bakName = readdirSync(d).find(f => f.endsWith('.bak'));
+  assert.ok(bakName, 'no backup produced');
+  const bakPath = join(d, bakName);
+
+  // 행은 그대로 두고 부팅에 필요한 테이블 하나만 없앤다
+  const bak = new Database(bakPath);
+  const before = bak.prepare(`SELECT COUNT(*) c FROM entities`).get().c;
+  bak.exec(`DROP TABLE embedding_profiles`);
+  assert.equal(bak.prepare(`SELECT COUNT(*) c FROM entities`).get().c, before,
+    'probe must not change any row');
+  assert.equal(bak.pragma('quick_check', { simple: true }), 'ok',
+    'probe must leave a structurally valid SQLite file (that is the point)');
+  bak.close();
+
+  let err = null;
+  try { const m = await reopen(dbPath); m.cleanup?.(); } catch (e) { err = String(e.message); }
+  assert.ok(err, 'a backup missing a required table was accepted as a recovery point');
+  assert.match(err, /logical state differs/i, `unexpected error: ${err}`);
+  rmSync(d, { recursive: true, force: true });
+  console.log('  OK: backup missing a schema object refused (rows alone are not the state)');
+}
+
+// --- metadata stamp 는 같고 벡터 바이트만 다른 백업도 거부한다 ---
+// "벡터는 파생이라 제외해도 된다"가 틀린 이유: backfill 은 벡터의 **존재**와 stamp 만
+// 보고 바이트를 검증하지 않으므로, 이 상태는 승인된 뒤에도 재생성되지 않는다(r5 P1).
+{
+  const { dir: d, dbPath } = await makeV12Db({ VecDrift: ['v1'] });
+  // live 에 벡터를 심는다
+  const live = new Database(dbPath);
+  sqliteVec.load(live);
+  live.prepare(`INSERT OR REPLACE INTO entity_embedding_metadata (rowid, entity_id, embedding_text)
+                VALUES (1, 'entity_vecdrift', 'v1')`).run();
+  live.prepare(`INSERT OR REPLACE INTO entity_embeddings (rowid, embedding) VALUES (1, ?)`)
+    .run(Buffer.from(new Float32Array(1024).fill(0.01).buffer));
+  live.close();
+
+  const migMod = await import(`../dist/src/migrations/migrations.js`);
+  migMod.setMigrationFaultPoint('roots');
+  try { const m = await reopen(dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
+  migMod.setMigrationFaultPoint(null);
+  const bakName = readdirSync(d).find(f => f.endsWith('.bak'));
+  assert.ok(bakName, 'no backup produced');
+
+  // 백업의 벡터 바이트만 바꾼다 — metadata stamp 는 건드리지 않는다
+  const bak = new Database(join(d, bakName));
+  sqliteVec.load(bak);
+  const stampBefore = bak.prepare(`SELECT * FROM entity_embedding_metadata WHERE rowid=1`).get();
+  bak.prepare(`UPDATE entity_embeddings SET embedding = ? WHERE rowid = 1`)
+    .run(Buffer.from(new Float32Array(1024).fill(0.09).buffer));
+  assert.deepEqual(bak.prepare(`SELECT * FROM entity_embedding_metadata WHERE rowid=1`).get(),
+    stampBefore, 'probe must leave the metadata stamp identical');
+  bak.close();
+
+  let err = null;
+  try { const m = await reopen(dbPath); m.cleanup?.(); } catch (e) { err = String(e.message); }
+  assert.ok(err, 'a backup whose vector bytes differ was accepted (backfill will not fix it)');
+  assert.match(err, /logical state differs/i, `unexpected error: ${err}`);
+  rmSync(d, { recursive: true, force: true });
+  console.log('  OK: differing vector bytes refused (same stamp is not the same state)');
 }
 
 // --- server_meta 가 없는 구 버전 DB 도 재사용이 된다 ---
