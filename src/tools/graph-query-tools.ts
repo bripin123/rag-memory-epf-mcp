@@ -602,7 +602,8 @@ Supports both merge (additive) and replace (clear + import) modes.
 - Replace mode provides clean import without conflicts
 - Handles partial imports (entities only, relations only, etc.)
 - Reports imported and skipped counts for verification
-- Supports full export format from exportGraph
+- Supports the full exportGraph format, including the v13 observation lifecycle tables
+  (revision history, provenance and events survive a round-trip)
 </features>
 
 <bestPractices>
@@ -632,7 +633,22 @@ const importGraphSchema: z.ZodRawShape = {
     entities: z.array(z.any()).optional().describe('Array of entity objects to import'),
     relations: z.array(z.any()).optional().describe('Array of relation objects to import'),
     documents: z.array(z.any()).optional().describe('Array of document objects to import'),
-  }).describe('Object containing entities, relations, and/or documents arrays to import'),
+    // v13: 이 네 배열이 스키마에 없으면 z.object().parse() 가 조용히 버린다. 그러면
+    // exportGraph 가 낸 완전한 dump 를 MCP 로 되돌릴 때 revision history·provenance·
+    // event log 가 전부 사라지고 legacy 관찰로 재생성된다 — 백업/복원이 조용히
+    // 손실 연산이 된다(advisor beta 발견 1, MCP 왕복으로 실측).
+    observation_roots: z.array(z.any()).optional()
+      .describe('Array of observation root rows (v13 lifecycle). Required to preserve history on restore'),
+    entity_observations: z.array(z.any()).optional()
+      .describe('Array of observation revision rows (v13 lifecycle)'),
+    observation_sources: z.array(z.any()).optional()
+      .describe('Array of observation provenance rows (v13 lifecycle)'),
+    observation_events: z.array(z.any()).optional()
+      .describe('Array of observation event rows (v13 lifecycle)'),
+  // passthrough: dump 는 `metadata` 같은 정상 키를 더 갖고 있고 앞으로 더 늘어난다.
+  // strict 면 실제 dump 를 거부하고, 기본 strip 이면 모르는 테이블을 조용히 버린다
+  // (그게 lifecycle 4배열에서 실제로 일어난 일이다). 통과시켜 manager 가 판단하게 둔다.
+  }).passthrough().describe('A graph dump as produced by exportGraph, including the v13 observation lifecycle tables'),
   merge: z.boolean().optional().default(true).describe('If true (default), merge with existing data. If false, clear existing data first.'),
 };
 

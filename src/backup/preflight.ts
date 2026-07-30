@@ -39,11 +39,25 @@ export function backupBeforeMigration(
 
   const target = `${dbPath}.v${currentVersion}.bak`;
 
-  // 기존 backup 절대 overwrite 금지 (spec §5.1-3)
+  // 기존 backup 은 절대 overwrite 하지 않는다 (spec §5.1-3). 다만 "존재하면 거부"는
+  // 너무 강했다: 마이그레이션이 한 번 실패하면 .bak 이 남고, 그 뒤 모든 재시작이
+  // 마이그레이션에 진입하기도 전에 죽는다 = fleet 자동 재시작 환경에서 영구 crashloop
+  // 이고, spec 의 crash 후 resume 요구와 정면으로 충돌한다(advisor beta 발견 3).
+  //
+  // 필요한 보장은 "지금의 pre-migration 상태에 대한 유효한 복구점이 존재한다"이고,
+  // 남아 있는 .bak 이 (a) 온전하고 (b) 이 DB 와 같은 스키마 버전이면 그 보장은
+  // 이미 충족된다 — 새로 만들 이유가 없고, 덮어쓸 이유도 없다. 그래서 **검증 후
+  // 재사용**한다. 검증에 실패하면 그때는 거부한다(그건 진짜 사람이 봐야 하는 상태다).
   if (existsSync(target)) {
-    throw new Error(
-      `migration backup refused: ${target} already exists. ` +
-      `Move or remove it deliberately — overwriting it would destroy the only recovery point.`);
+    const reused = verifyExistingBackup(target, currentVersion);
+    if (!reused.ok) {
+      throw new Error(
+        `migration backup refused: ${target} already exists but is not a usable recovery point ` +
+        `(${reused.reason}). Move or remove it deliberately — overwriting it would destroy ` +
+        `whatever it does contain.`);
+    }
+    console.error(`  ├─ 🛟 reusing verified backup ${target} (schema v${currentVersion})`);
+    return { path: target, sha256: reused.sha256 };
   }
 
   // SQLite backup API. 동기 완료를 보장하려면 VACUUM INTO 가 더 단순하고
@@ -63,18 +77,52 @@ export function backupBeforeMigration(
   }
 
   if (statSync(target).size === 0) throw new Error('migration backup is empty');
-  // 스트리밍 해시. readFileSync 로 전체를 메모리에 올리면 fleet 의 큰 DB 에서
-  // OOM 위험이 있다(advisor 구현리뷰 r1 발견 6).
-  const sha256 = (() => {
-    const h = createHash('sha256');
-    const fd = openSync(target, 'r');
-    try {
-      const buf = Buffer.allocUnsafe(1 << 20);
-      let n: number;
-      while ((n = readSync(fd, buf, 0, buf.length, null)) > 0) h.update(buf.subarray(0, n));
-    } finally { closeSync(fd); }
-    return h.digest('hex');
-  })();
+  const sha256 = streamSha256(target);
   console.error(`  ├─ 🛟 backup ${target} (sha256 ${sha256.slice(0, 12)}…)`);
   return { path: target, sha256 };
+}
+
+// 스트리밍 해시. readFileSync 로 전체를 메모리에 올리면 fleet 의 큰 DB 에서
+// OOM 위험이 있다(advisor 구현리뷰 r1 발견 6).
+function streamSha256(path: string): string {
+  const h = createHash('sha256');
+  const fd = openSync(path, 'r');
+  try {
+    const buf = Buffer.allocUnsafe(1 << 20);
+    let n: number;
+    while ((n = readSync(fd, buf, 0, buf.length, null)) > 0) h.update(buf.subarray(0, n));
+  } finally { closeSync(fd); }
+  return h.digest('hex');
+}
+
+// 남아 있는 .bak 이 이 DB 의 pre-migration 복구점으로 쓸 수 있는가.
+// 파일명이 이미 버전을 담고 있으므로(.vN.bak) 내부 버전이 N 과 다르면 그 파일은
+// 이 자리에 있을 이유가 없다 = 사람이 봐야 하는 상태다.
+function verifyExistingBackup(
+  target: string, expectedVersion: number
+): { ok: true; sha256: string } | { ok: false; reason: string } {
+  try {
+    if (statSync(target).size === 0) return { ok: false, reason: 'zero bytes' };
+    const db = new Database(target, { readonly: true });
+    try {
+      const ok = db.pragma('quick_check', { simple: true });
+      if (ok !== 'ok') return { ok: false, reason: `quick_check ${ok}` };
+      const n = db.prepare(`SELECT COUNT(*) c FROM sqlite_master`).get() as { c: number };
+      if (!n || n.c === 0) return { ok: false, reason: 'empty schema' };
+      const hasVersions = db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'`).get();
+      const v = hasVersions
+        ? (db.prepare(`SELECT COALESCE(MAX(version), 0) v FROM schema_migrations`)
+            .get() as { v: number }).v
+        : 0;
+      if (v !== expectedVersion) {
+        return { ok: false, reason: `holds schema v${v}, expected v${expectedVersion}` };
+      }
+    } finally {
+      db.close();
+    }
+    return { ok: true, sha256: streamSha256(target) };
+  } catch (e) {
+    return { ok: false, reason: `unreadable: ${(e as Error).message}` };
+  }
 }

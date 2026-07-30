@@ -5,6 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
+// entity_embeddings 는 vec0 가상 테이블이라 raw 연결에도 확장을 로드해야 읽힌다.
+import * as sqliteVec from 'sqlite-vec';
+const openRo = (p) => { const d = new Database(p, { readonly: true }); sqliteVec.load(d); return d; };
 
 const REAL = process.env.RAG_MEMORY_REALDATA_DB;
 if (!REAL || !existsSync(REAL)) {
@@ -18,7 +21,7 @@ const work = join(dir, 'copy.db');
 copyFileSync(REAL, work);
 
 // 사전 상태
-const pre = new Database(work, { readonly: true });
+const pre = openRo(work);
 const preVersion = pre.prepare(`SELECT COALESCE(MAX(version), 0) v FROM schema_migrations`).get().v;
 assert.ok(preVersion < 13,
   `fixture is already at schema v${preVersion} — this test needs a pre-v13 copy to prove anything`);
@@ -28,6 +31,16 @@ const totalChars = before.reduce((n, r) => n + (r.observations?.length ?? 0), 0)
 const preEmbeddings = pre.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata`).get().c;
 const preRelations = pre.prepare(`SELECT COUNT(*) c FROM relationships`).get().c;
 const preChunks = pre.prepare(`SELECT COUNT(*) c FROM chunk_metadata`).get().c;
+// 벡터는 metadata 개수만 세면 "행은 남았는데 벡터가 사라진" 상태를 통과시킨다.
+// join 실수와 벡터 본문까지 지문으로 잡는다(advisor beta 발견 5).
+const preVectorJoin = pre.prepare(
+  `SELECT COUNT(*) c FROM entity_embedding_metadata m
+   JOIN entity_embeddings v ON v.rowid = m.rowid`).get().c;
+const preVectorFingerprint = pre.prepare(
+  `SELECT COUNT(*) n, SUM(LENGTH(v.embedding)) bytes, SUM(m.rowid) rowsum
+   FROM entity_embedding_metadata m JOIN entity_embeddings v ON v.rowid = m.rowid`).get();
+const preHashes = pre.prepare(
+  `SELECT entity_id, input_hash FROM entity_embedding_metadata ORDER BY entity_id`).all();
 pre.close();
 console.log(`  fixture: schema v${preVersion}, ${entityCount} entities, ${totalChars} observation chars`);
 
@@ -40,12 +53,24 @@ const db = mgr.db;
 // 0) 마이그레이션이 실제로 v13 까지 갔다
 assert.equal(db.prepare(`SELECT MAX(version) v FROM schema_migrations`).get().v, 13, 'not at v13');
 
-// 1) 전 entity 의 projection 이 원본과 byte 동일
+// 1) 전 entity 의 projection 이 원본과 동일하다.
+//    두 층으로 본다: 배열 요소가 정확히 같은가(의미) + 원본 raw 문자열과 byte 동일한가.
+//    후자는 원본이 JSON.stringify 정규형이 아닐 수 있어 별도로 세고 보고한다 —
+//    "byte 동일"이라고 주장하려면 정규화한 쪽과 비교해서는 안 된다(advisor beta 발견 5).
+let rawIdentical = 0, normalizedOnly = 0;
 for (const r of before) {
   const now = db.prepare(`SELECT observations FROM entities WHERE id=?`).get(r.id).observations;
-  assert.equal(now, JSON.stringify(JSON.parse(r.observations ?? '[]')),
-    `projection mismatch for ${r.id}`);
+  const orig = r.observations ?? '[]';
+  assert.deepEqual(JSON.parse(now), JSON.parse(orig), `projection content mismatch for ${r.id}`);
+  if (now === orig) rawIdentical++;
+  else {
+    normalizedOnly++;
+    assert.equal(now, JSON.stringify(JSON.parse(orig)),
+      `projection is neither byte-identical nor the JSON normal form for ${r.id}`);
+  }
 }
+console.log(`  projection: ${rawIdentical} byte-identical to the raw column, ` +
+            `${normalizedOnly} equal after JSON normalisation (element-wise deepEqual for all)`);
 
 // 2) 관찰 총수 == root 총수 == revision 총수 == source 총수 == import event 총수
 const arrTotal = before.reduce((n, r) => n + JSON.parse(r.observations ?? '[]').length, 0);
@@ -64,14 +89,27 @@ assert.equal(db.pragma('quick_check', { simple: true }), 'ok', 'quick_check');
 // 4) 인접 자산 무손실 — 마이그레이션은 관찰만 건드린다.
 //    특히 entity 벡터를 죽이면 검색 품질만 조용히 깎이므로 어떤 기능 테스트도 안 운다.
 assert.equal(db.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata`).get().c, preEmbeddings,
-  'entity embeddings were destroyed by the migration');
+  'entity embedding metadata rows were destroyed by the migration');
+// metadata 행 수만으로는 "행은 남고 벡터만 사라진" 상태를 못 잡는다 — join·바이트·hash 로 본다
+assert.equal(db.prepare(
+  `SELECT COUNT(*) c FROM entity_embedding_metadata m
+   JOIN entity_embeddings v ON v.rowid = m.rowid`).get().c, preVectorJoin,
+  'a metadata row lost its vector (row survived, embedding did not)');
+const postVectorFingerprint = db.prepare(
+  `SELECT COUNT(*) n, SUM(LENGTH(v.embedding)) bytes, SUM(m.rowid) rowsum
+   FROM entity_embedding_metadata m JOIN entity_embeddings v ON v.rowid = m.rowid`).get();
+assert.deepEqual(postVectorFingerprint, preVectorFingerprint,
+  'vector bytes or rowid mapping changed — the stored embeddings are not the same ones');
+assert.deepEqual(db.prepare(
+  `SELECT entity_id, input_hash FROM entity_embedding_metadata ORDER BY entity_id`).all(), preHashes,
+  'embedding provenance hashes changed, so the backfill will consider vectors stale');
 assert.equal(db.prepare(`SELECT COUNT(*) c FROM relationships`).get().c, preRelations, 'relations changed');
 assert.equal(db.prepare(`SELECT COUNT(*) c FROM chunk_metadata`).get().c, preChunks, 'chunks changed');
 
 // 5) 검증된 백업이 남아 있다
 const baks = readdirSync(dir).filter(f => f.endsWith('.bak'));
 assert.equal(baks.length, 1, `expected exactly one backup, got ${JSON.stringify(baks)}`);
-const bak = new Database(join(dir, baks[0]), { readonly: true });
+const bak = openRo(join(dir, baks[0]));
 assert.equal(bak.prepare(`SELECT COUNT(*) c FROM entities`).get().c, entityCount,
   'backup does not hold the pre-migration entity set');
 assert.ok(!bak.prepare(`SELECT 1 FROM sqlite_master WHERE name='entity_observations'`).get(),

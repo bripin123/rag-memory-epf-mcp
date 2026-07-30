@@ -174,6 +174,145 @@ async function freshManager() {
   console.log('  OK: T17 import conflict parameterized (+T17b whole-import atomicity)');
 }
 
+// --- MCP 왕복: validateToolArgs -> dispatch -> manager 가 lifecycle 을 보존하는가 ---
+// 위의 T16/T17 은 manager.importGraph() 를 직접 부르므로 MCP 검증 층을 우회한다.
+// 그 사각에서 실제 P0 이 살아 있었다: importGraph 스키마에 lifecycle 4배열이 없어
+// z.object().parse() 가 조용히 버리고, 완전한 dump 가 legacy 관찰로 재생성됐다
+// (advisor beta 발견 1). 이제 검증 층을 통과시켜 대조한다.
+{
+  const { validateToolArgs } = await import('../dist/src/tools/tool-registry.js');
+
+  const dump = await mgr.exportGraph();
+  const validated = validateToolArgs('importGraph', { data: dump, merge: true });
+  for (const k of ['observation_roots', 'entity_observations', 'observation_sources', 'observation_events']) {
+    assert.ok(Array.isArray(validated.data[k]),
+      `MCP validation dropped ${k} — a full dump cannot survive the tool boundary`);
+    assert.equal(validated.data[k].length, dump[k].length, `MCP validation truncated ${k}`);
+  }
+
+  // 그리고 그 검증된 인자로 실제 import 하면 history 가 남는가
+  const { m: m2, d: d2 } = await freshManager();
+  await m2.importGraph(validated.data, { merge: validated.merge !== false });
+  const revs = m2.db.prepare(`SELECT COUNT(*) c FROM entity_observations`).get().c;
+  const supers = m2.db.prepare(`SELECT COUNT(*) c FROM entity_observations WHERE status='superseded'`).get().c;
+  const legacy = m2.db.prepare(
+    `SELECT COUNT(*) c FROM observation_sources WHERE source_ref='legacy-export'`).get().c;
+  assert.equal(revs, dump.entity_observations.length, 'MCP round-trip lost revisions');
+  assert.ok(supers >= 1, 'MCP round-trip lost the superseded revision (history flattened)');
+  assert.equal(legacy, 0, 'MCP round-trip re-created observations as legacy imports');
+  m2.cleanup?.();
+  rmSync(d2, { recursive: true, force: true });
+  process.env.DB_FILE_PATH = join(dir, 'test.db');
+  console.log('  OK: MCP round-trip preserves lifecycle (validateToolArgs -> manager)');
+}
+
+// --- 구 형식 dump 는 event='import' 로 승격된다 (spec §6.4) ---
+{
+  const { m, d } = await freshManager();
+  await m.importGraph({ entities: [{ id: 'entity_legacy', name: 'Legacy',
+    entityType: 'CONCEPT', observations: ['legacy fact'] }] });
+  const ev = m.db.prepare(`SELECT event, actor FROM observation_events`).all();
+  assert.equal(ev.length, 1, 'legacy import must record exactly one event');
+  assert.equal(ev[0].event, 'import',
+    `legacy import recorded event='${ev[0].event}' — history would claim a human added it now`);
+  assert.equal(ev[0].actor, 'import');
+  m.cleanup?.();
+  rmSync(d, { recursive: true, force: true });
+  process.env.DB_FILE_PATH = join(dir, 'test.db');
+  console.log('  OK: legacy import records event=import');
+}
+
+// --- import 는 파생 상태를 무효화한다 (비어 있지 않은 target + KG chunk) ---
+// 앞의 왕복 테스트는 전부 **빈 새 DB** 로 import 한다. 그래서 "이미 있는 entity 를
+// 덮어쓸 때 옛 벡터·옛 KG chunk 가 남는다"는 P0 을 전부 통과시켰다
+// (advisor beta 발견 2, hybridSearch 로 실측). 여기서는 target 을 채워서 대조한다.
+for (const merge of [true, false]) {
+  const STALE = 'zzstaleimportzz';
+  const { m, d } = await freshManager();
+  await m.createEntities([{ name: 'ImportTarget', entityType: 'CONCEPT',
+                           observations: [`old fact ${STALE}`] }]);
+  // KG chunk 는 dormant 경로라 자연 발생하지 않는다 — 명시로 만든다.
+  await m.generateKnowledgeGraphChunks();
+  const idb = m.db;
+  const chunksBefore = idb.prepare(
+    `SELECT COUNT(*) c FROM chunk_metadata WHERE chunk_type='entity' AND entity_id='entity_importtarget'`).get().c;
+  assert.ok(chunksBefore > 0, 'positive control: no entity chunk was created, the oracle proves nothing');
+  assert.ok(idb.prepare(`SELECT COUNT(*) c FROM chunk_metadata WHERE text LIKE '%'||?||'%'`)
+    .get(STALE).c > 0, 'positive control: the stale token is not in any chunk');
+  // 임베딩 metadata 를 심어 벡터 무효화 여부를 관찰 가능하게 만든다
+  idb.prepare(`INSERT OR REPLACE INTO entity_embedding_metadata (entity_id, embedding_text)
+               VALUES ('entity_importtarget', ?)`).run(`old fact ${STALE}`);
+
+  // 같은 entity 를 다른 내용으로 가진 dump
+  const { m: src, d: sd } = await freshManager();
+  await src.createEntities([{ name: 'ImportTarget', entityType: 'CONCEPT', observations: ['fresh only'] }]);
+  const freshDump = await src.exportGraph();
+  src.cleanup?.(); rmSync(sd, { recursive: true, force: true });
+
+  await m.importGraph(freshDump, { merge });
+
+  const proj = JSON.parse(idb.prepare(
+    `SELECT observations FROM entities WHERE id='entity_importtarget'`).get().observations);
+  assert.ok(proj.some(o => o.includes('fresh only')), `merge=${merge}: projection not updated`);
+  if (merge) {
+    // merge 는 더하기다: 들어온 관찰은 **다른** 논리 관찰이므로 배열 끝에 붙고
+    // 기존 관찰은 살아 있어야 한다. 같은 배열 위치를 요구하는 슬롯 충돌은
+    // 순번 재배정으로 해결한다(옛것을 덮으면 merge 가 아니라 replace 다).
+    assert.ok(proj.some(o => o.includes(STALE)),
+      'merge=true dropped an existing observation — that is replace semantics, not merge');
+    assert.equal(proj.length, 2, `merge=true: expected both observations, got ${JSON.stringify(proj)}`);
+    const orders = idb.prepare(
+      `SELECT projection_order FROM observation_roots WHERE entity_id='entity_importtarget'
+       ORDER BY projection_order`).all().map(r => r.projection_order);
+    assert.deepEqual(orders, [0, 1], `merge=true: projection_order not reallocated: ${orders}`);
+    // root 와 revision 의 순번이 어긋나면 trg_obs_matches_root 가 잡아야 한다 — 어긋남 0 확인
+    assert.equal(idb.prepare(
+      `SELECT COUNT(*) c FROM entity_observations o JOIN observation_roots r USING(root_id)
+       WHERE o.projection_order <> r.projection_order`).get().c, 0,
+      'merge=true: revision projection_order drifted from its root');
+  } else {
+    assert.ok(!proj.some(o => o.includes(STALE)),
+      'merge=false: the cleared observation came back');
+    assert.equal(proj.length, 1, `merge=false: expected only the imported observation`);
+  }
+
+  const staleChunks = idb.prepare(
+    `SELECT COUNT(*) c FROM chunk_metadata WHERE text LIKE '%'||?||'%'`).get(STALE).c;
+  assert.equal(staleChunks, 0,
+    `merge=${merge}: a stale KG chunk survived the import and stays searchable`);
+  const staleMeta = idb.prepare(
+    `SELECT COUNT(*) c FROM entity_embedding_metadata WHERE entity_id='entity_importtarget'`).get().c;
+  assert.equal(staleMeta, 0,
+    `merge=${merge}: the entity vector was not invalidated, so search keeps the old embedding`);
+
+  m.cleanup?.();
+  rmSync(d, { recursive: true, force: true });
+  process.env.DB_FILE_PATH = join(dir, 'test.db');
+}
+console.log('  OK: import invalidates derived state (merge true/false, non-empty target)');
+
+// --- 계약: 알 수 없는 인자 거부 + history 선택자 정확히 하나 ---
+{
+  const { validateToolArgs } = await import('../dist/src/tools/tool-registry.js');
+
+  // v3.6 의 index 기반 지정이 조용히 무시되면 호출자는 엉뚱한 revision 이
+  // 처리됐다는 사실을 모른다 (spec T6, advisor beta 발견 4-1)
+  assert.throws(() => validateToolArgs('retractObservation', { observation_id: 'x', index: 0 }),
+    /unrecognized|unknown/i, 'old index field must be rejected, not stripped');
+  assert.throws(() => validateToolArgs('correctObservation',
+    { observation_id: 'x', content: 'y', observation_index: 0 }),
+    /unrecognized|unknown/i, 'old observation_index must be rejected');
+  // 정상 인자는 통과한다 (strict 가 정상 경로를 막지 않는다)
+  assert.deepEqual(validateToolArgs('retractObservation', { observation_id: 'x' }),
+    { observation_id: 'x' }, 'strict must not reject a valid call');
+
+  assert.throws(() => getObservationHistory(db, { entity_name: 'Hist', root_id: 'missing' }),
+    /exactly one selector/i,
+    'two selectors must be rejected — precedence silently answers a different question');
+  assert.throws(() => getObservationHistory(db, {}), /requires one of/);
+  console.log('  OK: strict tool args + history one-of');
+}
+
 mgr.cleanup?.();
 rmSync(dir, { recursive: true, force: true });
 console.log('observation-contracts: ALL OK');

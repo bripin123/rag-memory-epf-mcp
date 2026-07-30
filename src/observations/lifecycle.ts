@@ -45,11 +45,15 @@ export function linkSources(db: Database.Database, observationId: string,
   return n;
 }
 
-// 새 논리 관찰 = root 1 + rev1 1 + sources N + add event 1.
+// 새 논리 관찰 = root 1 + rev1 1 + sources N + event 1.
+// event 는 기본 'add' 지만 legacy import 경로는 'import' 를 남겨야 한다(spec §6.4):
+// 그 관찰은 사람이 방금 추가한 것이 아니라 옛 형식 dump 에서 승격된 것이고,
+// 'add' 로 적으면 history 가 유입 경로를 잘못 말한다(advisor beta 발견 1).
 export function addRevision(db: Database.Database, a: {
   entityId: string; content: string;
   status: Extract<ObsStatus, 'active' | 'provisional'>;
   sources?: SourceInput[]; actor?: string | null; ts: string;
+  event?: Extract<ObsEvent, 'add' | 'import'>;
 }): string {
   const rootId = randomUUID();
   const obsId = randomUUID();
@@ -69,7 +73,8 @@ export function addRevision(db: Database.Database, a: {
   // (advisor 구현리뷰 r1 발견 5). unknown 은 0행으로 표현한다.
   if (a.sources?.length) linkSources(db, obsId, a.sources, a.ts);
 
-  recordEvent(db, { rootId, event: 'add', toId: obsId, actor: a.actor ?? null, ts: a.ts });
+  recordEvent(db, { rootId, event: a.event ?? 'add', toId: obsId,
+                    actor: a.actor ?? null, ts: a.ts });
   return obsId;
 }
 

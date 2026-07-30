@@ -1,10 +1,10 @@
 {
   "name": "rag-memory-epf-mcp",
-  "version": "3.7.0",
+  "version": "4.0.0",
   "engines": {
     "node": ">=24"
   },
-  "description": "Project-local RAG memory MCP server — knowledge graph + multilingual vector + FTS5 in a single SQLite file. Per-project isolation, 30 MCP tools, codepoint-safe chunking (Korean/CJK/emoji).",
+  "description": "Project-local RAG memory MCP server — knowledge graph + multilingual vector + FTS5 in a single SQLite file. Per-project isolation, 38 MCP tools, codepoint-safe chunking (Korean/CJK/emoji).",
   "keywords": [
     "mcp",
     "model-context-protocol",

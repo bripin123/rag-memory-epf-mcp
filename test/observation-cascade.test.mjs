@@ -92,12 +92,12 @@ rmSync(dir, { recursive: true, force: true });
   const d2 = mkdtempSync(join(tmpdir(), 'rag-obs-fk0-'));
   const p = join(d2, 'test.db');
   process.env.DB_FILE_PATH = p;
-  process.env.RAG_MEMORY_FORCE_FK_OFF = '1';   // 테스트 전용 주입 훅
   const { RAGKnowledgeGraphManager: M } = await import('../dist/index.js?fk=0');
   const m = new M();
   let threw = null;
-  try { await m.initialize({ skipModel: true }); } catch (e) { threw = String(e.message); }
-  delete process.env.RAG_MEMORY_FORCE_FK_OFF;
+  // 주입은 인자로만 한다 — 환경변수 스위치는 프로덕션 부팅을 막을 수 있어 제거됐다.
+  try { await m.initialize({ skipModel: true, __testForceFkOff: true }); }
+  catch (e) { threw = String(e.message); }
   assert.ok(threw, 'T25 negative: boot succeeded with FK off');
   assert.match(threw, /foreign_keys/i, 'T25 negative: unclear error');
   // 게이트가 마이그레이션·버전 기록 *앞*에 있었는가

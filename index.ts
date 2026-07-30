@@ -31,7 +31,7 @@ import { MigrationManager } from './src/migrations/migration-manager.js';
 import { backupBeforeMigration } from './src/backup/preflight.js';
 import { rebuildProjection, deleteStaleKgChunks } from './src/observations/projection.js';
 import { addRevision, correctRevision, transitionStatus, linkSources,
-         type SourceInput } from './src/observations/lifecycle.js';
+         nextProjectionOrder, type SourceInput } from './src/observations/lifecycle.js';
 import { getObservationHistory } from './src/observations/history.js';
 
 // Import chunk text algorithm (extracted for publish-time invariant testing)
@@ -247,7 +247,10 @@ export class RAGKnowledgeGraphManager {
   // v3.6 (spec §3): initialize = DB + migrations + profile only. The embedding
   // model is NEVER awaited here — main() connects the MCP server first and the
   // gate loads in the background (lazy) or is awaited explicitly (eager).
-  async initialize(opts: { skipModel?: boolean; gate?: EmbeddingGate } = {}) {
+  // __testForceFkOff: 음성 대조군 전용. FK 게이트가 실제로 부팅을 막는지 시험한다.
+  // 이름에 __test 를 박아 둔 이유는 이것이 프로덕션 설정 표면이 아니라는 것을
+  // 호출부에서 읽히게 하기 위해서다.
+  async initialize(opts: { skipModel?: boolean; gate?: EmbeddingGate; __testForceFkOff?: boolean } = {}) {
     console.error('🚀 Initializing RAG Knowledge Graph MCP Server...');
 
     this.db = new Database(DB_FILE_PATH);
@@ -265,7 +268,12 @@ export class RAGKnowledgeGraphManager {
     // 전에(= runMigrations 앞에서) 멈춘다.
     // 트랜잭션 내부에서는 이 pragma 가 no-op 이므로(실측 before=1·during=1·after=1)
     // 부팅 시점 확인이 유일한 방어 지점이다.
-    if (process.env.RAG_MEMORY_FORCE_FK_OFF === '1') this.db.pragma('foreign_keys = OFF'); // test-only
+    //
+    // 음성 대조군 주입은 **인자로만** 받는다. 환경변수로 두면 프로덕션 경로에
+    // "부팅을 막는 스위치"가 상시 존재하게 되고, 오설정 한 줄로 서버가 안 뜬다
+    // (advisor beta 자기의심 2 = "더 나쁘다"). 테스트는 manager 를 직접 만들므로
+    // 인자 주입으로 충분하다.
+    if (opts.__testForceFkOff) this.db.pragma('foreign_keys = OFF');
     {
       const fk = this.db.pragma('foreign_keys', { simple: true });
       if (Number(fk) !== 1) {
@@ -468,17 +476,29 @@ export class RAGKnowledgeGraphManager {
       changed = mutate() !== false;
       if (!changed) return;
       rebuildProjection(this.db!, entityId);
-      const meta = this.db!.prepare(`SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?`)
-        .get(entityId) as { rowid: number } | undefined;
-      if (meta) {
-        this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(meta.rowid)}`);
-        this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`).run(entityId);
-      }
-      deleteStaleKgChunks(this.db!, entityId);
+      this.invalidateDerivedForEntity(entityId);
     });
     tx();
     if (changed) this.coordinator?.invalidateCoverage();
     return changed;
+  }
+
+  // 관찰이 바뀐 entity 의 파생 상태를 무효화한다: entity vector + stale KG chunk.
+  // **트랜잭션을 열지 않는다** — 호출자가 이미 하나의 단위 안에 있다고 가정한다.
+  //
+  // importGraph 가 이 단계를 건너뛰고 있었다: projection 만 재합성하고 파생 상태를
+  // 그대로 둬서, 이미 존재하는 entity 를 import 로 덮으면 옛 벡터·옛 KG chunk 가
+  // 계속 검색에 나왔다(advisor beta 발견 2, hybridSearch 로 실측 재현).
+  // 그래서 "모든 관찰 변경은 mutateEntityAndInvalidate 를 통한다"는 규칙에
+  // 예외가 하나 있었고, 그 예외가 정확히 그 규칙이 막으려던 결함을 만들었다.
+  private invalidateDerivedForEntity(entityId: string): void {
+    const meta = this.db!.prepare(`SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?`)
+      .get(entityId) as { rowid: number } | undefined;
+    if (meta) {
+      this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(meta.rowid)}`);
+      this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`).run(entityId);
+    }
+    deleteStaleKgChunks(this.db!, entityId);
   }
 
   // §6a-1 invariant: when an entity's embedding input changed but re-embedding
@@ -2953,6 +2973,21 @@ export class RAGKnowledgeGraphManager {
       this.db!.exec(`DELETE FROM observation_roots`);
       this.db!.exec(`DELETE FROM entities`);
       this.db!.exec(`DELETE FROM documents`);
+      // entities 를 지워도 파생 데이터는 따라오지 않는다: chunk_metadata 에는
+      // entities 로 가는 FK 가 없고 entity_embedding_metadata.entity_id 는 UNIQUE 일
+      // 뿐이다. 그래서 replace-import 뒤에 **사라진 entity 의 벡터와 KG chunk 가
+      // 검색에 남았다**(advisor beta 발견 2). document chunk 는 documents 의
+      // CASCADE 로 이미 정리되므로 여기서는 entity·relationship chunk 만 지운다.
+      const orphanChunks = this.db!.prepare(
+        `SELECT rowid FROM chunk_metadata WHERE chunk_type IN ('entity','relationship')`)
+        .all() as Array<{ rowid: number }>;
+      for (const c of orphanChunks) {
+        this.db!.exec(`DELETE FROM chunks WHERE rowid = ${Number(c.rowid)}`);
+        this.db!.prepare(`DELETE FROM chunk_metadata WHERE rowid = ?`).run(c.rowid);
+      }
+      this.db!.exec(
+        `DELETE FROM entity_embeddings WHERE rowid IN (SELECT rowid FROM entity_embedding_metadata)`);
+      this.db!.exec(`DELETE FROM entity_embedding_metadata`);
       console.error('🗑️ Cleared existing data for full import');
     }
 
@@ -3037,6 +3072,14 @@ export class RAGKnowledgeGraphManager {
     const hasLifecycle = Array.isArray(data.observation_roots);
     if (hasLifecycle) {
       const tx = this.db!.transaction(() => {
+        // 새 root 가 이미 점유된 (entity_id, projection_order) 슬롯을 요구할 수 있다:
+        // 두 DB 가 같은 entity 이름을 갖고 서로 다른 관찰을 배열 0번에 두면 그렇다.
+        // 이건 §6.4 의 "같은 키 다른 값" 충돌이 아니라 **슬롯 충돌**이고, 규칙이 없어서
+        // raw UNIQUE 오류로 터졌다(내 MCP 왕복 테스트가 잡았다). merge 의 뜻은
+        // "더한다"이므로 들어오는 root 에 다음 빈 순번을 준다 — 남의 관찰을 덮지 않고,
+        // 배열 끝에 붙는다. remap 은 그 root 의 revision 들에도 그대로 적용해야 한다
+        // (trg_obs_matches_root 가 둘의 일치를 요구한다).
+        const remappedOrder = new Map<string, number>();
         for (const r of (data.observation_roots ?? [])) {
           const cur = this.db!.prepare(`SELECT * FROM observation_roots WHERE root_id = ?`)
             .get(r.root_id) as any;
@@ -3045,9 +3088,20 @@ export class RAGKnowledgeGraphManager {
               throw new Error(`import conflict: observation_roots ${r.root_id} differs from the existing row`);
             continue;
           }
+          let order = r.projection_order;
+          const taken = this.db!.prepare(
+            `SELECT root_id FROM observation_roots WHERE entity_id = ? AND projection_order = ?`)
+            .get(r.entity_id, order) as { root_id: string } | undefined;
+          if (taken) {
+            order = nextProjectionOrder(this.db!, r.entity_id);
+            remappedOrder.set(r.root_id, order);
+            console.error(
+              `  ├─ ↪️ import: ${r.entity_id} position ${r.projection_order} is held by ` +
+              `${taken.root_id}; appending imported observation at ${order}`);
+          }
           this.db!.prepare(`INSERT INTO observation_roots
             (root_id, entity_id, projection_order, created_at) VALUES (?, ?, ?, ?)`)
-            .run(r.root_id, r.entity_id, r.projection_order, r.created_at);
+            .run(r.root_id, r.entity_id, order, r.created_at);
         }
 
         const revCols = ['root_id','entity_id','revision_no','projection_order','content',
@@ -3064,11 +3118,13 @@ export class RAGKnowledgeGraphManager {
               throw new Error(`import conflict: entity_observations ${v.observation_id} differs from the existing row`);
             continue;
           }
+          const order = remappedOrder.has(v.root_id)
+            ? remappedOrder.get(v.root_id)! : v.projection_order;
           this.db!.prepare(`INSERT INTO entity_observations
             (observation_id, root_id, entity_id, revision_no, projection_order,
              content, status, supersedes_id, recorded_at, superseded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-            .run(v.observation_id, v.root_id, v.entity_id, v.revision_no, v.projection_order,
+            .run(v.observation_id, v.root_id, v.entity_id, v.revision_no, order,
                  v.content, v.status, v.supersedes_id ?? null, v.recorded_at, v.superseded_at ?? null);
         }
 
@@ -3116,7 +3172,7 @@ export class RAGKnowledgeGraphManager {
             addRevision(this.db!, {
               entityId, content, status: 'active',
               sources: [{ source_kind: 'import', source_ref: 'legacy-export', source_hash: null }],
-              actor: 'import', ts
+              actor: 'import', ts, event: 'import'
             });
           }
         }
@@ -3124,11 +3180,15 @@ export class RAGKnowledgeGraphManager {
       tx();
     }
 
-    // projection 재합성: import 된 entity 전부.
+    // projection 재합성 + 파생 상태 무효화: import 된 entity 전부.
+    // 무효화가 없으면 이미 있던 entity 를 덮어쓴 뒤에도 옛 벡터·옛 KG chunk 가
+    // 검색에 남는다. import 는 관찰을 바꾸는 writer 이므로 다른 writer 와 같은
+    // 계약을 져야 한다(advisor beta 발견 2).
     for (const ent of (data.entities ?? [])) {
       const entityId = ent.id ??
         `entity_${String(ent.name).toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
       rebuildProjection(this.db!, entityId);
+      this.invalidateDerivedForEntity(entityId);
     }
     });
     importAll();

@@ -187,7 +187,11 @@ export function validateToolArgs<T>(toolName: string, args: any): T {
     throw new Error(`Unknown tool: ${toolName}`);
   }
   
-  const schema = z.object(toolDef.schema);
+  // strict: 알 수 없는 최상위 인자는 거부한다. 기본 strip 은 오래된 호출자를
+  // **조용히** 통과시킨다 — v3.6 의 index 기반 관찰 지정(`{observation_id, index}`,
+  // `{observation_index}`)이 아무 오류 없이 무시되고, 호출자는 자기가 지정한
+  // revision 이 아닌 다른 것이 처리됐다는 사실을 모른다(spec T6, advisor beta 발견 4-1).
+  const schema = z.object(toolDef.schema).strict();
   return schema.parse(args) as T;
 }
 

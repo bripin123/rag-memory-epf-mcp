@@ -210,10 +210,13 @@ console.log('  OK: T4 array<string> preflight (5 cases)');
 // --- T11: 각 지점 fault injection -> 전체 rollback (commit 전이므로 부분 잔존 불허) ---
 for (const at of ['preflight', 'roots', 'revisions', 'sources', 'gate']) {
   const { dir: d, dbPath } = await makeV12Db({ Fault: ['f1', 'f2'] });
-  process.env.RAG_MEMORY_FAULT_AT = at;
+  // 주입은 dist 의 명시적 setter 로만 한다. 같은 모듈 인스턴스를 reopen 이 쓰도록
+  // 쿼리 파라미터를 맞춰 import 한다.
+  const migMod = await import(`../dist/src/migrations/migrations.js`);
+  migMod.setMigrationFaultPoint(at);
   let threw = null;
   try { const m = await reopen(dbPath); m.cleanup?.(); } catch (e) { threw = String(e.message); }
-  delete process.env.RAG_MEMORY_FAULT_AT;
+  migMod.setMigrationFaultPoint(null);
   assert.ok(threw, `T11: fault at '${at}' did not fail the migration`);
   assert.match(threw, new RegExp(`injected fault at '${at}'`),
     `T11: fault at '${at}' failed for the wrong reason: ${threw}`);
@@ -238,18 +241,42 @@ for (const at of ['preflight', 'roots', 'revisions', 'sources', 'gate']) {
   const baks = readdirSync(d).filter(f => f.endsWith('.bak'));
   assert.equal(baks.length, 1, `T11: backup missing after fault at '${at}': ${JSON.stringify(baks)}`);
 
-  // 그리고 그 .bak 때문에 재시도가 fail-closed 된다 = 의도된 설계다(운영자가 확인해야
-  // 한다). 여기서 고정하는 이유는 이 성질이 fleet 에서 눈에 보이는 결과이기 때문이다:
-  // 자동 재시작 루프가 이 오류로 계속 죽는다.
-  process.env.RAG_MEMORY_FAULT_AT = '';
-  let retryErr = null;
-  try { const m2 = await reopen(dbPath); m2.cleanup?.(); } catch (e) { retryErr = String(e.message); }
-  assert.ok(retryErr, `T11: retry after fault at '${at}' silently proceeded past the stale backup`);
-  assert.match(retryErr, /backup refused|already exists/i,
-    `T11: retry failed for an unexpected reason: ${retryErr}`);
+  // **재시작이 가능해야 한다.** 예전 구현은 남은 .bak 때문에 마이그레이션 진입 전에
+  // 죽어서, 한 번의 일시적 실패가 fleet 자동 재시작 환경을 영구 정지시켰다
+  // (advisor beta 발견 3). 이제는 남은 .bak 을 검증하고 재사용한다.
+  const before = readdirSync(d).filter(f => f.endsWith('.bak'));
+  const m2 = await reopen(dbPath);          // fault 해제 상태 = 정상 재시도
+  const db2 = m2.db;
+  assert.equal(db2.prepare(`SELECT MAX(version) v FROM schema_migrations`).get().v, 13,
+    `T11: retry after fault at '${at}' did not complete the migration`);
+  assert.deepEqual(JSON.parse(db2.prepare(
+    `SELECT observations FROM entities WHERE id='entity_fault'`).get().observations), ['f1', 'f2'],
+    `T11: retry after fault at '${at}' lost the observations`);
+  m2.cleanup?.();
+  // 그리고 원래 스냅샷을 덮어쓰거나 늘리지 않았다
+  assert.deepEqual(readdirSync(d).filter(f => f.endsWith('.bak')), before,
+    `T11: retry changed the backup set after fault at '${at}'`);
 
   rmSync(d, { recursive: true, force: true });
 }
-console.log('  OK: T11 fault injection (5 points, rollback + backup retained + fail-closed retry)');
+console.log('  OK: T11 fault injection (5 points: rollback, backup retained, restart resumes)');
+
+// --- 손상된 .bak 은 재사용하지 않는다 (재사용 정책이 검증을 건너뛰면 게이트가 사라진다) ---
+{
+  const { dir: d, dbPath } = await makeV12Db({ Corrupt: ['c1'] });
+  const migMod = await import(`../dist/src/migrations/migrations.js`);
+  migMod.setMigrationFaultPoint('roots');
+  try { const m = await reopen(dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
+  migMod.setMigrationFaultPoint(null);
+  const bak = readdirSync(d).find(f => f.endsWith('.bak'));
+  assert.ok(bak, 'backup was not created');
+  writeFileSync(join(d, bak), 'not a sqlite file at all');
+  let err = null;
+  try { const m2 = await reopen(dbPath); m2.cleanup?.(); } catch (e) { err = String(e.message); }
+  assert.ok(err, 'a corrupt backup must not be silently reused');
+  assert.match(err, /not a usable recovery point/i, `unexpected error: ${err}`);
+  rmSync(d, { recursive: true, force: true });
+  console.log('  OK: corrupt backup refused (reuse is verified, not assumed)');
+}
 
 console.log('observation-migration: ALL OK');

@@ -23,11 +23,22 @@ const db = mgr.db;
 
   const has = (payload) => JSON.stringify(payload).includes(SENTINEL);
 
+  // hybridSearch 도 포함한다. 관찰이 chunk 검색에 닿는 경로(KG chunk)는 dormant 라
+  // 자연 발생하지 않지만, generateKnowledgeGraphChunks() 를 명시로 부르면 정상
+  // positive control 이 만들어진다. 처음에는 "entity chunk 가 0이니 경계 밖"이라고
+  // 적었는데 그건 실패하는 대조군을 경계로 재정의한 것이었다 — advisor 가 같은
+  // 방법으로 positive control 을 만들어 반박했다(beta 자기의심 4 = "더 나쁘다").
+  await mgr.generateKnowledgeGraphChunks();
+  const kgChunks = db.prepare(
+    `SELECT COUNT(*) c FROM chunk_metadata WHERE chunk_type='entity' AND entity_id=?`).get(eid).c;
+  assert.ok(kgChunks > 0, 'T7: no entity chunk was generated — hybridSearch oracle would be vacuous');
+
   const modes = {
     openNodes:    () => mgr.openNodes(['T7']),
     searchNodes:  () => mgr.searchNodes(SENTINEL, 5),
     readGraph:    () => mgr.readGraph(),
     getNeighbors: () => mgr.getNeighbors(['T7'], 1),
+    hybridSearch: () => mgr.hybridSearch(SENTINEL, 5, false),
   };
 
   // positive control — retract 전에는 각 모드가 실제로 sentinel 을 낸다.
@@ -49,21 +60,12 @@ const db = mgr.db;
   assert.equal(h.roots[0].revisions[0].status, 'retracted', 'T7: revision must survive as retracted');
   assert.ok(h.roots[0].revisions[0].content.includes(SENTINEL),
     'T7: retract must not destroy the content — history is the only surface for it');
-  // hybridSearch 는 단계 1 에서 관찰 reader 가 아니다 — 조용히 빼지 않고 경계를 고정한다.
-  // 관찰이 chunk 검색에 닿는 유일한 경로는 generateKnowledgeGraphChunks 이고, 그것은
-  // MCP 도구로도 내부 호출로도 노출돼 있지 않다(dormant). 그래서 sentinel 은 retract
-  // 전에도 안 나온다 = 누출 가능성 자체가 없다. 단계 2 에서 관찰 단위 색인을 붙이면
-  // 이 블록이 실패해야 하고, 그때 T7 의 모드 목록에 hybridSearch 를 넣어야 한다.
-  {
-    const entityChunks = db.prepare(
-      `SELECT COUNT(*) c FROM chunk_metadata WHERE chunk_type='entity'`).get().c;
-    assert.equal(entityChunks, 0,
-      'stage-1 boundary broken: entity chunks exist, so hybridSearch must join the T7 sweep');
-    const hs = await mgr.hybridSearch(SENTINEL, 5, false);
-    assert.ok(!JSON.stringify(hs).includes(SENTINEL),
-      'hybridSearch surfaced an observation without an entity chunk — the boundary is wrong');
-  }
-  console.log('  OK: T7 active-only across reader modes (+hybridSearch stage-1 boundary)');
+  // stale KG chunk 가 물리적으로 제거됐는지도 확인한다 (payload 부재만으로는
+  // "검색이 안 걸렸을 뿐"인 경우와 구분되지 않는다)
+  assert.equal(db.prepare(
+    `SELECT COUNT(*) c FROM chunk_metadata WHERE text LIKE '%'||?||'%'`).get(SENTINEL).c, 0,
+    'T7: a KG chunk still holds the retracted text');
+  console.log('  OK: T7 active-only across 5 reader modes (KG chunk positive control)');
 }
 
 // --- T13: 같은 content 가 다른 source 로 재등장하면 source link 만 늘어난다 ---

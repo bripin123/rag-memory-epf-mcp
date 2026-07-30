@@ -153,7 +153,7 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
-### v3.7.0
+### v4.0.0
 
 **Observation lifecycle (schema v13).** Observations used to be a JSON array of strings on the
 entity row. A correction overwrote a string, so the fact that it *was* a correction disappeared —

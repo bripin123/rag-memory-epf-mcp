@@ -212,8 +212,10 @@ Observations provide the factual foundation that supports entity existence and p
 
 <importantNotes>
 - (!important!) **Entity must exist** - this tool only adds to existing entities
-- (!important!) Only new observations are added - duplicates are automatically filtered
-- (!important!) Observations are cumulative - they build the entity's knowledge base
+- (!important!) Duplicates are filtered - repeating existing text with a **new** sources entry
+  adds evidence to the existing revision and returns null for that position
+- (!important!) Observations are cumulative. **This tool never replaces anything** - use
+  correctObservation to supersede and retractObservation to withdraw
 - (!important!) **Be specific and factual** - observations should be verifiable statements
 </importantNotes>
 
@@ -223,21 +225,24 @@ Observations provide the factual foundation that supports entity existence and p
 - When updating entity knowledge from new sources
 - When refining and expanding entity descriptions
 - **Before making knowledge-based decisions** - ensure entities have sufficient context
-- When correcting or expanding incomplete entity information
+- When *expanding* incomplete entity information. **To correct a wrong observation use
+  correctObservation** - adding a second, contradicting observation leaves both in search
 </whenToUseThisTool>
 
 <features>
 - Batch addition of observations to multiple entities
 - Automatic duplicate filtering - no redundant observations
 - Supports rich textual observations with context
-- Maintains observation history and chronology
+- Stable observation ids returned in observation_ids, aligned 1:1 with contents
+- Real revision history: see correctObservation and getObservationHistory
 - Integrates with document processing workflows
 - Enables incremental knowledge building
 </features>
 
 <bestPractices>
 - Keep observations factual and specific rather than general
-- Include source context when possible ("According to paper X...")
+- Put provenance in the sources field, not in the text. A source written in prose cannot be
+  queried, deduplicated, or attached to a later revision
 - Use consistent terminology across observations
 - Add complementary observations that provide different perspectives
 - Include temporal information when relevant ("As of 2024...")

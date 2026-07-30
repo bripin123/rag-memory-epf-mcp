@@ -62,7 +62,10 @@ at **1024 dimensions** (`index.ts` fails fast on a mismatch). FTS5 provides BM25
 4. `README.md` tool count and the group list
 
 Skipping (3) makes the tool listable but uncallable. Skipping (2) makes it invisible. Both fail
-silently — there is no test that cross-checks the registry against the switch.
+silently, which is why `test/tool-contracts.test.mjs` cross-checks the registry against the
+dispatch switch in both directions. It does **not** check nested argument schemas — a tool whose
+schema omits a field the manager expects still passes, and `validateToolArgs` strips that field on
+the way in. That gap cost a full-dump restore its entire revision history once.
 
 ---
 
@@ -73,14 +76,20 @@ silently — there is no test that cross-checks the registry against the switch.
 matter: Korean entity names are normal here. Do not write a new variant of this expression —
 there are already several copies, and they must stay identical.
 
-**Every observation mutation goes through `mutateEntityAndInvalidate(entityId, mutate)`**
-(`index.ts:450`). It runs `mutate()` inside one transaction and then, **only if `mutate()` did not
-return `false`**, rebuilds the projection, invalidates the entity vector, and drops stale KG
-chunks. Returning `false` means *nothing changed*.
+**An observation mutation owes four things in one transaction**: mutate, rebuild the projection,
+invalidate the entity vector, drop stale KG chunks. `mutateEntityAndInvalidate(entityId, mutate)`
+packages all four and skips the last three when `mutate()` returns `false` (meaning *nothing
+changed*). `invalidateDerivedForEntity(entityId)` is the last two on their own, for callers already
+inside a transaction.
 
-> This is not optional bookkeeping. Invalidating without re-embedding leaves an entity with no
-> vector and no queue entry — search quality silently degrades and no test cries. A writer that
-> may be a no-op (empty input, dedup-only, relation endpoint check) **must** report it.
+> This is not optional bookkeeping. Doing fewer than four leaves search answering with facts that
+> were already corrected, and nothing fails: invalidating without re-embedding drops the vector
+> silently, and skipping invalidation keeps the old vector and old KG chunk searchable.
+>
+> `importGraph` is the one writer that does not call `mutateEntityAndInvalidate` — it batches its
+> own transaction and calls `rebuildProjection` + `invalidateDerivedForEntity` per entity. It got
+> there by first shipping *without* the invalidation, which produced exactly the stale-search
+> defect above. If you add another writer outside the helper, you owe all four explicitly.
 
 **Re-embedding happens after the transaction, never inside it**, and only when the helper reported
 a change: `if (changed) await this.tryEmbedEntity(entityId, 'bulk')`.
@@ -162,16 +171,16 @@ tests = `node:assert/strict` in `.test.mjs`, no runner.
 |---|---|
 | Add a migration | `src/migrations/migrations.ts` — new `{ version, description, up, down }`; DDL goes in a shared constant if a test needs it |
 | Add an MCP tool | the four edits in §1 |
-| Change observation behaviour | `src/observations/lifecycle.ts` + the calling writer in `index.ts`, always inside `mutateEntityAndInvalidate` |
+| Change observation behaviour | `src/observations/lifecycle.ts` + the calling writer in `index.ts`, inside `mutateEntityAndInvalidate` (or, if already in a transaction, `rebuildProjection` + `invalidateDerivedForEntity`) |
 | Add a test | new `test/*.test.mjs` + wire into `verify:engine` |
-| Verify | `cd ~/Development/rag-memory-epf-mcp && npm test > /tmp/t.log 2>&1; echo "EXIT:$?"` |
+| Verify | `npm test > <logfile> 2>&1; echo "EXIT:$?"` — never pipe, and set `RAG_MEMORY_REALDATA_DB` to a pre-v13 copy to include the real-data regression |
 
 ---
 
 ## 7. File References
 
 - `src/observations/schema.ts` — the DDL, and the clearest statement of the v13 invariants
-- `index.ts:450` `mutateEntityAndInvalidate` — the transaction contract every writer obeys
+- `index.ts` `mutateEntityAndInvalidate` / `invalidateDerivedForEntity` — the four-part transaction contract, and the one exception (`importGraph`) that pays it manually
 - `src/tools/knowledge-graph-tools.ts` `addObservationsTool` — the tool-declaration template
 - `test/observation-schema.test.mjs` — how to test a trigger, including isolated-schema controls
 - `docs/UPDATING.md` — version-update reliability runbook (v3.6)

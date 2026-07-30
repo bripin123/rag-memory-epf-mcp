@@ -2,6 +2,18 @@ import { Migration } from './migration-manager.js';
 import { OBSERVATION_SCHEMA_SQL } from '../observations/schema.js';
 import { randomUUID } from 'node:crypto';
 
+// v13 변환의 단계 경계에서 의도적으로 실패시키는 지점. 마이그레이션이 정말로
+// all-or-nothing 인지는 각 경계에서 끊어 봐야만 알 수 있다(spec §8.2 T11).
+//
+// 환경변수가 아니라 명시적 setter 인 이유: 환경변수는 프로덕션 경로에 상시
+// 존재하는 스위치가 되고, 오설정 한 줄이 마이그레이션을 깨서 .bak 을 남기고
+// 그 .bak 이 재시작을 막는다. 이 setter 는 dist 를 import 한 테스트만 부를 수 있다.
+export type MigrationFaultPoint = 'preflight' | 'roots' | 'revisions' | 'sources' | 'gate';
+let faultPoint: MigrationFaultPoint | null = null;
+export function setMigrationFaultPoint(point: MigrationFaultPoint | null): void {
+  faultPoint = point;
+}
+
 export const migrations: Migration[] = [
   {
     version: 1,
@@ -706,10 +718,12 @@ export const migrations: Migration[] = [
       const MIGRATION_TS = new Date().toISOString();
       const BATCH_ID = randomUUID();
 
-      // test-only fault injection. 값이 없으면 아무 효과 없다.
-      const faultAt = process.env.RAG_MEMORY_FAULT_AT;
+      // 단계 경계 fault injection. 주입은 setMigrationFaultPoint() 로만 하며
+      // 환경변수를 보지 않는다 — 환경변수로 두면 프로덕션에 "마이그레이션을 깨는
+      // 스위치"가 상시 존재하고, 오설정 한 줄이 .bak 을 남겨 재시작을 막는다
+      // (advisor beta 자기의심 2 = "더 나쁘다").
       const fault = (point: string) => {
-        if (faultAt === point) throw new Error(`injected fault at '${point}' (test-only)`);
+        if (faultPoint === point) throw new Error(`injected fault at '${point}' (test-only)`);
       };
 
       // 1) 읽기 전용 preflight: array<string> 검증.

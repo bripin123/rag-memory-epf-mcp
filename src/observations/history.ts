@@ -6,6 +6,20 @@ import type Database from 'better-sqlite3';
 export function getObservationHistory(db: Database.Database, sel: {
   entity_name?: string; observation_id?: string; root_id?: string;
 }): { roots: any[] } {
+  // 정확히 하나만 받는다. 우선순위를 조용히 적용하면 두 개를 넘긴 호출자가
+  // *다른* 선택자의 답을 받고 그 사실을 모른다 — 실측으로 entity_name 이 유효한데
+  // 존재하지 않는 root_id 가 이겨서 `{roots: []}` 가 나갔다(advisor beta 발견 4-2).
+  const given = (['entity_name', 'observation_id', 'root_id'] as const)
+    .filter(k => sel[k] !== undefined && sel[k] !== null && sel[k] !== '');
+  if (given.length === 0) {
+    throw new Error('getObservationHistory requires one of: entity_name, observation_id, root_id');
+  }
+  if (given.length > 1) {
+    throw new Error(
+      `getObservationHistory takes exactly one selector, got ${given.length} (${given.join(', ')}). ` +
+      `Applying a precedence order would silently answer a different question than the one asked.`);
+  }
+
   let rootIds: string[];
   if (sel.root_id) {
     rootIds = [sel.root_id];
