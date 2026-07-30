@@ -1,11 +1,10 @@
 // v13 migration: 변환 정확성 + 검증 게이트 + backup preflight.
 // spec §5 + §8.2 (T3·T4·T9·T12·T15)
-import { mkdtempSync, rmSync, existsSync, writeFileSync, readdirSync, copyFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
-import * as sqliteVec from 'sqlite-vec';
 
 process.env.RAG_MEMORY_NO_AUTOSTART = '1';
 
@@ -160,16 +159,22 @@ console.log('  OK: T4 array<string> preflight (5 cases)');
   console.log('  OK: T12 backup preflight');
 }
 
-// --- T12b: 기존 backup 을 덮어쓰지 않는다 ---
+// --- T12b: 기존 backup 을 덮어쓰지 않고 새 슬롯에 만든다 ---
 {
   const { dir, dbPath } = await makeV12Db({ Gamma: ['y'] });
-  writeFileSync(dbPath + '.v12.bak', 'PRE-EXISTING');
-  let threw = null;
-  try { const m = await reopen(dbPath); m.cleanup?.(); } catch (e) { threw = String(e.message); }
-  assert.ok(threw, 'T12b: existing backup silently overwritten');
-  assert.match(threw, /backup/i, 'T12b: unclear error');
+  const base = dbPath + '.v12.bak';
+  writeFileSync(base, 'PRE-EXISTING');
+  const m = await reopen(dbPath);
+  m.cleanup?.();
+  // 원본은 한 글자도 안 바뀐다
+  assert.equal(readFileSync(base, 'utf8'), 'PRE-EXISTING', 'T12b: existing backup was overwritten');
+  // 그리고 새 복구점이 옆에 생긴다 (재시작이 막히지 않는다)
+  assert.ok(existsSync(base + '.1'), 'T12b: no new recovery slot was created');
+  const fresh = new Database(base + '.1', { readonly: true });
+  assert.equal(fresh.pragma('quick_check', { simple: true }), 'ok', 'T12b: new slot is corrupt');
+  fresh.close();
   rmSync(dir, { recursive: true, force: true });
-  console.log('  OK: T12b backup overwrite refused');
+  console.log('  OK: T12b existing backup preserved, new slot created');
 }
 
 // --- T12c: 대기 중 마이그레이션이 없으면 backup 을 만들지 않는다 (no-op) ---
@@ -245,7 +250,7 @@ for (const at of ['preflight', 'roots', 'revisions', 'sources', 'gate']) {
   // **재시작이 가능해야 한다.** 예전 구현은 남은 .bak 때문에 마이그레이션 진입 전에
   // 죽어서, 한 번의 일시적 실패가 fleet 자동 재시작 환경을 영구 정지시켰다
   // (advisor beta 발견 3). 이제는 남은 .bak 을 검증하고 재사용한다.
-  const before = readdirSync(d).filter(f => f.endsWith('.bak'));
+  const before = readdirSync(d).filter(f => f.includes('.bak')).sort();
   const m2 = await reopen(dbPath);          // fault 해제 상태 = 정상 재시도
   const db2 = m2.db;
   assert.equal(db2.prepare(`SELECT MAX(version) v FROM schema_migrations`).get().v, 13,
@@ -254,219 +259,124 @@ for (const at of ['preflight', 'roots', 'revisions', 'sources', 'gate']) {
     `SELECT observations FROM entities WHERE id='entity_fault'`).get().observations), ['f1', 'f2'],
     `T11: retry after fault at '${at}' lost the observations`);
   m2.cleanup?.();
-  // 그리고 원래 스냅샷을 덮어쓰거나 늘리지 않았다
-  assert.deepEqual(readdirSync(d).filter(f => f.endsWith('.bak')), before,
-    `T11: retry changed the backup set after fault at '${at}'`);
+  // 원래 스냅샷은 그대로 있고, 재시도는 **새 슬롯**을 하나 더 만든다
+  const after = readdirSync(d).filter(f => f.includes('.bak')).sort();
+  assert.ok(before.every(f => after.includes(f)),
+    `T11: retry removed a recovery point after fault at '${at}'`);
+  assert.equal(after.length, before.length + 1,
+    `T11: retry did not create a new recovery slot after fault at '${at}': ${JSON.stringify(after)}`);
 
   rmSync(d, { recursive: true, force: true });
 }
 console.log('  OK: T11 fault injection (5 points: rollback, backup retained, restart resumes)');
 
-// --- 손상된 .bak 은 재사용하지 않는다 (재사용 정책이 검증을 건너뛰면 게이트가 사라진다) ---
+// --- 복구점 슬롯이 다 차면 fail-closed ---
+// 회전의 대가는 디스크다. 무한히 쌓이면 그것도 결함이므로 상한을 두고, 상한에
+// 닿으면 멈춘다 — 마이그레이션이 세 번 연속 실패하는 상태는 사람이 봐야 한다.
 {
-  const { dir: d, dbPath } = await makeV12Db({ Corrupt: ['c1'] });
+  const { dir: d, dbPath } = await makeV12Db({ Slots: ['s1'] });
   const migMod = await import(`../dist/src/migrations/migrations.js`);
-  migMod.setMigrationFaultPoint('roots');
-  try { const m = await reopen(dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
-  migMod.setMigrationFaultPoint(null);
-  const bak = readdirSync(d).find(f => f.endsWith('.bak'));
-  assert.ok(bak, 'backup was not created');
-  writeFileSync(join(d, bak), 'not a sqlite file at all');
-  let err = null;
-  try { const m2 = await reopen(dbPath); m2.cleanup?.(); } catch (e) { err = String(e.message); }
-  assert.ok(err, 'a corrupt backup must not be silently reused');
-  assert.match(err, /not a usable recovery point/i, `unexpected error: ${err}`);
-  rmSync(d, { recursive: true, force: true });
-  console.log('  OK: corrupt backup refused (reuse is verified, not assumed)');
-}
+  const base = dbPath + '.v12.bak';
 
-// --- 다른 DB 의 정상 .bak 은 재사용하지 않는다 ---
-// 손상 파일만 음성 대조군으로 쓰면 "정상 SQLite 이지만 남의 백업"이 통과한다.
-// 스키마 버전은 판정 근거가 못 된다 — fleet 의 다른 프로젝트 DB 도 v12 이고
-// quick_check 도 ok 다 (advisor beta r3 발견 1, 두 DB 로 실행 재현).
-// 기준은 신원이 아니라 **논리 상태 동일성**이다(r4 P0 에서 신원 접근이 폐기됐다:
-// DB 내부 UUID 는 파일 복사와 함께 복제된다).
-{
-  const A = await makeV12Db({ FleetA: ['a1'] });
-  const B = await makeV12Db({ FleetB: ['b1'] });
-  // A 를 실패시켜 A 의 .bak 을 만든다
-  const migMod = await import(`../dist/src/migrations/migrations.js`);
-  migMod.setMigrationFaultPoint('roots');
-  try { const m = await reopen(A.dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
-  migMod.setMigrationFaultPoint(null);
-  const bakA = readdirSync(A.dir).find(f => f.endsWith('.bak'));
-  assert.ok(bakA, 'A produced no backup');
+  // 세 번 실패시키면 세 슬롯이 찬다
+  for (let i = 0; i < 3; i++) {
+    migMod.setMigrationFaultPoint('roots');
+    try { const m = await reopen(dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
+    migMod.setMigrationFaultPoint(null);
+  }
+  const baks = readdirSync(d).filter(f => f.includes('.v12.bak')).sort();
+  assert.equal(baks.length, 3, `expected 3 recovery points, got ${JSON.stringify(baks)}`);
 
-  // 그 .bak 을 B 의 자리로 옮긴다 = 정상 SQLite · 같은 v12 · 다른 DB
-  copyFileSync(join(A.dir, bakA), `${B.dbPath}.v12.bak`);
-  let err = null;
-  try { const m = await reopen(B.dbPath); m.cleanup?.(); } catch (e) { err = String(e.message); }
-  assert.ok(err, "another database's backup was accepted as this one's recovery point");
-  assert.match(err, /logical state differs/i, `unexpected error: ${err}`);
-  // 그리고 남의 백업을 덮어쓰지 않았다
-  assert.ok(existsSync(`${B.dbPath}.v12.bak`), 'the foreign backup was destroyed');
-  rmSync(A.dir, { recursive: true, force: true });
-  rmSync(B.dir, { recursive: true, force: true });
-  console.log("  OK: another database's backup refused (state equality, not version)");
-}
-
-// --- 실패 후 live 가 변한 뒤에는 옛 .bak 을 현 상태의 복구점으로 인정하지 않는다 ---
-{
-  const { dir: d, dbPath } = await makeV12Db({ Drift: ['d1'] });
-  const migMod = await import(`../dist/src/migrations/migrations.js`);
-  migMod.setMigrationFaultPoint('roots');
-  try { const m = await reopen(dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
-  migMod.setMigrationFaultPoint(null);
-
-  // **행 수를 바꾸지 않는** 변경을 넣는다. 새 행을 넣으면 COUNT 가 달라져서
-  // 약한 집계 지문도 잡는다 — 그건 지문을 시험하지 않는다. 같은 길이 교체가
-  // 통과하던 것이 실제 결함이었다(advisor beta r4 P0).
-  const raw = new Database(dbPath);
-  const beforeObs = raw.prepare(`SELECT observations FROM entities WHERE id='entity_drift'`).get().observations;
-  const sameLength = beforeObs.replace('d1', 'zZ');   // 길이 동일, 내용 다름
-  assert.equal(sameLength.length, beforeObs.length, 'probe must keep the length identical');
-  raw.prepare(`UPDATE entities SET observations=? WHERE id='entity_drift'`).run(sameLength);
-  raw.close();
-
+  // 네 번째 시도는 거부된다 — 그리고 기존 셋을 건드리지 않는다
+  const before = baks.map(f => statSync(join(d, f)).size);
   let err = null;
   try { const m = await reopen(dbPath); m.cleanup?.(); } catch (e) { err = String(e.message); }
-  assert.ok(err, 'a stale backup was accepted after a same-length change to live');
-  assert.match(err, /logical state differs|not a snapshot/i, `unexpected error: ${err}`);
+  assert.ok(err, 'a fourth attempt ran with all recovery slots full');
+  assert.match(err, /recovery points already exist/i, `unexpected error: ${err}`);
+  assert.deepEqual(readdirSync(d).filter(f => f.includes('.v12.bak')).sort(), baks,
+    'the refused attempt changed the backup set');
+  assert.deepEqual(baks.map(f => statSync(join(d, f)).size), before,
+    'the refused attempt modified an existing recovery point');
   rmSync(d, { recursive: true, force: true });
-  console.log('  OK: same-length change to live refuses the older backup (real digest)');
+  console.log('  OK: recovery slots are bounded and full slots fail closed');
 }
 
-// --- 복제된 DB: 파일을 복사해도 상태가 갈리면 남의 .bak 을 쓰지 않는다 ---
-// fleet 에는 실제로 `_copy_`·`_backup` DB 들이 있다. DB 내부 신원값은 복사와 함께
-// 복제되므로 신원으로는 가를 수 없다 — 상태 동일성만이 기준이다(advisor beta r4 P0).
-{
-  const A = await makeV12Db({ Clone: ['c1'] });
-  const B = { dir: mkdtempSync(join(tmpdir(), 'rag-obs-clone-')) };
-  B.dbPath = join(B.dir, 'test.db');
-  copyFileSync(A.dbPath, B.dbPath);      // 완전 복제 = 내부 신원값까지 동일
-
-  // A 를 실패시켜 A 의 .bak 을 만든 뒤 B 자리로 옮긴다
-  const migMod = await import(`../dist/src/migrations/migrations.js`);
-  migMod.setMigrationFaultPoint('roots');
-  try { const m = await reopen(A.dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
-  migMod.setMigrationFaultPoint(null);
-  copyFileSync(join(A.dir, readdirSync(A.dir).find(f => f.endsWith('.bak'))), `${B.dbPath}.v12.bak`);
-
-  // 복제 직후에는 상태가 같으므로 재사용이 **허용**된다 (그게 맞는 계약이다)
-  const okRun = await reopen(B.dbPath);
-  assert.equal(okRun.db.prepare(`SELECT MAX(version) v FROM schema_migrations`).get().v, 13,
-    'an identical-state backup should have been reusable');
-  okRun.cleanup?.();
-
-  // 이제 B 를 v12 로 되돌리고 내용을 바꾼 뒤 다시 시도하면 거부돼야 한다
-  const raw = new Database(B.dbPath);
-  raw.exec(`DROP TABLE IF EXISTS observation_events; DROP TABLE IF EXISTS observation_sources;
-            DROP TABLE IF EXISTS entity_observations; DROP TABLE IF EXISTS observation_roots`);
-  raw.prepare(`DELETE FROM schema_migrations WHERE version=13`).run();
-  raw.prepare(`UPDATE entities SET name='Cl0ne' WHERE id='entity_clone'`).run();  // 같은 길이
-  raw.close();
-  let err2 = null;
-  try { const m = await reopen(B.dbPath); m.cleanup?.(); } catch (e) { err2 = String(e.message); }
-  assert.ok(err2, 'a cloned database reused a backup that no longer matches its state');
-  assert.match(err2, /logical state differs/i, `unexpected error: ${err2}`);
-  rmSync(A.dir, { recursive: true, force: true });
-  rmSync(B.dir, { recursive: true, force: true });
-  console.log('  OK: cloned DB — identical state reusable, diverged state refused');
-}
-
-// --- 행은 같고 스키마 객체만 빠진 백업은 거부한다 ---
-// 이게 r5 의 P0 였다: `DROP TABLE embedding_profiles` 한 백업이 quick_check ok +
-// digest 동일로 승인됐고, 복원 후 부팅이 `no such table: embedding_profiles` 로 죽었다.
-// 행만 해시하면 스키마 topology 가 검사 밖에 남는다.
-{
-  const { dir: d, dbPath } = await makeV12Db({ SchemaGap: ['s1'] });
-  const migMod = await import(`../dist/src/migrations/migrations.js`);
-  migMod.setMigrationFaultPoint('roots');
-  try { const m = await reopen(dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
-  migMod.setMigrationFaultPoint(null);
-  const bakName = readdirSync(d).find(f => f.endsWith('.bak'));
-  assert.ok(bakName, 'no backup produced');
-  const bakPath = join(d, bakName);
-
-  // 행은 그대로 두고 부팅에 필요한 테이블 하나만 없앤다
-  const bak = new Database(bakPath);
-  const before = bak.prepare(`SELECT COUNT(*) c FROM entities`).get().c;
-  bak.exec(`DROP TABLE embedding_profiles`);
-  assert.equal(bak.prepare(`SELECT COUNT(*) c FROM entities`).get().c, before,
-    'probe must not change any row');
-  assert.equal(bak.pragma('quick_check', { simple: true }), 'ok',
-    'probe must leave a structurally valid SQLite file (that is the point)');
-  bak.close();
-
-  let err = null;
-  try { const m = await reopen(dbPath); m.cleanup?.(); } catch (e) { err = String(e.message); }
-  assert.ok(err, 'a backup missing a required table was accepted as a recovery point');
-  assert.match(err, /logical state differs/i, `unexpected error: ${err}`);
+// --- 기존 백업이 무엇이든(손상·남의 것·오래된 것) 재시작을 막지 않는다 ---
+// 앞선 세 판본은 남은 .bak 이 "이 DB 의 현재 상태인가"를 판정하려 했고, 그 판정이
+// 세 번 틀렸다(스키마 버전=신원 착각 · 복제되는 내부 UUID+약한 지문 · sqlite_sequence·
+// hidden rowid·INTEGER 정밀도 누락). 회전은 그 판정을 하지 않으므로 이 셋 전부가
+// 같은 결과를 낸다: 건드리지 않고, 옆에 새로 만들고, 부팅은 성공한다.
+for (const [label, make] of [
+  ['corrupt', (p) => writeFileSync(p, 'not a sqlite file at all')],
+  ['foreign', (p) => { const d2 = new Database(p); d2.exec(`CREATE TABLE other(x)`);
+                       d2.prepare(`INSERT INTO other VALUES ('someone else')`).run(); d2.close(); }],
+]) {
+  const { dir: d, dbPath } = await makeV12Db({ [`Keep${label}`]: ['k1'] });
+  const base = dbPath + '.v12.bak';
+  make(base);
+  const bytesBefore = readFileSync(base);
+  const m = await reopen(dbPath);
+  assert.equal(m.db.prepare(`SELECT MAX(version) v FROM schema_migrations`).get().v, 13,
+    `${label} backup blocked the migration`);
+  m.cleanup?.();
+  assert.deepEqual(readFileSync(base), bytesBefore, `${label} backup was modified`);
+  assert.ok(existsSync(base + '.1'), `${label}: no new recovery slot`);
   rmSync(d, { recursive: true, force: true });
-  console.log('  OK: backup missing a schema object refused (rows alone are not the state)');
+  console.log(`  OK: pre-existing ${label} backup neither blocks nor is touched`);
 }
 
-// --- metadata stamp 는 같고 벡터 바이트만 다른 백업도 거부한다 ---
-// "벡터는 파생이라 제외해도 된다"가 틀린 이유: backfill 은 벡터의 **존재**와 stamp 만
-// 보고 바이트를 검증하지 않으므로, 이 상태는 승인된 뒤에도 재생성되지 않는다(r5 P1).
-{
-  const { dir: d, dbPath } = await makeV12Db({ VecDrift: ['v1'] });
-  // live 에 벡터를 심는다
-  const live = new Database(dbPath);
-  sqliteVec.load(live);
-  live.prepare(`INSERT OR REPLACE INTO entity_embedding_metadata (rowid, entity_id, embedding_text)
-                VALUES (1, 'entity_vecdrift', 'v1')`).run();
-  live.prepare(`INSERT OR REPLACE INTO entity_embeddings (rowid, embedding) VALUES (1, ?)`)
-    .run(Buffer.from(new Float32Array(1024).fill(0.01).buffer));
-  live.close();
-
-  const migMod = await import(`../dist/src/migrations/migrations.js`);
-  migMod.setMigrationFaultPoint('roots');
-  try { const m = await reopen(dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
-  migMod.setMigrationFaultPoint(null);
-  const bakName = readdirSync(d).find(f => f.endsWith('.bak'));
-  assert.ok(bakName, 'no backup produced');
-
-  // 백업의 벡터 바이트만 바꾼다 — metadata stamp 는 건드리지 않는다
-  const bak = new Database(join(d, bakName));
-  sqliteVec.load(bak);
-  const stampBefore = bak.prepare(`SELECT * FROM entity_embedding_metadata WHERE rowid=1`).get();
-  bak.prepare(`UPDATE entity_embeddings SET embedding = ? WHERE rowid = 1`)
-    .run(Buffer.from(new Float32Array(1024).fill(0.09).buffer));
-  assert.deepEqual(bak.prepare(`SELECT * FROM entity_embedding_metadata WHERE rowid=1`).get(),
-    stampBefore, 'probe must leave the metadata stamp identical');
-  bak.close();
-
-  let err = null;
-  try { const m = await reopen(dbPath); m.cleanup?.(); } catch (e) { err = String(e.message); }
-  assert.ok(err, 'a backup whose vector bytes differ was accepted (backfill will not fix it)');
-  assert.match(err, /logical state differs/i, `unexpected error: ${err}`);
-  rmSync(d, { recursive: true, force: true });
-  console.log('  OK: differing vector bytes refused (same stamp is not the same state)');
-}
-
-// --- server_meta 가 없는 구 버전 DB 도 재사용이 된다 ---
+// --- server_meta 없는 구 버전 DB 도 두 번째 시도가 막히지 않는다 ---
 // 신원값을 server_meta 에 두던 판본은 pre-v12 DB 에서 "신원 없음"으로 영구 거부해
-// 같은 crashloop 을 다시 만들었다(advisor beta r4 P1). 논리 다이제스트는 의존하지 않는다.
+// 같은 crashloop 을 다시 만들었다(advisor beta r4 P1). 회전은 아무것도 조회하지 않는다.
 {
   const dir = mkdtempSync(join(tmpdir(), 'rag-obs-prev12-'));
   const dbPath = join(dir, 'test.db');
-  const raw = new Database(dbPath);
-  raw.exec(`CREATE TABLE entities (id TEXT PRIMARY KEY, name TEXT, observations TEXT)`);
-  raw.prepare(`INSERT INTO entities VALUES ('entity_old','Old','["legacy"]')`).run();
-  raw.close();
+  const seed = new Database(dbPath);
+  seed.exec(`CREATE TABLE entities (id TEXT PRIMARY KEY, name TEXT, observations TEXT)`);
+  seed.prepare(`INSERT INTO entities VALUES ('entity_old','Old','["legacy"]')`).run();
+  seed.close();
   const { backupBeforeMigration } = await import('../dist/src/backup/preflight.js');
-  const open = () => { const d = new Database(dbPath); return d; };
-  const d1 = open();
-  const first = backupBeforeMigration(d1, dbPath, [12], 11);
-  d1.close();
+  const call = () => { const d = new Database(dbPath);
+    try { return backupBeforeMigration(d, dbPath, [12], 11); } finally { d.close(); } };
+  const first = call();
   assert.ok(first && existsSync(`${dbPath}.v11.bak`), 'no backup for a pre-v12 database');
-  const d2 = open();
-  const second = backupBeforeMigration(d2, dbPath, [12], 11);   // 재시도 = 거부되면 안 된다
-  d2.close();
-  assert.equal(second.path, first.path, 'pre-v12 retry did not reuse the existing backup');
+  const second = call();
+  assert.ok(second, 'pre-v12 retry was refused');
+  assert.notEqual(second.path, first.path, 'the retry reused the same file instead of a new slot');
+  assert.equal(second.path, `${dbPath}.v11.bak.1`);
   rmSync(dir, { recursive: true, force: true });
-  console.log('  OK: pre-v12 DB (no server_meta) can still resume');
+  console.log('  OK: pre-v12 DB (no server_meta) retries into a new slot');
+}
+
+// --- version 0 인데 데이터가 있으면 백업한다 (테이블 목록 하드코딩 금지) ---
+// `entities/documents/relationships` 세 개만 세던 판본은 `embedding_profiles` 에만
+// 행이 있는 version-0 DB 를 무백업으로 통과시켰다(advisor beta r6 P0-3).
+{
+  const dir = mkdtempSync(join(tmpdir(), 'rag-obs-v0data-'));
+  const dbPath = join(dir, 'test.db');
+  const seed = new Database(dbPath);
+  seed.exec(`CREATE TABLE embedding_profiles (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT)`);
+  seed.prepare(`INSERT INTO embedding_profiles (name) VALUES ('bge-m3')`).run();
+  seed.close();
+  const { backupBeforeMigration } = await import('../dist/src/backup/preflight.js');
+  const d = new Database(dbPath);
+  const got = backupBeforeMigration(d, dbPath, [1], 0);
+  d.close();
+  assert.ok(got, 'a version-0 database holding data was migrated without a backup');
+  assert.ok(existsSync(`${dbPath}.v0.bak`), 'no backup file was produced');
+
+  // 그리고 진짜 빈 DB 는 여전히 건너뛴다 (정상 경로를 막지 않는다)
+  const dir2 = mkdtempSync(join(tmpdir(), 'rag-obs-v0empty-'));
+  const p2 = join(dir2, 'test.db');
+  const e = new Database(p2);
+  e.exec(`CREATE TABLE embedding_profiles (id INTEGER PRIMARY KEY, name TEXT)`);
+  const skipped = backupBeforeMigration(e, p2, [1], 0);
+  e.close();
+  assert.equal(skipped, null, 'a genuinely empty version-0 database should not be backed up');
+  assert.deepEqual(readdirSync(dir2).filter(f => f.endsWith('.bak')), []);
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(dir2, { recursive: true, force: true });
+  console.log('  OK: version-0 with data is backed up; genuinely empty is skipped');
 }
 
 console.log('observation-migration: ALL OK');

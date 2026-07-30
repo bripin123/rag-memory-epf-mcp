@@ -2,150 +2,29 @@ import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 
-// 남아 있는 .bak 을 재사용해도 되는지의 **유일한 기준은 상태 동일성**이다.
-// 출처를 가리려 하지 않는다: 논리 상태가 완전히 같다면 그 파일이 어디서 왔든
-// 지금의 pre-migration 복구점으로 유효하다. 반대로 상태가 다르면 출처가 같아도
-// 복구점이 아니다.
+// 이 파일이 지켜야 하는 것은 두 줄이다:
+//   ① 복구점을 절대 덮어쓰지 않는다
+//   ② 재시작을 막지 않는다
 //
-// 앞선 두 시도가 모두 여기서 틀렸다:
-//   ① quick_check + 스키마 버전 → fleet 의 **다른 프로젝트 백업**이 통과했다.
-//      스키마 버전은 신원이 아니다.
-//   ② DB 안의 UUID + 집계 지문 → UUID 는 **파일 복사 시 함께 복제**되고(fleet 에
-//      실제로 사본 DB 들이 있다), 집계 지문은 같은 길이 교체·이름/metadata/document
-//      변경을 전부 통과시켰다. 지문이 값을 안 보면 지문이 아니다.
-// (advisor beta r3 발견 1 · r4 발견 P0, 둘 다 실행 재현)
+// 이걸 "남아 있는 .bak 이 live 와 같은 상태인가"를 증명해서 풀려고 세 판본을 썼고
+// 세 번 다 틀렸다(스키마 버전을 신원으로 착각 → DB 내부 UUID+집계 지문 → 전체 논리
+// 다이제스트). 마지막 판본조차 `sqlite_sequence`·hidden rowid·INTEGER 정밀도·
+// INTEGER/REAL 구분이 새고, `VACUUM INTO` 는 명시적 INTEGER PRIMARY KEY 가 없는
+// 테이블의 ROWID 를 바꿀 수 있어서 **비교의 전제 자체가 흔들린다**.
 //
-// 그래서 **권위 데이터 전체를 안정된 순서로 스트리밍 해시**한다. 파생 자산
-// (벡터·임베딩 metadata)은 제외한다 — 재생성 가능하고, 그 차이는 복구점의
-// 유효성을 바꾸지 않는다. 마이그레이션이 대기 중일 때만 계산하므로 부팅마다 도는
-// 비용이 아니다.
-// 무엇을 해시하나: **DB 안의 모든 것**. sqlite_schema 의 객체 정의(테이블·인덱스·트리거·
-// 가상테이블·제약)와, sqlite 내부 테이블을 뺀 모든 테이블의 행 전체다.
+// 등가 증명은 애초에 필요하지 않았다. **백업은 마이그레이션 전에 만들어지므로,
+// 시도마다 새 슬롯에 하나 더 만들면 그 모든 파일이 정의상 유효한 pre-migration
+// 스냅샷이다.** 덮어쓰지 않으니 ①, 막지 않으니 ②. 비교가 없으니 비교의 정확성
+// 문제가 전부 사라진다. (advisor beta r2~r6 6라운드의 결론)
 //
-// "파생이라 제외"를 세 번 시도했고 세 번 다 틀렸다:
-//   · `embedding_profiles` 는 캐시가 아니라 profile ID 의 의미를 보존하는 registry 이고
-//     부팅에 필수다 — 이게 빠진 백업이 digest 동일 + quick_check ok 로 승인됐고
-//     복원 후 부팅이 `no such table: embedding_profiles` 로 죽었다.
-//   · 벡터·임베딩 metadata 도 "재생성 가능"이 안전을 뜻하지 않았다. backfill 은 벡터의
-//     **존재**와 metadata stamp 만 보고 바이트를 검증하지 않으므로, stamp 가 같고 바이트가
-//     다른 상태는 승인된 뒤에도 재생성되지 않는다.
-//   · 스키마 topology(PK/FK/CHECK/COLLATE·인덱스·트리거)는 애초에 안 보고 있었다.
-// (advisor beta r5 발견 P0·P1, 인메모리 재현)
-//
-// 그래서 제외 목록을 없앴다. 제외가 없으면 "무엇이 파생인가"를 판정할 필요도 없다.
-// 실측: 32.6MB · 30테이블 · blob 22.25MB 를 해시해 **144ms**, 그리고 live 와 그
-// `VACUUM INTO` 사본의 digest 가 **일치**한다(정상 경로를 막지 않는다는 확인).
-// vec0 가상테이블과 그 shadow 테이블이 모두 읽히므로 **벡터 바이트도 범위 안**이다.
-// 이 계산은 마이그레이션이 대기 중일 때만 돈다.
-// 섹션별 다이제스트. 불일치 시 "무엇이 다른가"를 말할 수 있어야 한다 —
-// 운영자가 백업을 판단할 수 있어야 하고, 개발 중에도 진단이 겉돌지 않는다.
-export function digestSections(db: Database.Database): Record<string, string> {
-  const out: Record<string, string> = {};
-  const objs = createHash('sha256');
-  for (const o of db.prepare(
-    `SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name, tbl_name`)
-    .iterate() as any) {
-    objs.update(JSON.stringify([o.type, o.name, o.tbl_name, o.sql]));
-  }
-  out['#schema'] = objs.digest('hex');
-  for (const { name: t } of (db.prepare(
-    `SELECT name FROM sqlite_schema WHERE type='table'
-       AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
-       AND sql NOT LIKE 'CREATE VIRTUAL TABLE%'
-     ORDER BY name`).all() as Array<{ name: string }>)) {
-    const qt = `"${t.replace(/"/g, '""')}"`;
-    const h = createHash('sha256');
-    try {
-      const cols = (db.pragma(`table_info(${qt})`) as Array<{ name: string }>)
-        .map(c => c.name).sort();
-      const q = cols.map(c => `"${c.replace(/"/g, '""')}"`).join(', ');
-      for (const row of db.prepare(`SELECT ${q} FROM ${qt} ORDER BY ${q}`).iterate() as any) {
-        for (const c of cols) {
-          const v = row[c];
-          h.update(v === null || v === undefined ? 'N'
-            : Buffer.isBuffer(v) ? `B${v.toString('hex')}` : `s${v}`);
-          h.update('|');
-        }
-      }
-    } catch { h.update('#unreadable'); }
-    out[t] = h.digest('hex');
-  }
-  return out;
-}
-
-export function diffSections(a: Record<string, string>, b: Record<string, string>): string[] {
-  const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])].sort();
-  return keys.filter(k => a[k] !== b[k]);
-}
-
-export function logicalDigest(db: Database.Database): string {
-  const h = createHash('sha256');
-  // 길이 접두사 인코딩. 이게 없으면 'a'+'bc' 와 'ab'+'c' 가 같은 해시가 된다.
-  const put = (tag: string, v?: Buffer) => {
-    h.update(`${tag.length}:${tag}\u0000`);
-    if (v) { h.update(`b${v.length}\u0000`); h.update(v); }
-  };
-
-  // 1) 스키마 topology. 행이 같아도 필수 테이블·트리거·제약이 빠진 백업은 복구선이 아니다.
-  for (const o of db.prepare(
-    `SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name, tbl_name`)
-    .iterate() as any) {
-    put('#obj');
-    for (const k of ['type', 'name', 'tbl_name', 'sql'] as const) {
-      put(o[k] === null || o[k] === undefined ? 'N' : `s${o[k]}`);
-    }
-  }
-
-  // 2) 모든 **실제** 테이블의 행. 목록은 스키마에서 얻는다 — 하드코딩하면 새 테이블이
-  //    조용히 검사 밖에 남는다(그게 embedding_profiles 에서 일어난 일이다).
-  //
-  //    가상 테이블(vec0 · FTS5)은 제외한다. 그것은 자기 shadow 테이블에 대한 *뷰*이고,
-  //    조건 없는 전체 스캔은 연결 모드에 따라 결과가 달라진다(실측: 같은 상태의
-  //    read-write live 와 read-only 백업에서 `chunks`·`entity_embeddings` 섹션이 갈렸다).
-  //    **제외해도 데이터는 빠지지 않는다** — 벡터 바이트는 `*_vector_chunks00` 등
-  //    shadow 테이블에 있고 그것들은 실제 테이블이라 위 목록에 포함된다(실측 blob 22.25MB).
-  //    가상 테이블의 DDL 자체는 1) 의 스키마 섹션에서 해시된다.
-  const tables = (db.prepare(
-    `SELECT name FROM sqlite_schema WHERE type='table'
-       AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'
-       AND sql NOT LIKE 'CREATE VIRTUAL TABLE%'
-     ORDER BY name`).all() as Array<{ name: string }>);
-  for (const { name: t } of tables) {
-    const qt = `"${t.replace(/"/g, '""')}"`;
-    put(`#table:${t}`);
-    let cols: string[];
-    try {
-      cols = (db.pragma(`table_info(${qt})`) as Array<{ name: string }>).map(c => c.name).sort();
-    } catch { put('#no-table-info'); continue; }
-    if (cols.length === 0) { put('#no-columns'); continue; }
-    put(`#cols:${cols.join(',')}`);
-    const q = cols.map(c => `"${c.replace(/"/g, '""')}"`).join(', ');
-    try {
-      // 전 컬럼 정렬 = 저장 순서에 의존하지 않는다. 전 컬럼이 같은 행들은 서로
-      // 구별 불가하므로 그 사이 순서가 달라도 바이트열이 같다.
-      for (const row of db.prepare(`SELECT ${q} FROM ${qt} ORDER BY ${q}`).iterate() as any) {
-        for (const c of cols) {
-          const v = row[c];
-          if (v === null || v === undefined) put('N');
-          else if (Buffer.isBuffer(v)) put('B', v);
-          else if (typeof v === 'number') put(`n${v}`);
-          else if (typeof v === 'bigint') put(`i${v}`);
-          else put(`s${v}`);
-        }
-        put('#row');
-      }
-    } catch {
-      // 읽을 수 없는 테이블은 오류 문자열을 해시에 넣지 않는다(환경마다 달라져
-      // 정상 경로를 깨뜨린다). 이름만 남긴다 — 그 테이블의 DDL 은 1)에서 이미 해시됐다.
-      put('#unreadable');
-    }
-  }
-  return h.digest('hex');
-}
+// 대가 = 디스크. 그래서 슬롯을 유한하게 두고, 다 차면 fail-closed 한다 —
+// 마이그레이션이 세 번 연속 실패하는 상태는 사람이 봐야 한다.
+const MAX_RECOVERY_POINTS = 3;
 
 // spec §5.1: 마이그레이션 전 SQLite-consistent snapshot.
-// 파일 복사는 금지 — WAL 이 반영되지 않는다. better-sqlite3 의 backup() 은
-// SQLite backup API 를 쓰므로 WAL 을 포함한 일관 스냅샷을 만든다.
+// 파일 복사는 금지 — WAL 이 반영되지 않는다. `VACUUM INTO` 는 WAL 을 반영한 일관
+// 스냅샷을 **동기로** 만든다(better-sqlite3 의 backup() 은 Promise 라 마이그레이션
+// 흐름에 섞이면 순서를 잃는다).
 //
 // 실패는 전부 throw = fail-closed. 백업 없이 스키마를 바꾸지 않는다:
 // 이 프로젝트군은 non-git 환경(Google Drive 폴더)에 배포되어 git 롤백이 없고,
@@ -159,53 +38,14 @@ export function backupBeforeMigration(
   if (pendingVersions.length === 0) return null;          // 대기 없으면 no-op
   if (!dbPath || dbPath === ':memory:') return null;      // 메모리 DB 는 대상 아님
 
-  // 백업 대상 판정 = "잃을 데이터가 있는가". 스키마 버전만으로 판정하면
-  // migration metadata 가 없거나 비어 있는데 실제 데이터는 있는 DB(수동 복사본,
-  // 부분 복구본)를 백업 없이 통과시킨다(advisor 구현리뷰 r1 발견 6).
-  // 그래서 버전과 실제 행 수를 함께 본다.
-  const hasData = (() => {
-    for (const t of ['entities', 'documents', 'relationships']) {
-      const exists = db.prepare(
-        `SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(t);
-      if (!exists) continue;
-      const n = db.prepare(`SELECT COUNT(*) c FROM ${t}`).get() as { c: number };
-      if (n.c > 0) return true;
-    }
-    return false;
-  })();
-  // 진짜 빈 신규 DB 만 건너뛴다. 이 가드가 없으면 같은 경로를 재사용하는
-  // 정상 경로(서버 재시작·테스트가 DB 를 지우고 재생성)에서 남은 .bak 때문에
-  // 두 번째 부팅이 죽는다 — fail-closed 가 정상 운영을 막으면 게이트가 아니다.
-  if (currentVersion <= 0 && !hasData) return null;
+  // 백업 대상 판정 = "잃을 데이터가 있는가". 스키마 버전만으로 판정하면 migration
+  // metadata 가 없는데 실제 데이터는 있는 DB(수동 복사본·부분 복구본)를 무백업으로
+  // 통과시킨다. 그리고 **테이블 목록을 하드코딩하면 그 목록 밖의 데이터가 안 보인다**
+  // — `embedding_profiles` 에만 행이 있는 version-0 DB 가 그렇게 통과했다
+  // (advisor beta r6 발견 P0-3). 그래서 사용자 테이블 전체를 본다.
+  if (currentVersion <= 0 && !hasAnyUserRows(db)) return null;
 
-  const target = `${dbPath}.v${currentVersion}.bak`;
-
-  // 기존 backup 은 절대 overwrite 하지 않는다 (spec §5.1-3). 다만 "존재하면 거부"는
-  // 너무 강했다: 마이그레이션이 한 번 실패하면 .bak 이 남고, 그 뒤 모든 재시작이
-  // 마이그레이션에 진입하기도 전에 죽는다 = fleet 자동 재시작 환경에서 영구 crashloop
-  // 이고, spec 의 crash 후 resume 요구와 정면으로 충돌한다(advisor beta 발견 3).
-  //
-  // 필요한 보장은 "지금의 pre-migration 상태에 대한 유효한 복구점이 존재한다"이다.
-  // 남아 있는 .bak 이 온전하고 **논리 상태가 live 와 동일**하면 그 보장은 이미
-  // 충족돼 있다 — 새로 만들 이유도, 덮어쓸 이유도 없다. 그래서 **검증 후 재사용**하고,
-  // 검증에 실패하면 보존한 채 거부한다(그건 사람이 봐야 하는 상태다).
-  const liveDigest = logicalDigest(db);
-
-  if (existsSync(target)) {
-    const reused = verifyExistingBackup(target, liveDigest, digestSections(db));
-    if (!reused.ok) {
-      throw new Error(
-        `migration backup refused: ${target} already exists but is not a usable recovery point ` +
-        `for this database (${reused.reason}). Move or remove it deliberately — overwriting it ` +
-        `would destroy whatever it does contain.`);
-    }
-    console.error(`  ├─ 🛟 reusing verified backup ${target} (logical state identical to live)`);
-    return { path: target, sha256: reused.sha256 };
-  }
-
-  // SQLite backup API. 동기 완료를 보장하려면 VACUUM INTO 가 더 단순하고
-  // better-sqlite3 의 backup() 은 Promise 라 마이그레이션 흐름과 섞이면
-  // 순서를 잃는다. VACUUM INTO 는 WAL 을 반영한 일관 스냅샷을 동기로 만든다.
+  const target = pickRecoverySlot(`${dbPath}.v${currentVersion}.bak`);
   db.exec(`VACUUM INTO '${target.replace(/'/g, "''")}'`);
 
   // quick_check + 복원 시험 (spec §5.1-2)
@@ -225,6 +65,44 @@ export function backupBeforeMigration(
   return { path: target, sha256 };
 }
 
+// 다음 빈 복구점 슬롯. 기존 파일은 읽지도, 검증하지도, 건드리지도 않는다 —
+// 그것들이 무엇인지 판정하려는 시도가 앞선 세 판본의 결함 전부였다.
+function pickRecoverySlot(base: string): string {
+  if (!existsSync(base)) return base;
+  for (let i = 1; i < MAX_RECOVERY_POINTS; i++) {
+    const candidate = `${base}.${i}`;
+    if (!existsSync(candidate)) return candidate;
+  }
+  throw new Error(
+    `migration refused: ${MAX_RECOVERY_POINTS} recovery points already exist for this schema ` +
+    `version (${base} and ${MAX_RECOVERY_POINTS - 1} numbered siblings). The migration has failed ` +
+    `repeatedly — inspect the database and move the backups aside deliberately rather than letting ` +
+    `another attempt run.`);
+}
+
+// 사용자 테이블 중 하나라도 행이 있으면 잃을 데이터가 있다.
+// 목록은 스키마에서 얻는다(하드코딩하면 새 테이블이 조용히 검사 밖에 남는다).
+// `schema_migrations` 는 순수 메타데이터라 제외한다 — 그것만 있는 DB 는 빈 DB 다.
+// 가상 테이블은 자기 shadow 테이블을 통해 이미 세어진다.
+function hasAnyUserRows(db: Database.Database): boolean {
+  const tables = db.prepare(
+    `SELECT name, sql FROM sqlite_schema WHERE type='table'
+       AND name <> 'schema_migrations'
+     ORDER BY name`).all() as Array<{ name: string; sql: string | null }>;
+  for (const t of tables) {
+    if (/CREATE VIRTUAL TABLE/i.test(t.sql ?? '')) continue;
+    const qt = `"${t.name.replace(/"/g, '""')}"`;
+    try {
+      const n = db.prepare(`SELECT EXISTS(SELECT 1 FROM ${qt}) e`).get() as { e: number };
+      if (n.e) return true;
+    } catch {
+      // 읽을 수 없는 테이블이 있으면 "빈 DB"라고 단정하지 않는다 = 백업한다.
+      return true;
+    }
+  }
+  return false;
+}
+
 // 스트리밍 해시. readFileSync 로 전체를 메모리에 올리면 fleet 의 큰 DB 에서
 // OOM 위험이 있다(advisor 구현리뷰 r1 발견 6).
 function streamSha256(path: string): string {
@@ -236,41 +114,4 @@ function streamSha256(path: string): string {
     while ((n = readSync(fd, buf, 0, buf.length, null)) > 0) h.update(buf.subarray(0, n));
   } finally { closeSync(fd); }
   return h.digest('hex');
-}
-
-// 남아 있는 .bak 이 지금의 pre-migration 복구점으로 쓸 수 있는가 = 온전하고,
-// 논리 상태가 live 와 동일한가.
-function verifyExistingBackup(
-  target: string, liveDigest: string, liveSections?: Record<string, string>
-): { ok: true; sha256: string } | { ok: false; reason: string } {
-  try {
-    if (statSync(target).size === 0) return { ok: false, reason: 'zero bytes' };
-    const db = new Database(target, { readonly: true });
-    try {
-      const ok = db.pragma('quick_check', { simple: true });
-      if (ok !== 'ok') return { ok: false, reason: `quick_check ${ok}` };
-      const n = db.prepare(`SELECT COUNT(*) c FROM sqlite_master`).get() as { c: number };
-      if (!n || n.c === 0) return { ok: false, reason: 'empty schema' };
-      // 스키마 버전을 따로 검사하지 않는다. 다이제스트가 `schema_migrations` 를 포함하므로
-      // **다이제스트가 같으면 버전도 같다** — 별도 검사는 안전을 더하지 않고 모순만 만든다
-      // (`schema_migrations` 가 없는 구 DB 에서 내부 버전이 0으로 읽혀 호출자의
-      // currentVersion 과 어긋나 정상 재시도를 거부했다). 파일명의 .vN 은 사람용 표지다.
-      //
-      // 상태 동일성. 이게 유일한 기준이다 — 다르면 (다른 프로젝트의 백업이든
-      // 실패 후 live 가 변한 것이든) 지금의 복구점이 아니므로 보존한 채 멈춘다.
-      const bakDigest = logicalDigest(db);
-      if (bakDigest !== liveDigest) {
-        const differing = liveSections ? diffSections(liveSections, digestSections(db)) : [];
-        return { ok: false, reason:
-          `logical state differs from live (backup ${bakDigest.slice(0, 12)}…, ` +
-          `live ${liveDigest.slice(0, 12)}…) — it is not a snapshot of the current state` +
-          (differing.length ? `; differing: ${differing.join(', ')}` : '') };
-      }
-    } finally {
-      db.close();
-    }
-    return { ok: true, sha256: streamSha256(target) };
-  } catch (e) {
-    return { ok: false, reason: `unreadable: ${(e as Error).message}` };
-  }
 }

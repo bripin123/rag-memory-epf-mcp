@@ -181,13 +181,14 @@ the `active` revisions.
   a delete, and a batch where any item matches two or more active revisions **aborts with zero
   mutations** — v3.6 deleted every duplicate and carried on, but a machine cannot tell which
   revision was meant. Use `retractObservation(observation_id)` to say which one.
-- Migration to v13 takes a verified backup first (`<db>.v12.bak`) and **never overwrites one**. If a
-  backup is already there it is reused only when its **logical state is identical to the live
-  database** — every schema object plus every row of every real table, hashed. Anything else is
-  refused with the differing sections named, so one transient failure cannot brick every subsequent
-  restart and a recovery point is never written over. Conversion runs in one transaction with two
-  gates: `PRAGMA foreign_key_check`, then a byte-exact comparison of the rebuilt projection against
-  the original array. `foreign_keys` is checked at boot and the server refuses to migrate without it.
+- Migration to v13 takes a verified backup first (`<db>.v12.bak`) and **never overwrites one**. A
+  backup is written before any schema change, so if one is already present the next attempt simply
+  writes to the next free slot (`.bak.1`, `.bak.2`) — every file is a valid pre-migration snapshot by
+  construction, and nothing has to prove that one matches the live database. Slots are bounded: once
+  they are full the migration refuses to run, because a migration failing three times in a row needs
+  a person. Conversion runs in one transaction with two gates: `PRAGMA foreign_key_check`, then a
+  byte-exact comparison of the rebuilt projection against the original array. `foreign_keys` is
+  checked at boot and the server refuses to migrate without it.
 
 ### v3.6.0
 - **Lite install / lazy boot**: the MCP server connects immediately — FTS5 search, knowledge graph and CRUD work from the first second, while the bge-m3 model (~1.2GB) loads or downloads in the background. Hybrid search switches on automatically. Requires Node **>= 24**.
