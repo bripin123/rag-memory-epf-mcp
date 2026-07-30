@@ -382,18 +382,23 @@ for (const [label, make] of [
 // --- 백업은 복원했을 때 실제로 쓸 수 있어야 한다 (FTS external-content 포함) ---
 // `quick_check` 는 페이지 구조만 본다. `entities` 는 hidden ROWID 테이블이고
 // `entities_fts` 가 `content_rowid='rowid'` 로 그것을 참조하므로, ROWID 가 재번호된
-// 스냅샷은 quick_check 를 통과하면서도 복원 후 FTS 쿼리가 깨진다(advisor beta r7 P0-1).
-// 그래서 대조군은 digest 가 아니라 **복원 후 동작**이다.
+// 스냅샷은 quick_check 를 통과하면서도 복원 후 FTS 가 깨진다(advisor beta r7 P0-1).
+//
+// **`rank = 1` 이 필수다.** 인자 없는 integrity-check 는 external-content 를 대조하지
+// 않아서, 불일치 스냅샷에서도 통과한다(r8 P0 — 이 테스트의 첫 판이 그래서 무력했다).
 {
   const { dir: d, dbPath } = await makeV12Db({ FtsRestore: ['searchable observation alpha'] });
-  // rowid 간격을 만든다 (재번호가 일어난다면 여기서 드러난다)
+  // ROWID 간격을 실제로 만든다: 2·3 을 만든 뒤 **가운데(2)를 지운다**.
+  // 지운 뒤 새로 넣으면 SQLite 가 max+1 을 주므로 간격이 안 생긴다(첫 판의 오류).
   const seed = new Database(dbPath);
   seed.prepare(`INSERT INTO entities (id,name,observations,created_at)
-                VALUES ('entity_gap','Gap','["gap"]','2020-01-01T00:00:00Z')`).run();
-  seed.prepare(`DELETE FROM entities WHERE id='entity_gap'`).run();
+                VALUES ('entity_mid','Mid','["middle"]','2020-01-01T00:00:00Z')`).run();
   seed.prepare(`INSERT INTO entities (id,name,observations,created_at)
-                VALUES ('entity_after','After','["after the gap"]','2020-01-01T00:00:00Z')`).run();
+                VALUES ('entity_after','After','["zzuniqueafterzz token"]','2020-01-01T00:00:00Z')`).run();
+  seed.prepare(`DELETE FROM entities WHERE id='entity_mid'`).run();
   const liveRowids = seed.prepare(`SELECT rowid FROM entities ORDER BY rowid`).all().map(r => r.rowid);
+  assert.deepEqual(liveRowids, [1, 3],
+    `fixture must have a real ROWID gap, got ${JSON.stringify(liveRowids)}`);
   seed.close();
 
   const migMod = await import(`../dist/src/migrations/migrations.js`);
@@ -403,23 +408,53 @@ for (const [label, make] of [
 
   const bakName = readdirSync(d).find(f => f.includes('.v12.bak'));
   assert.ok(bakName, 'no backup produced');
-  // 백업을 복원처럼 열어 실제로 쓴다
   const restored = new Database(join(d, bakName));
   assert.deepEqual(restored.prepare(`SELECT rowid FROM entities ORDER BY rowid`).all().map(r => r.rowid),
-    liveRowids, 'the snapshot renumbered ROWIDs — external-content FTS would be inconsistent');
-  restored.exec(`INSERT INTO entities_fts(entities_fts) VALUES('integrity-check')`);
+    [1, 3], 'the snapshot renumbered ROWIDs — external-content FTS would be inconsistent');
+  restored.exec(`INSERT INTO entities_fts(entities_fts, rank) VALUES('integrity-check', 1)`);
+
+  // 간격 **뒤** 행(rowid 3)의 고유 토큰을 content 테이블과 JOIN 해서 회수한다.
+  // rowid 1 만 확인하면 간격 뒤가 깨져도 통과한다.
   const hit = restored.prepare(
-    `SELECT COUNT(*) c FROM entities_fts WHERE entities_fts MATCH 'alpha'`).get().c;
-  assert.ok(hit >= 1, 'FTS returns nothing from the restored snapshot');
+    `SELECT e.id FROM entities_fts f JOIN entities e ON e.rowid = f.rowid
+     WHERE entities_fts MATCH 'zzuniqueafterzz'`).all();
+  assert.deepEqual(hit.map(r => r.id), ['entity_after'],
+    'FTS did not resolve the row after the gap through its content rowid');
   const gone = restored.prepare(
     `SELECT COUNT(*) c FROM entities_fts WHERE entities_fts MATCH 'nonexistentxyz'`).get().c;
   assert.equal(gone, 0, 'FTS oracle is vacuous — it matches everything');
   restored.close();
-  // 그리고 partial 임시 파일이 남지 않았다
   assert.deepEqual(readdirSync(d).filter(f => f.includes('.partial-')), [],
     'a partial backup file was left behind');
   rmSync(d, { recursive: true, force: true });
-  console.log('  OK: restored backup keeps ROWIDs and FTS works (not just quick_check)');
+  console.log('  OK: restored backup keeps the ROWID gap and resolves FTS through it (rank=1)');
+}
+
+// --- external-content 가 어긋난 스냅샷은 **발행 전에** 거부된다 ---
+// 검증이 실제로 게이트인지 = 틀린 것을 거부하는지를 본다. 이게 없으면 위 대조군은
+// "정상 케이스가 정상이다"만 말한다.
+{
+  const { dir: d, dbPath } = await makeV12Db({ FtsBroken: ['token here'] });
+  // 인덱스에 content 없는 rowid 를 심는다 → quick_check ok, rank 없는 검사 통과, rank=1 실패
+  const seed = new Database(dbPath);
+  seed.prepare(`INSERT INTO entities_fts(rowid, name, observations)
+                VALUES (99999, 'ghost', 'ghosttoken')`).run();
+  assert.equal(seed.pragma('quick_check', { simple: true }), 'ok',
+    'probe must stay structurally valid — that is the point');
+  seed.exec(`INSERT INTO entities_fts(entities_fts) VALUES('integrity-check')`);  // rank 없이는 통과
+  seed.close();
+
+  let err = null;
+  try { const m = await reopen(dbPath); m.cleanup?.(); } catch (e) { err = String(e.message); }
+  assert.ok(err, 'a snapshot with an inconsistent external-content index was published');
+  assert.match(err, /FTS5 integrity-check/i, `unexpected error: ${err}`);
+  // 그리고 아무것도 발행되지 않았고 임시 파일도 남지 않았다
+  assert.deepEqual(readdirSync(d).filter(f => f.includes('.bak')), [],
+    'a rejected snapshot was published to a slot anyway');
+  assert.deepEqual(readdirSync(d).filter(f => f.includes('.partial-')), [],
+    'the rejected temp file was left behind');
+  rmSync(d, { recursive: true, force: true });
+  console.log('  OK: inconsistent external-content snapshot refused before publish');
 }
 
 console.log('observation-migration: ALL OK');

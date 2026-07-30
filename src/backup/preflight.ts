@@ -85,7 +85,13 @@ function verifyRecoveryPoint(path: string): void {
     for (const { name } of fts) {
       const q = `"${name.replace(/"/g, '""')}"`;
       try {
-        v.exec(`INSERT INTO ${q}(${q}) VALUES('integrity-check')`);
+        // **`rank = 1` 이 필수다.** 인자 없는 integrity-check 는 인덱스가 자기 자신과
+        // 정합한지만 본다 — external-content 테이블과의 대조는 하지 않는다. 실측:
+        // 인덱스에 content 없는 rowid 를 심어 놓으면 `quick_check` 도, 인자 없는
+        // integrity-check 도 **통과**하고 `rank=1` 만 malformed 를 던진다.
+        // 즉 rank 없이 부르면 이 검사를 넣은 이유였던 실패 모드를 못 잡는다
+        // (advisor beta r8 P0, 같은 런타임에서 재현).
+        v.exec(`INSERT INTO ${q}(${q}, rank) VALUES('integrity-check', 1)`);
       } catch (e) {
         throw new Error(
           `migration backup failed FTS5 integrity-check on ${name}: ${(e as Error).message}. ` +
