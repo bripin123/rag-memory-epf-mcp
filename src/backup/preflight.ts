@@ -1,4 +1,4 @@
-import { existsSync, statSync, readFileSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 
@@ -18,11 +18,24 @@ export function backupBeforeMigration(
   if (pendingVersions.length === 0) return null;          // 대기 없으면 no-op
   if (!dbPath || dbPath === ':memory:') return null;      // 메모리 DB 는 대상 아님
 
-  // 신규 DB(스키마 버전 0)는 백업 대상이 아니다 — 잃을 데이터가 없다.
-  // 이 가드가 없으면 같은 경로를 재사용하는 정상 경로(서버 재시작·테스트가
-  // DB 파일을 지우고 다시 만드는 경우)에서 남아 있던 .bak 때문에 두 번째
-  // 부팅이 죽는다. fail-closed 가 정상 운영을 막으면 그것은 게이트가 아니다.
-  if (currentVersion <= 0) return null;
+  // 백업 대상 판정 = "잃을 데이터가 있는가". 스키마 버전만으로 판정하면
+  // migration metadata 가 없거나 비어 있는데 실제 데이터는 있는 DB(수동 복사본,
+  // 부분 복구본)를 백업 없이 통과시킨다(advisor 구현리뷰 r1 발견 6).
+  // 그래서 버전과 실제 행 수를 함께 본다.
+  const hasData = (() => {
+    for (const t of ['entities', 'documents', 'relationships']) {
+      const exists = db.prepare(
+        `SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(t);
+      if (!exists) continue;
+      const n = db.prepare(`SELECT COUNT(*) c FROM ${t}`).get() as { c: number };
+      if (n.c > 0) return true;
+    }
+    return false;
+  })();
+  // 진짜 빈 신규 DB 만 건너뛴다. 이 가드가 없으면 같은 경로를 재사용하는
+  // 정상 경로(서버 재시작·테스트가 DB 를 지우고 재생성)에서 남은 .bak 때문에
+  // 두 번째 부팅이 죽는다 — fail-closed 가 정상 운영을 막으면 게이트가 아니다.
+  if (currentVersion <= 0 && !hasData) return null;
 
   const target = `${dbPath}.v${currentVersion}.bak`;
 
@@ -50,7 +63,18 @@ export function backupBeforeMigration(
   }
 
   if (statSync(target).size === 0) throw new Error('migration backup is empty');
-  const sha256 = createHash('sha256').update(readFileSync(target)).digest('hex');
+  // 스트리밍 해시. readFileSync 로 전체를 메모리에 올리면 fleet 의 큰 DB 에서
+  // OOM 위험이 있다(advisor 구현리뷰 r1 발견 6).
+  const sha256 = (() => {
+    const h = createHash('sha256');
+    const fd = openSync(target, 'r');
+    try {
+      const buf = Buffer.allocUnsafe(1 << 20);
+      let n: number;
+      while ((n = readSync(fd, buf, 0, buf.length, null)) > 0) h.update(buf.subarray(0, n));
+    } finally { closeSync(fd); }
+    return h.digest('hex');
+  })();
   console.error(`  ├─ 🛟 backup ${target} (sha256 ${sha256.slice(0, 12)}…)`);
   return { path: target, sha256 };
 }

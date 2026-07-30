@@ -62,13 +62,12 @@ export function addRevision(db: Database.Database, a: {
     VALUES (?, ?, ?, 1, ?, ?, ?, NULL, ?, NULL)`)
     .run(obsId, rootId, a.entityId, order, a.content, a.status, a.ts);
 
-  // observation_sources.source_ref 는 NOT NULL 이므로 출처가 없으면 기본값을 쓴다.
-  // spec §6.1 은 sources 를 optional 로 두었을 뿐 기본값을 정하지 않았다 —
-  // 이 값은 구현 결정이며 spec 에 역기록한다.
-  const srcs: SourceInput[] = a.sources?.length
-    ? a.sources
-    : [{ source_kind: 'conversation', source_ref: 'unspecified', source_hash: null }];
-  linkSources(db, obsId, srcs, a.ts);
+  // 출처를 모르면 source 행을 만들지 않는다.
+  // source_ref 가 NOT NULL 인 것은 "행을 반드시 만들라"는 뜻이 아니다.
+  // sources 가 생략됐는데 conversation/unspecified 를 넣으면 "대화에서 왔다"는
+  // 사실을 발명하는 것이고, provenance 의 목적과 정반대다
+  // (advisor 구현리뷰 r1 발견 5). unknown 은 0행으로 표현한다.
+  if (a.sources?.length) linkSources(db, obsId, a.sources, a.ts);
 
   recordEvent(db, { rootId, event: 'add', toId: obsId, actor: a.actor ?? null, ts: a.ts });
   return obsId;

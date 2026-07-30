@@ -254,6 +254,108 @@ const proj = (eid) => JSON.parse(db.prepare(`SELECT observations FROM entities W
   console.log('  OK: purgeObservation');
 }
 
+// ============================================================
+// advisor 구현리뷰 r1 회귀 — 내 테스트가 가리고 있던 결함들
+// ============================================================
+
+// --- ADV1: 무변경 writer 가 정상 벡터를 지우지 않는다 ---
+{
+  await mgr.createEntities([{ name: 'ADV1', entityType: 'CONCEPT', observations: ['x'] }]);
+  const eid = 'entity_adv1';
+  const putVector = () => db.prepare(
+    `INSERT OR REPLACE INTO entity_embedding_metadata (entity_id, embedding_text) VALUES (?, 'v')`).run(eid);
+  const hasVector = () => count('entity_embedding_metadata', `entity_id=?`, eid);
+
+  // (a) 무변경 upsert
+  putVector();
+  await mgr.createEntities([{ name: 'ADV1', entityType: 'CONCEPT', observations: ['x'] }]);
+  assert.equal(hasVector(), 1, 'ADV1a: no-op upsert must not drop the vector');
+
+  // (b) 빈 contents
+  await mgr.addObservations([{ entityName: 'ADV1', contents: [] }]);
+  assert.equal(hasVector(), 1, 'ADV1b: empty contents must not drop the vector');
+
+  // (c) dedup-only add
+  await mgr.addObservations([{ entityName: 'ADV1', contents: ['x'] }]);
+  assert.equal(hasVector(), 1, 'ADV1c: dedup-only add must not drop the vector');
+
+  // (d) createRelations 의 기존 endpoint 확인도 같은 경로다
+  await mgr.createEntities([{ name: 'ADV1b', entityType: 'CONCEPT', observations: ['y'] }]);
+  putVector();
+  await mgr.createRelations([{ from: 'ADV1', to: 'ADV1b', relationType: 'RELATED_TO' }]);
+  assert.equal(hasVector(), 1, 'ADV1d: relation endpoint check must not drop the vector');
+
+  // (e) 실제 변경이면 무효화되어야 한다 (게이트가 반대로 죽지 않았는지)
+  await mgr.addObservations([{ entityName: 'ADV1', contents: ['genuinely new'] }]);
+  assert.equal(hasVector(), 0, 'ADV1e: a real change must still invalidate');
+  console.log('  OK: ADV1 no-op writers preserve the vector');
+}
+
+// --- ADV2: createEntities 는 entity+lifecycle 이 한 트랜잭션 ---
+{
+  // 유효하지 않은 status 로 lifecycle INSERT 를 실패시키면 entity 행도 남지 않아야 한다
+  await assert.rejects(
+    () => mgr.createEntities([{ name: 'ADV2', entityType: 'CONCEPT',
+                               observations: ['x'], status: 'bogus' }]),
+    /CHECK constraint failed/, 'ADV2: invalid status must fail');
+  assert.equal(count('entities', `id='entity_adv2'`), 0,
+    'ADV2: entity row survived a failed lifecycle insert (split state)');
+  assert.equal(count('observation_roots', `entity_id='entity_adv2'`), 0, 'ADV2: roots');
+  console.log('  OK: ADV2 createEntities is atomic');
+}
+
+// --- ADV3: shim 은 중복 입력에도 0-mutation 또는 전량 성공 ---
+{
+  await mgr.createEntities([{ name: 'ADV3', entityType: 'CONCEPT', observations: ['dupitem'] }]);
+  const eid = 'entity_adv3';
+  const content = db.prepare(`SELECT content FROM entity_observations WHERE entity_id=?`).get(eid).content;
+  const before = db.prepare(`SELECT observation_id, status FROM entity_observations WHERE entity_id=?`).all(eid);
+
+  // 같은 (entity, content) 를 두 항목에 넣는다 -> id dedup 으로 한 번만 retract
+  const out = await mgr.deleteObservations([
+    { entityName: 'ADV3', observations: [content] },
+    { entityName: 'ADV3', observations: [content] },
+  ]);
+  assert.equal(out.total_deleted, 1, 'ADV3: duplicate items must collapse to one retract');
+  const after = db.prepare(`SELECT status FROM entity_observations WHERE entity_id=?`).all(eid);
+  assert.equal(after[0].status, 'retracted', 'ADV3: retract applied');
+  assert.equal(after.length, before.length, 'ADV3: no extra revisions');
+  console.log('  OK: ADV3 shim collapses duplicate ids');
+}
+
+// --- ADV4: purge 는 suffix purge 이고 event 가 dangling 되지 않는다 ---
+{
+  await mgr.createEntities([{ name: 'ADV4', entityType: 'CONCEPT', observations: ['c1'] }]);
+  const eid = 'entity_adv4';
+  const o1 = db.prepare(`SELECT observation_id FROM entity_observations WHERE entity_id=?`).get(eid).observation_id;
+  const o2 = await mgr.correctObservation(o1, 'c2', 'correction', 'x');
+  const o3 = await mgr.correctObservation(o2, 'c3', 'correction', 'y');
+  const rid = db.prepare(`SELECT root_id FROM observation_roots WHERE entity_id=?`).get(eid).root_id;
+  assert.equal(count('entity_observations', `root_id=?`, rid), 3, 'ADV4: 3-revision chain');
+
+  // 가운데(rev2)를 purge -> rev3 도 함께 사라진다 (suffix)
+  const r = await mgr.purgeObservation(o2, 'PURGE');
+  assert.equal(r.purged, 2, 'ADV4: purging rev2 must remove rev2 and rev3');
+  assert.equal(count('entity_observations', `root_id=?`, rid), 1, 'ADV4: only rev1 remains');
+  // dangling event 가 없다
+  const dangling = db.prepare(`SELECT COUNT(*) c FROM observation_events e
+    WHERE (e.from_id IS NOT NULL AND e.from_id NOT IN (SELECT observation_id FROM entity_observations))
+       OR (e.to_id   IS NOT NULL AND e.to_id   NOT IN (SELECT observation_id FROM entity_observations))`).get().c;
+  assert.equal(dangling, 0, 'ADV4: events dangle after purge');
+  // root 는 남아 순번을 예약한다
+  assert.equal(count('observation_roots', `root_id=?`, rid), 1, 'ADV4: root must survive');
+  console.log('  OK: ADV4 suffix purge, no dangling events');
+}
+
+// --- ADV5: 출처를 모르면 source 행을 만들지 않는다 (허위 provenance 금지) ---
+{
+  await mgr.createEntities([{ name: 'ADV5', entityType: 'CONCEPT', observations: ['no source'] }]);
+  const oid = db.prepare(`SELECT observation_id FROM entity_observations WHERE entity_id='entity_adv5'`).get().observation_id;
+  assert.equal(count('observation_sources', `observation_id=?`, oid), 0,
+    'ADV5: unknown provenance must be 0 rows, not an invented conversation source');
+  console.log('  OK: ADV5 no invented provenance');
+}
+
 mgr.cleanup?.();
 rmSync(dir, { recursive: true, force: true });
 console.log('observation-lifecycle: ALL OK');
