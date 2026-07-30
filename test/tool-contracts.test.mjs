@@ -142,6 +142,14 @@ rmSync(dir, { recursive: true, force: true });
     'declineObservation must require a reason');
   assert.deepEqual(byName.retractObservation.inputSchema.required, ['observation_id'],
     'retractObservation reason is optional');
+
+  // nested strict 도 광고돼야 한다. importGraph.data 는 런타임에서 unknown 키를
+  // 거부하는데 광고 스키마가 침묵하면 클라이언트는 허용된다고 읽는다(beta r4 P2).
+  assert.equal(byName.importGraph.inputSchema.properties.data.additionalProperties, false,
+    'importGraph.data is strict at runtime but does not advertise it');
+  assert.equal(byName.importGraph.inputSchema.properties.data.properties.entities.items.type,
+    'object', 'dump rows must be advertised as objects, not strings');
+
   console.log(`  OK: registry<->dispatch parity (${registered.size} tools) + enum/literal schemas`);
 }
 

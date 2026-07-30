@@ -281,8 +281,10 @@ console.log('  OK: T11 fault injection (5 points: rollback, backup retained, res
 
 // --- 다른 DB 의 정상 .bak 은 재사용하지 않는다 ---
 // 손상 파일만 음성 대조군으로 쓰면 "정상 SQLite 이지만 남의 백업"이 통과한다.
-// 스키마 버전은 신원이 아니다 — fleet 의 다른 프로젝트 DB 도 v12 이고 quick_check 도 ok 다
-// (advisor beta r3 발견 1, 두 DB 로 실행 재현).
+// 스키마 버전은 판정 근거가 못 된다 — fleet 의 다른 프로젝트 DB 도 v12 이고
+// quick_check 도 ok 다 (advisor beta r3 발견 1, 두 DB 로 실행 재현).
+// 기준은 신원이 아니라 **논리 상태 동일성**이다(r4 P0 에서 신원 접근이 폐기됐다:
+// DB 내부 UUID 는 파일 복사와 함께 복제된다).
 {
   const A = await makeV12Db({ FleetA: ['a1'] });
   const B = await makeV12Db({ FleetB: ['b1'] });
@@ -299,12 +301,12 @@ console.log('  OK: T11 fault injection (5 points: rollback, backup retained, res
   let err = null;
   try { const m = await reopen(B.dbPath); m.cleanup?.(); } catch (e) { err = String(e.message); }
   assert.ok(err, "another database's backup was accepted as this one's recovery point");
-  assert.match(err, /belongs to database|instance id/i, `unexpected error: ${err}`);
+  assert.match(err, /logical state differs/i, `unexpected error: ${err}`);
   // 그리고 남의 백업을 덮어쓰지 않았다
   assert.ok(existsSync(`${B.dbPath}.v12.bak`), 'the foreign backup was destroyed');
   rmSync(A.dir, { recursive: true, force: true });
   rmSync(B.dir, { recursive: true, force: true });
-  console.log("  OK: another database's backup refused (identity, not just version)");
+  console.log("  OK: another database's backup refused (state equality, not version)");
 }
 
 // --- 실패 후 live 가 변한 뒤에는 옛 .bak 을 현 상태의 복구점으로 인정하지 않는다 ---
@@ -315,17 +317,84 @@ console.log('  OK: T11 fault injection (5 points: rollback, backup retained, res
   try { const m = await reopen(dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
   migMod.setMigrationFaultPoint(null);
 
-  // live 에 실제 쓰기를 넣는다 (백업 이후 상태가 앞서 나간 상황)
+  // **행 수를 바꾸지 않는** 변경을 넣는다. 새 행을 넣으면 COUNT 가 달라져서
+  // 약한 집계 지문도 잡는다 — 그건 지문을 시험하지 않는다. 같은 길이 교체가
+  // 통과하던 것이 실제 결함이었다(advisor beta r4 P0).
   const raw = new Database(dbPath);
-  raw.prepare(`INSERT INTO entities (id, name, observations) VALUES ('entity_drift2','Drift2','["x"]')`).run();
+  const beforeObs = raw.prepare(`SELECT observations FROM entities WHERE id='entity_drift'`).get().observations;
+  const sameLength = beforeObs.replace('d1', 'zZ');   // 길이 동일, 내용 다름
+  assert.equal(sameLength.length, beforeObs.length, 'probe must keep the length identical');
+  raw.prepare(`UPDATE entities SET observations=? WHERE id='entity_drift'`).run(sameLength);
   raw.close();
 
   let err = null;
   try { const m = await reopen(dbPath); m.cleanup?.(); } catch (e) { err = String(e.message); }
-  assert.ok(err, 'a stale backup was accepted after live diverged');
-  assert.match(err, /diverged|no longer a snapshot/i, `unexpected error: ${err}`);
+  assert.ok(err, 'a stale backup was accepted after a same-length change to live');
+  assert.match(err, /logical state differs|not a snapshot/i, `unexpected error: ${err}`);
   rmSync(d, { recursive: true, force: true });
-  console.log('  OK: diverged live refuses the older backup (content fingerprint)');
+  console.log('  OK: same-length change to live refuses the older backup (real digest)');
+}
+
+// --- 복제된 DB: 파일을 복사해도 상태가 갈리면 남의 .bak 을 쓰지 않는다 ---
+// fleet 에는 실제로 `_copy_`·`_backup` DB 들이 있다. DB 내부 신원값은 복사와 함께
+// 복제되므로 신원으로는 가를 수 없다 — 상태 동일성만이 기준이다(advisor beta r4 P0).
+{
+  const A = await makeV12Db({ Clone: ['c1'] });
+  const B = { dir: mkdtempSync(join(tmpdir(), 'rag-obs-clone-')) };
+  B.dbPath = join(B.dir, 'test.db');
+  copyFileSync(A.dbPath, B.dbPath);      // 완전 복제 = 내부 신원값까지 동일
+
+  // A 를 실패시켜 A 의 .bak 을 만든 뒤 B 자리로 옮긴다
+  const migMod = await import(`../dist/src/migrations/migrations.js`);
+  migMod.setMigrationFaultPoint('roots');
+  try { const m = await reopen(A.dbPath); m.cleanup?.(); } catch { /* 의도된 실패 */ }
+  migMod.setMigrationFaultPoint(null);
+  copyFileSync(join(A.dir, readdirSync(A.dir).find(f => f.endsWith('.bak'))), `${B.dbPath}.v12.bak`);
+
+  // 복제 직후에는 상태가 같으므로 재사용이 **허용**된다 (그게 맞는 계약이다)
+  const okRun = await reopen(B.dbPath);
+  assert.equal(okRun.db.prepare(`SELECT MAX(version) v FROM schema_migrations`).get().v, 13,
+    'an identical-state backup should have been reusable');
+  okRun.cleanup?.();
+
+  // 이제 B 를 v12 로 되돌리고 내용을 바꾼 뒤 다시 시도하면 거부돼야 한다
+  const raw = new Database(B.dbPath);
+  raw.exec(`DROP TABLE IF EXISTS observation_events; DROP TABLE IF EXISTS observation_sources;
+            DROP TABLE IF EXISTS entity_observations; DROP TABLE IF EXISTS observation_roots`);
+  raw.prepare(`DELETE FROM schema_migrations WHERE version=13`).run();
+  raw.prepare(`UPDATE entities SET name='Cl0ne' WHERE id='entity_clone'`).run();  // 같은 길이
+  raw.close();
+  let err2 = null;
+  try { const m = await reopen(B.dbPath); m.cleanup?.(); } catch (e) { err2 = String(e.message); }
+  assert.ok(err2, 'a cloned database reused a backup that no longer matches its state');
+  assert.match(err2, /logical state differs/i, `unexpected error: ${err2}`);
+  rmSync(A.dir, { recursive: true, force: true });
+  rmSync(B.dir, { recursive: true, force: true });
+  console.log('  OK: cloned DB — identical state reusable, diverged state refused');
+}
+
+// --- server_meta 가 없는 구 버전 DB 도 재사용이 된다 ---
+// 신원값을 server_meta 에 두던 판본은 pre-v12 DB 에서 "신원 없음"으로 영구 거부해
+// 같은 crashloop 을 다시 만들었다(advisor beta r4 P1). 논리 다이제스트는 의존하지 않는다.
+{
+  const dir = mkdtempSync(join(tmpdir(), 'rag-obs-prev12-'));
+  const dbPath = join(dir, 'test.db');
+  const raw = new Database(dbPath);
+  raw.exec(`CREATE TABLE entities (id TEXT PRIMARY KEY, name TEXT, observations TEXT)`);
+  raw.prepare(`INSERT INTO entities VALUES ('entity_old','Old','["legacy"]')`).run();
+  raw.close();
+  const { backupBeforeMigration } = await import('../dist/src/backup/preflight.js');
+  const open = () => { const d = new Database(dbPath); return d; };
+  const d1 = open();
+  const first = backupBeforeMigration(d1, dbPath, [12], 11);
+  d1.close();
+  assert.ok(first && existsSync(`${dbPath}.v11.bak`), 'no backup for a pre-v12 database');
+  const d2 = open();
+  const second = backupBeforeMigration(d2, dbPath, [12], 11);   // 재시도 = 거부되면 안 된다
+  d2.close();
+  assert.equal(second.path, first.path, 'pre-v12 retry did not reuse the existing backup');
+  rmSync(dir, { recursive: true, force: true });
+  console.log('  OK: pre-v12 DB (no server_meta) can still resume');
 }
 
 console.log('observation-migration: ALL OK');

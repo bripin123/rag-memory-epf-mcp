@@ -403,6 +403,59 @@ console.log('  OK: import invalidates derived state (merge true/false, non-empty
   console.log('  OK: unsupported dump keys rejected');
 }
 
+// --- writer 도 MCP 층을 통과해야 provenance 가 살아남는다 ---
+// importGraph 의 P0 은 "스키마에 필드가 없어 validateToolArgs 가 조용히 버린다"였고,
+// 그 사각은 manager 를 직접 부르는 테스트로는 절대 보이지 않는다. addObservations·
+// createEntities 의 sources/status 도 같은 경로를 지나므로 같은 방식으로 대조한다.
+{
+  const { validateToolArgs } = await import('../dist/src/tools/tool-registry.js');
+  const { m, d } = await freshManager();
+
+  const createArgs = validateToolArgs('createEntities', {
+    entities: [{ name: 'McpProv', entityType: 'CONCEPT', observations: ['from a doc'],
+                 status: 'provisional',
+                 sources: [{ source_kind: 'document', source_ref: 'doc-mcp', source_hash: 'abc' }] }],
+  });
+  const e0 = createArgs.entities[0];
+  assert.equal(e0.status, 'provisional', 'MCP validation dropped createEntities.status');
+  assert.equal(e0.sources?.length, 1, 'MCP validation dropped createEntities.sources');
+  assert.equal(e0.sources[0].source_hash, 'abc', 'MCP validation dropped source_hash');
+
+  await m.createEntities(createArgs.entities);
+  const mdb = m.db;
+  const rev = mdb.prepare(
+    `SELECT observation_id, status FROM entity_observations WHERE entity_id='entity_mcpprov'`).get();
+  assert.equal(rev.status, 'provisional', 'status did not reach the engine through MCP');
+  assert.equal(mdb.prepare(
+    `SELECT COUNT(*) c FROM observation_sources WHERE observation_id=?`).get(rev.observation_id).c, 1,
+    'provenance did not reach the engine through MCP');
+  // provisional 이므로 검색에 안 보인다
+  assert.ok(!JSON.stringify(await m.openNodes(['McpProv'])).includes('from a doc'),
+    'a provisional observation is visible to readers');
+
+  const addArgs = validateToolArgs('addObservations', {
+    observations: [{ entityName: 'McpProv', contents: ['second'],
+                     sources: [{ source_kind: 'decision', source_ref: 'D99' }] }],
+  });
+  assert.equal(addArgs.observations[0].sources?.length, 1,
+    'MCP validation dropped addObservations.sources');
+  const added = await m.addObservations(addArgs.observations);
+  assert.equal(mdb.prepare(`SELECT COUNT(*) c FROM observation_sources WHERE observation_id=?`)
+    .get(added[0].observation_ids[0]).c, 1, 'addObservations provenance lost through MCP');
+
+  // approve 하면 보인다 (전이도 MCP 인자로 통과)
+  const appArgs = validateToolArgs('approveObservation',
+    { observation_id: rev.observation_id, reason: 'verified' });
+  await m.approveObservation(appArgs.observation_id, appArgs.reason);
+  assert.ok(JSON.stringify(await m.openNodes(['McpProv'])).includes('from a doc'),
+    'approve did not make the observation visible');
+
+  m.cleanup?.();
+  rmSync(d, { recursive: true, force: true });
+  process.env.DB_FILE_PATH = join(dir, 'test.db');
+  console.log('  OK: writer provenance/status survive the MCP boundary');
+}
+
 // --- 계약: 알 수 없는 인자 거부 + history 선택자 정확히 하나 ---
 {
   const { validateToolArgs } = await import('../dist/src/tools/tool-registry.js');

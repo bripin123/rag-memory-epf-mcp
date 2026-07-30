@@ -115,6 +115,10 @@ function zodTypeToJsonSchema(zodType: any, fieldName: string): any {
           description: def.description || `${fieldName} object`,
           properties: objectProperties,
           required: objectRequired,
+          // 런타임이 strict 면 광고도 strict 라고 말해야 한다. 안 그러면 클라이언트가
+          // 여분 키를 허용된다고 읽고 서버에서 거부당한다 — importGraph.data 가
+          // 정확히 그 상태였다(advisor beta r4 남은 P2).
+          ...(def.unknownKeys === 'strict' && { additionalProperties: false }),
         };
       
       case 'ZodRecord':
