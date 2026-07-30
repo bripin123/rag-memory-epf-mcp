@@ -119,3 +119,60 @@ All other tools are additive (`embedding_status`, `endpoint_embedding_status`,
 stats `server` block). Error responses now set `isError: true`; embedding-gate
 errors are structured: `{code: "MODEL_NOT_READY" | "EMBEDDINGS_DISABLED",
 state, retry_after_ms?, message}`.
+
+## v4.0: migrating to schema v13 (observation lifecycle)
+
+### One process per database while migrating
+
+The migration runs during `initialize()`, before `server.connect()`, so within a
+single server there is no writer to race. **Two servers opened on the same database
+file at once are not supported**, and the migration window is where that matters:
+a commit landing between the backup and the migration is included in the migration
+but not in the recovery point, so restoring would lose it. This is not enforced by
+a lock — the deployment model is one server per project (`DB_FILE_PATH` per
+project's `.mcp.json`), and the rollout below preserves that. If you have arranged
+something else, stop the other process before upgrading.
+
+### Recovery points
+
+Before applying anything, the server writes a snapshot next to the database:
+`<db>.v<current>.bak`. It uses the SQLite Online Backup API, not `VACUUM INTO`,
+because VACUUM may renumber the ROWIDs of tables without an explicit
+`INTEGER PRIMARY KEY` — `entities` is such a table and `entities_fts` indexes it by
+ROWID, so a renumbered snapshot would pass `quick_check` and still fail FTS queries
+once restored. Every snapshot is verified before it is published: page-level
+`quick_check`, plus FTS5's own `integrity-check` on each full-text index.
+
+**An existing snapshot is never overwritten.** A second attempt writes `.bak.1`, a
+third `.bak.2`. Every file in that rotation was taken before any schema change, so
+each one is a valid pre-migration snapshot on its own — nothing has to prove which
+one matches the live database.
+
+To restore: stop the server, move the live database aside, copy the snapshot into
+its place, and start again. The engine will re-apply the migration.
+
+### Recovery-point slots are full
+
+If all three slots are taken, the server refuses to migrate and exits before it
+connects. **In an MCP client this looks like the server being unavailable**, and the
+explanation is only on stderr — check the client's MCP log for a line beginning
+`migration refused:`.
+
+The slot count is a circuit breaker for one schema version, not a disk quota (each
+version has its own set), and the files in it are not necessarily failed attempts —
+an unrelated or stale `.bak` occupies a slot just the same. Look at what is there,
+move aside what you do not need, and start the server again. Nothing is deleted for
+you: a recovery point is never removed automatically.
+
+### Rollout
+
+Canary one project, then three of different sizes, then the rest. At each step,
+confirm after the first boot:
+
+- the MCP log shows `backup <path>` followed by `Migration 13 applied successfully`
+- `getMigrationStatus` reports version 13
+- a search still returns results (`searchNodes` on a term you know exists)
+- `getObservationHistory({entity_name: "<some entity>"})` returns its roots
+
+Then kill the server mid-run and restart it once, to confirm a restart resumes
+rather than refusing.

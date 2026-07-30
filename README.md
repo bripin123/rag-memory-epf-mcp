@@ -181,14 +181,16 @@ the `active` revisions.
   a delete, and a batch where any item matches two or more active revisions **aborts with zero
   mutations** — v3.6 deleted every duplicate and carried on, but a machine cannot tell which
   revision was meant. Use `retractObservation(observation_id)` to say which one.
-- Migration to v13 takes a verified backup first (`<db>.v12.bak`) and **never overwrites one**. A
-  backup is written before any schema change, so if one is already present the next attempt simply
-  writes to the next free slot (`.bak.1`, `.bak.2`) — every file is a valid pre-migration snapshot by
-  construction, and nothing has to prove that one matches the live database. Slots are bounded: once
-  they are full the migration refuses to run, because a migration failing three times in a row needs
-  a person. Conversion runs in one transaction with two gates: `PRAGMA foreign_key_check`, then a
-  byte-exact comparison of the rebuilt projection against the original array. `foreign_keys` is
-  checked at boot and the server refuses to migrate without it.
+- Migration to v13 writes a recovery point first (`<db>.v12.bak`) using the SQLite Online Backup API,
+  and verifies it — `quick_check` plus FTS5's own `integrity-check`, because a snapshot can be
+  structurally valid and still have a broken full-text index. **An existing one is never
+  overwritten**: the next attempt writes `.bak.1`, then `.bak.2`. Every file in that rotation was
+  taken before any schema change, so each is a valid pre-migration snapshot on its own and nothing
+  has to prove which matches the live database. Slots are bounded and a full set refuses to migrate.
+  Conversion runs in one transaction with two gates: `PRAGMA foreign_key_check`, then a byte-exact
+  comparison of the rebuilt projection against the original array. `foreign_keys` is checked at boot
+  and the server refuses to migrate without it. Restore and slot-exhaustion runbook:
+  `docs/UPDATING.md`.
 
 ### v3.6.0
 - **Lite install / lazy boot**: the MCP server connects immediately — FTS5 search, knowledge graph and CRUD work from the first second, while the bge-m3 model (~1.2GB) loads or downloads in the background. Hybrid search switches on automatically. Requires Node **>= 24**.

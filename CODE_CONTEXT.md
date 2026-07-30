@@ -35,7 +35,7 @@ src/tools/              MCP tool *declarations* only (no behaviour)
   tool-registry.ts      allTools = spread of the five groups; convertToMCPTool; validateToolArgs
   types.ts              ToolDefinition · ToolCapabilityInfo · ToolRegistrationDescription
 
-src/backup/preflight.ts   pre-migration backup (VACUUM INTO) into the next free recovery slot; never overwrites, bounded, fails closed when full
+src/backup/preflight.ts   pre-migration backup (Online Backup API) into the next free recovery slot; verified (quick_check + FTS5 integrity-check), published no-clobber via link(), bounded, fails closed when full
 src/embeddingGate.ts      embedding admission control
 src/backfillCoordinator.ts  background embedding backfill
 src/modelCache.ts         version-independent model cache (v3.6)
@@ -145,8 +145,14 @@ manager method. Keep it that way — `validateToolArgs` is the only bridge.
   `CHECK (typeof(col) = 'integer')`.
 - `TEXT PRIMARY KEY` **permits NULL** in SQLite — write `NOT NULL` explicitly.
 - Embedding dimension is **1024, fixed**. Changing the model means a migration, not a config edit.
-- Use `VACUUM INTO` for synchronous copies. `db.backup()` returns a Promise and does not fit the
-  synchronous migration flow.
+- **Do not use `VACUUM INTO` to make a recovery point.** VACUUM may renumber the ROWIDs of tables
+  without an explicit `INTEGER PRIMARY KEY`, and `entities` is one — `entities_fts` indexes it by
+  ROWID, so a renumbered snapshot passes `quick_check` and fails FTS queries after a restore. Use
+  `await db.backup(...)` (Online Backup API), which is documented to produce a bitwise-identical
+  snapshot. The migration path is async; that was the only reason `VACUUM INTO` looked simpler.
+- **`quick_check` does not validate an external-content FTS5 index.** Run
+  `INSERT INTO <fts>(<fts>) VALUES('integrity-check')` when you need to know a snapshot is usable.
+- **Publish a file no-clobber with `linkSync`, not `renameSync`.** rename overwrites silently.
 - Node **>= 24** (`engines`). Published to npm as `rag-memory-epf-mcp`; **31 projects consume it**,
   so a schema or tool-contract change is a fleet event, not a local one.
 - A migration must be all-or-nothing: one transaction, and gates (`PRAGMA foreign_key_check`, plus

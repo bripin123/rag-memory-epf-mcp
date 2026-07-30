@@ -593,8 +593,10 @@ export class RAGKnowledgeGraphManager {
 
     // spec §5.1: 대기 중 마이그레이션이 있으면 먼저 일관 스냅샷을 남긴다.
     // 실패는 throw = fail-closed (백업 없이 스키마를 바꾸지 않는다).
-    backupBeforeMigration(this.db, DB_FILE_PATH, pendingBefore.map(m => m.version),
-                          migrationManager.getCurrentVersion());
+    // await: 백업은 Online Backup API 를 쓰므로 비동기다. 여기서 await 를 빠뜨리면
+    // 백업이 끝나기 전에 마이그레이션이 시작한다 = 백업 없이 스키마를 바꾸는 것이다.
+    await backupBeforeMigration(this.db, DB_FILE_PATH, pendingBefore.map(m => m.version),
+                                migrationManager.getCurrentVersion());
 
     // Run pending migrations
     const result = await migrationManager.runMigrations();

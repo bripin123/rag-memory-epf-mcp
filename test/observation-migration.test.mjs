@@ -292,7 +292,7 @@ console.log('  OK: T11 fault injection (5 points: rollback, backup retained, res
   let err = null;
   try { const m = await reopen(dbPath); m.cleanup?.(); } catch (e) { err = String(e.message); }
   assert.ok(err, 'a fourth attempt ran with all recovery slots full');
-  assert.match(err, /recovery points already exist/i, `unexpected error: ${err}`);
+  assert.match(err, /recovery-point slots .* are taken/i, `unexpected error: ${err}`);
   assert.deepEqual(readdirSync(d).filter(f => f.includes('.v12.bak')).sort(), baks,
     'the refused attempt changed the backup set');
   assert.deepEqual(baks.map(f => statSync(join(d, f)).size), before,
@@ -336,11 +336,11 @@ for (const [label, make] of [
   seed.prepare(`INSERT INTO entities VALUES ('entity_old','Old','["legacy"]')`).run();
   seed.close();
   const { backupBeforeMigration } = await import('../dist/src/backup/preflight.js');
-  const call = () => { const d = new Database(dbPath);
-    try { return backupBeforeMigration(d, dbPath, [12], 11); } finally { d.close(); } };
-  const first = call();
+  const call = async () => { const d = new Database(dbPath);
+    try { return await backupBeforeMigration(d, dbPath, [12], 11); } finally { d.close(); } };
+  const first = await call();
   assert.ok(first && existsSync(`${dbPath}.v11.bak`), 'no backup for a pre-v12 database');
-  const second = call();
+  const second = await call();
   assert.ok(second, 'pre-v12 retry was refused');
   assert.notEqual(second.path, first.path, 'the retry reused the same file instead of a new slot');
   assert.equal(second.path, `${dbPath}.v11.bak.1`);
@@ -360,7 +360,7 @@ for (const [label, make] of [
   seed.close();
   const { backupBeforeMigration } = await import('../dist/src/backup/preflight.js');
   const d = new Database(dbPath);
-  const got = backupBeforeMigration(d, dbPath, [1], 0);
+  const got = await backupBeforeMigration(d, dbPath, [1], 0);
   d.close();
   assert.ok(got, 'a version-0 database holding data was migrated without a backup');
   assert.ok(existsSync(`${dbPath}.v0.bak`), 'no backup file was produced');
@@ -370,13 +370,56 @@ for (const [label, make] of [
   const p2 = join(dir2, 'test.db');
   const e = new Database(p2);
   e.exec(`CREATE TABLE embedding_profiles (id INTEGER PRIMARY KEY, name TEXT)`);
-  const skipped = backupBeforeMigration(e, p2, [1], 0);
+  const skipped = await backupBeforeMigration(e, p2, [1], 0);
   e.close();
   assert.equal(skipped, null, 'a genuinely empty version-0 database should not be backed up');
   assert.deepEqual(readdirSync(dir2).filter(f => f.endsWith('.bak')), []);
   rmSync(dir, { recursive: true, force: true });
   rmSync(dir2, { recursive: true, force: true });
   console.log('  OK: version-0 with data is backed up; genuinely empty is skipped');
+}
+
+// --- 백업은 복원했을 때 실제로 쓸 수 있어야 한다 (FTS external-content 포함) ---
+// `quick_check` 는 페이지 구조만 본다. `entities` 는 hidden ROWID 테이블이고
+// `entities_fts` 가 `content_rowid='rowid'` 로 그것을 참조하므로, ROWID 가 재번호된
+// 스냅샷은 quick_check 를 통과하면서도 복원 후 FTS 쿼리가 깨진다(advisor beta r7 P0-1).
+// 그래서 대조군은 digest 가 아니라 **복원 후 동작**이다.
+{
+  const { dir: d, dbPath } = await makeV12Db({ FtsRestore: ['searchable observation alpha'] });
+  // rowid 간격을 만든다 (재번호가 일어난다면 여기서 드러난다)
+  const seed = new Database(dbPath);
+  seed.prepare(`INSERT INTO entities (id,name,observations,created_at)
+                VALUES ('entity_gap','Gap','["gap"]','2020-01-01T00:00:00Z')`).run();
+  seed.prepare(`DELETE FROM entities WHERE id='entity_gap'`).run();
+  seed.prepare(`INSERT INTO entities (id,name,observations,created_at)
+                VALUES ('entity_after','After','["after the gap"]','2020-01-01T00:00:00Z')`).run();
+  const liveRowids = seed.prepare(`SELECT rowid FROM entities ORDER BY rowid`).all().map(r => r.rowid);
+  seed.close();
+
+  const migMod = await import(`../dist/src/migrations/migrations.js`);
+  migMod.setMigrationFaultPoint('roots');
+  try { const m = await reopen(dbPath); m.cleanup?.(); } catch { /* 백업만 만들고 실패 */ }
+  migMod.setMigrationFaultPoint(null);
+
+  const bakName = readdirSync(d).find(f => f.includes('.v12.bak'));
+  assert.ok(bakName, 'no backup produced');
+  // 백업을 복원처럼 열어 실제로 쓴다
+  const restored = new Database(join(d, bakName));
+  assert.deepEqual(restored.prepare(`SELECT rowid FROM entities ORDER BY rowid`).all().map(r => r.rowid),
+    liveRowids, 'the snapshot renumbered ROWIDs — external-content FTS would be inconsistent');
+  restored.exec(`INSERT INTO entities_fts(entities_fts) VALUES('integrity-check')`);
+  const hit = restored.prepare(
+    `SELECT COUNT(*) c FROM entities_fts WHERE entities_fts MATCH 'alpha'`).get().c;
+  assert.ok(hit >= 1, 'FTS returns nothing from the restored snapshot');
+  const gone = restored.prepare(
+    `SELECT COUNT(*) c FROM entities_fts WHERE entities_fts MATCH 'nonexistentxyz'`).get().c;
+  assert.equal(gone, 0, 'FTS oracle is vacuous — it matches everything');
+  restored.close();
+  // 그리고 partial 임시 파일이 남지 않았다
+  assert.deepEqual(readdirSync(d).filter(f => f.includes('.partial-')), [],
+    'a partial backup file was left behind');
+  rmSync(d, { recursive: true, force: true });
+  console.log('  OK: restored backup keeps ROWIDs and FTS works (not just quick_check)');
 }
 
 console.log('observation-migration: ALL OK');
