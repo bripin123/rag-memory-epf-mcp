@@ -13,7 +13,8 @@ A **project-local RAG memory** MCP server — knowledge graph + multilingual vec
 - **3-signal hybrid search** — vector similarity (bge-m3, 1024-dim) + FTS5 BM25 keyword matching + knowledge graph re-ranking, combined via Reciprocal Rank Fusion
 - **100+ languages** — Korean, Chinese, Japanese, Arabic, and more. Cross-lingual search works out of the box.
 - **Graph-aware scoring** — per-entity geometric decay (0.5^i) with hard cap prevents any single document from dominating results
-- **31 MCP tools** — knowledge graph CRUD, document pipeline, hybrid search, multi-hop traversal, graph analytics (centrality / community detection / structure), export/import, temporal queries
+- **38 MCP tools** — knowledge graph CRUD, observation lifecycle (correct / retract / history), document pipeline, hybrid search, multi-hop traversal, graph analytics (centrality / community detection / structure), export/import, temporal queries
+- **Observations that hold their history** — corrections supersede instead of overwrite, search returns only current facts, and every revision keeps its provenance
 - **Codepoint-safe chunking** — chunk offsets are Unicode codepoints, language-neutral across SQL `substr`, Python slicing, and JS `[...str]` iteration. Korean/CJK/emoji documents stay aligned. Verified by a publish-time invariant test.
 - **SQLite optimized** — WAL mode, 32MB cache, 256MB mmap, FTS5 triggers, 7 indexes
 - **MCP SDK 1.27.1** — Tool Annotations (readOnly/destructive/idempotent), latest protocol 2025-11-25
@@ -36,7 +37,7 @@ A **project-local RAG memory** MCP server — knowledge graph + multilingual vec
 
 Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each project maintains completely isolated memory.
 
-## Tools (31)
+## Tools (38)
 
 ### Knowledge Graph (7)
 | Tool | Description | Annotation |
@@ -47,7 +48,18 @@ Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each 
 | `updateRelations` | Update relationship confidence and metadata | idempotent |
 | `deleteEntities` | Remove entities and relationships | destructive |
 | `deleteRelations` | Remove specific relationships | destructive |
-| `deleteObservations` | Remove specific observations | destructive |
+| `deleteObservations` | **Deprecated** soft-retract shim — see Observation Lifecycle | destructive |
+
+### Observation Lifecycle (7)
+| Tool | Description | Annotation |
+|------|------------|------------|
+| `correctObservation` | Supersede a revision with corrected text, keeping the old one | |
+| `retractObservation` | `active` → `retracted` (hidden from search, kept in history) | |
+| `restoreObservation` | `retracted` → `active` | |
+| `approveObservation` | `provisional` → `active` | |
+| `declineObservation` | `provisional` → `retracted` (reason required) | |
+| `purgeObservation` | Physically delete a revision and its successors (`confirm='PURGE'`) | destructive |
+| `getObservationHistory` | Every revision, status, provenance and event | read-only |
 
 ### Document Pipeline (9)
 | Tool | Description | Annotation |
@@ -121,7 +133,8 @@ storeDocument(id, content, metadata)
 │  │  ├── chunks (sqlite-vec, 1024-dim)     │  │
 │  │  ├── entity_embeddings (sqlite-vec)    │  │
 │  │  ├── entities_fts + chunks_fts (FTS5)  │  │
-│  │  └── 11 migrations (auto-applied)      │  │
+│  │  ├── observation lifecycle (4 tables)  │  │
+│  │  └── 13 migrations (auto-applied)      │  │
 │  └────────────────────────────────────────┘  │
 │                                              │
 │  bge-m3 (ONNX, 100+ langs)                   │
@@ -139,6 +152,40 @@ storeDocument(id, content, metadata)
 | `RAG_MEMORY_TRUST_LEGACY_VECTORS` | unset | Set `1` to grandfather pre-existing vectors under a **custom** `EMBEDDING_MODEL` (default model configs grandfather automatically) |
 
 ## Changelog
+
+### v3.7.0
+
+**Observation lifecycle (schema v13).** Observations used to be a JSON array of strings on the
+entity row. A correction overwrote a string, so the fact that it *was* a correction disappeared —
+and if you deleted the wrong duplicate, nothing recorded that either. Observations now have stable
+ids, provenance, and a status, and `entities.observations` becomes a projection synthesised from
+the `active` revisions.
+
+- **Corrections keep the previous revision.** `correctObservation(observation_id, content, change_kind, reason)`
+  marks the old revision `superseded` and inserts a new one that inherits its position in the array,
+  so a correction does not reorder anything.
+- **Search returns `active` revisions only.** A retracted or superseded fact stops coming back from
+  `openNodes` / `searchNodes` / `readGraph` / `getNeighbors` without being destroyed.
+- **`getObservationHistory({entity_name | observation_id | root_id})` is the only history surface.**
+  It always returns `{ roots: [...] }`, one root per logical observation, revisions oldest-first.
+- **State transitions are a table, not a guess**: `retract` / `restore` / `approve` / `decline`.
+  `superseded` is terminal. Anything outside the table is rejected.
+- **Provenance**: `addObservations` and `createEntities` accept `sources: [{source_kind, source_ref, source_hash?}]`.
+  Repeated content from a *new* source adds evidence to the existing revision instead of a duplicate.
+  Unknown provenance is zero source rows — the engine does not invent one.
+- **`observation_ids`**: `addObservations` and `createEntities` return ids aligned 1:1 with the input,
+  `null` where no revision was created (dedup or source-only).
+- **`purgeObservation(observation_id, 'PURGE')`** physically deletes, as a suffix purge from the
+  target to the newest revision of that root. It is separate, explicit, and almost never what you want.
+- **⚠️ BREAKING**: `deleteObservations` is deprecated. It now performs a soft **retract** instead of
+  a delete, and a batch where any item matches two or more active revisions **aborts with zero
+  mutations** — v3.6 deleted every duplicate and carried on, but a machine cannot tell which
+  revision was meant. Use `retractObservation(observation_id)` to say which one.
+- Migration to v13 takes a verified backup first (`<db>.v12.bak`) and **refuses to run if one
+  already exists**, so a failed migration does not get retried over its own snapshot. Conversion
+  runs in one transaction with two gates: `PRAGMA foreign_key_check`, then a byte-exact comparison
+  of the rebuilt projection against the original array. `foreign_keys` is now checked at boot and
+  the server refuses to migrate without it.
 
 ### v3.6.0
 - **Lite install / lazy boot**: the MCP server connects immediately — FTS5 search, knowledge graph and CRUD work from the first second, while the bge-m3 model (~1.2GB) loads or downloads in the background. Hybrid search switches on automatically. Requires Node **>= 24**.
