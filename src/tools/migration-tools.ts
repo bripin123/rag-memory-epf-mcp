@@ -114,7 +114,7 @@ Applies all pending database migrations to bring the schema up to the latest ver
 
   rollbackMigration: {
     capability: {
-      description: 'Rollback database to a specific migration version',
+      description: 'Rollback database to a specific migration version. v14+: rolling back the chunking_signature column does NOT restore old chunk boundaries (compatibility rollback only — the response carries semanticRollback:false and a warning).',
       parameters: {
         type: 'object',
         properties: {

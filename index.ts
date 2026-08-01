@@ -4121,7 +4121,7 @@ export class RAGKnowledgeGraphManager {
 
 
 
-  async rollbackMigration(targetVersion: number): Promise<{ rolledBack: number; currentVersion: number; rolledBackMigrations: Array<{ version: number; description: string }> }> {
+  async rollbackMigration(targetVersion: number): Promise<{ rolledBack: number; currentVersion: number; rolledBackMigrations: Array<{ version: number; description: string }>; semanticRollback?: boolean; warning?: string }> {
     if (!this.db) throw new Error('Database not initialized');
     
     const migrationManager = new MigrationManager(this.db);
@@ -4146,8 +4146,8 @@ export class RAGKnowledgeGraphManager {
       .sort((a, b) => b.version - a.version);
     
     migrationManager.rollback(targetVersion);
-    
-    return {
+
+    const result = {
       rolledBack: migrationsToRollback.length,
       currentVersion: migrationManager.getCurrentVersion(),
       rolledBackMigrations: migrationsToRollback.map(m => ({
@@ -4155,6 +4155,18 @@ export class RAGKnowledgeGraphManager {
         description: m.description
       }))
     };
+    // v14 rollback is a compatibility rollback ONLY (spec §6.3): dropping the
+    // chunking_signature column does not restore old chunk boundaries — c1 rows
+    // read fine on v13 code. Say so in the RESPONSE, not just the tool
+    // description, so a caller who rolled back sees the limit (advisor r5-10).
+    if (result.rolledBackMigrations.some(m => m.version === 14)) {
+      return {
+        ...result,
+        semanticRollback: false,
+        warning: 'v14 rollback removes the chunking_signature column only; chunk boundaries produced by chunker c1 are NOT restored (compatibility rollback). Data restore path = pre-migration backup snapshot.'
+      };
+    }
+    return result;
   }
 }
 

@@ -813,4 +813,30 @@ export const migrations: Migration[] = [
       db.exec(`DROP TABLE IF EXISTS observation_roots`);
     }
   }
+  ,{
+    version: 14,
+    description: 'Chunking signature: documents.chunking_signature (schema-only; backfill legacy-unknown)',
+    up: (db) => {
+      // spec §6.1: schema-only. 전환은 sync 의 content 변경 시에만 (spec §5.1, r4 D3).
+      // 백필값은 'legacy-unknown', NOT 'bpe-800-160': custom chunkDocument 파라미터가
+      // 기록된 적 없어 단정하면 거짓 표기가 된다 (advisor r1).
+      const before = (db.prepare(`SELECT count(*) AS n FROM documents`).get() as { n: number }).n;
+      db.exec(`ALTER TABLE documents ADD COLUMN chunking_signature TEXT NOT NULL DEFAULT 'legacy-unknown'`);
+      // 리터럴 고정 — 마이그레이션은 동결된 역사다. 런타임 기본값 진화는 boot upsert 소관.
+      db.prepare(`INSERT INTO server_meta (key, value) VALUES ('current_default_chunker', ?)
+                  ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+        .run('c1:enc=cl100k_base:max=800:overlap=0:fence=on:fallback=cp-exact-800');
+      const after = (db.prepare(`SELECT count(*) AS n FROM documents`).get() as { n: number }).n;
+      if (after !== before) throw new Error(`v14 gate: documents rows changed ${before} -> ${after}`);
+      const cols = db.prepare(`PRAGMA table_info(documents)`).all() as Array<{ name: string }>;
+      if (!cols.some(c => c.name === 'chunking_signature')) throw new Error('v14 gate: column missing after ALTER');
+      const fk = db.prepare(`PRAGMA foreign_key_check`).all();
+      if (fk.length > 0) throw new Error(`v14 gate: foreign_key_check reported ${fk.length} violations`);
+    },
+    down: (db) => {
+      // 호환성 rollback 뿐 (spec §6.3): chunk 경계는 복원하지 않는다. c1 행은 v13 코드가 읽는다.
+      db.exec(`ALTER TABLE documents DROP COLUMN chunking_signature`);
+      db.prepare(`DELETE FROM server_meta WHERE key = 'current_default_chunker'`).run();
+    }
+  }
 ];
