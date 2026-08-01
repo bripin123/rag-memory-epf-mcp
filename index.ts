@@ -2619,6 +2619,62 @@ export class RAGKnowledgeGraphManager {
     return /[\u3000-\u9fff\uac00-\ud7af\uff00-\uffef]/.test(text);
   }
 
+  // spec §5.4 (r7-2·r8-1·r9): primary name 의 본문 occurrence range [sCp, eCp).
+  // 의미 = buildEntityMatcher 와 동일 (CJK substring / Latin word-boundary) — 여기서
+  // 어긋나면 'Data' 가 'Database' 에 새로 링크되는 식으로 의미가 확장된다.
+  private buildEntityRangeFinder(content: string): (name: string, isCjk: boolean) => Array<{ s: number; e: number }> {
+    // 원문 UTF-16 -> codepoint 표. Latin 경로는 folded 가 아니라 **원문**에 regex 를 건다
+    // (r9-1: folded 에 걸면 fooİ -> fooi̇ 로 접힌 뒤 매치돼 현행 matcher 의미가 확장된다).
+    const origU16ToCp: number[] = [];
+    let origTotalCp = 0;
+    for (let u = 0; u < content.length; ) {
+      const c = content.codePointAt(u)!;
+      origU16ToCp.push(origTotalCp);
+      if (c > 0xffff) { origU16ToCp.push(origTotalCp); u += 2; } else u += 1;
+      origTotalCp++;
+    }
+    const origCpAt = (u16: number) => (u16 < origU16ToCp.length ? origU16ToCp[u16] : origTotalCp);
+
+    // folded 표 (CJK substring / fallback 경로 전용). unit -> 유래한 원문 cp.
+    let folded = '';
+    const u16ToCp: number[] = [];
+    let cp = 0;
+    for (const ch of content) {                       // for..of = codepoint 순회
+      const f = ch.toLowerCase();                     // 다단위 fold 가능 (İ -> 'i̇')
+      for (let i = 0; i < f.length; i++) u16ToCp.push(cp);
+      folded += f;
+      cp++;
+    }
+    // r9-1: exclusive end = "마지막으로 소비한 unit 의 원문 cp + 1".
+    // 경계 unit 을 읽으면 매치가 fold 전개 중간에서 끝날 때 1 모자란다 (漢İ/漢i 실측 [0,1)).
+    const endCp = (u16: number) => (u16 === 0 ? 0 : u16ToCp[Math.min(u16, u16ToCp.length) - 1] + 1);
+
+    return (name: string, isCjk: boolean) => {
+      const out: Array<{ s: number; e: number }> = [];
+      const lower = name.toLowerCase();
+      const pushAllSubstr = () => {
+        let from = 0;
+        while (true) {
+          const u = folded.indexOf(lower, from);
+          if (u < 0) break;
+          out.push({ s: u16ToCp[u], e: endCp(u + lower.length) });
+          from = u + 1;                               // r9-2: 중첩 occurrence 보존
+        }
+      };
+      if (isCjk) { pushAllSubstr(); return out; }
+      try {
+        const escaped = lower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re = new RegExp(`\\b${escaped}\\b`, 'gi');    // buildEntityMatcher 와 동일 규칙,
+        let m: RegExpExecArray | null;                          // 단 원문에 실행 (의미 확장 방지)
+        while ((m = re.exec(content)) !== null) {
+          out.push({ s: origCpAt(m.index), e: origCpAt(m.index + m[0].length) });
+          if (re.lastIndex === m.index) re.lastIndex++;
+        }
+      } catch { pushAllSubstr(); }                              // matcher 의 fallback 과 동일
+      return out;
+    };
+  }
+
   // Build a match pattern for an entity name — word-boundary for Latin, substring for CJK
   private buildEntityMatcher(name: string): (text: string) => boolean {
     const lower = name.toLowerCase();
@@ -2643,10 +2699,14 @@ export class RAGKnowledgeGraphManager {
     try {
       // Get all chunk text for this document
       const chunks = this.db.prepare(
-        `SELECT rowid, text FROM chunk_metadata WHERE document_id = ?`
-      ).all(documentId) as Array<{ rowid: number; text: string }>;
+        `SELECT rowid, text, start_pos, end_pos FROM chunk_metadata WHERE document_id = ?`
+      ).all(documentId) as Array<{ rowid: number; text: string; start_pos: number | null; end_pos: number | null }>;
 
       if (chunks.length === 0) return 0;
+
+      // spec §5.4: range 링킹용 — 문서 본문과 finder 를 1회 준비
+      const docRow = this.db.prepare(`SELECT content FROM documents WHERE id = ?`).get(documentId) as { content: string } | undefined;
+      const findRanges = docRow ? this.buildEntityRangeFinder(docRow.content) : null;
 
       // Get all entities with observations for richer matching
       const entities = this.db.prepare(
@@ -2694,6 +2754,19 @@ export class RAGKnowledgeGraphManager {
           if (matched) {
             insertStmt.run(chunk.rowid, entity.id);
             entityLinked = true;
+          }
+        }
+        // spec §5.4 (r7-2): chunk 단위 매칭은 경계에 잘린 이름을 영원히 놓친다 — c1 은
+        // overlap 이 없어 흡수도 안 된다. primary name 의 본문 occurrence range 와
+        // 교차하는 chunk 에 링크한다 (aliases 는 predicate 라 chunk 단위 유지).
+        if (findRanges) {
+          for (const { s, e } of findRanges(entity.name, this.hasCJK(entity.name))) {
+            for (const chunk of chunks) {
+              if (chunk.start_pos !== null && chunk.end_pos !== null && chunk.start_pos < e && chunk.end_pos > s) {
+                insertStmt.run(chunk.rowid, entity.id);         // INSERT OR IGNORE — 중복 무해
+                entityLinked = true;
+              }
+            }
           }
         }
 
