@@ -35,7 +35,7 @@ import { addRevision, correctRevision, transitionStatus, linkSources,
 import { getObservationHistory } from './src/observations/history.js';
 
 // Import chunk text algorithm (extracted for publish-time invariant testing)
-import { chunkText as splitTextIntoChunks } from './src/chunkText.js';
+import { chunkStructured as chunkStructuredText, effectiveSignature, isCurrentFormatSignature, LEGACY_SIGNATURE, DEFAULT_MAX_TOKENS } from './src/chunkerC.js';
 import { migrations } from './src/migrations/migrations.js';
 
 // v3.6 lite install: model lifecycle + version-independent cache (A′ boundary)
@@ -221,6 +221,40 @@ interface DetailedContext {
 // not emit U+FFFD. Pass trimHead/trimTail=false to preserve head/tail bytes.
 // (Implementation moved to src/chunkText.ts for testability.)
 
+export class SyncCasConflictError extends Error {
+  constructor(documentId: string) { super(`sync CAS conflict on ${documentId}`); this.name = 'SyncCasConflictError'; }
+}
+
+// Test-only fault hook (v13 setMigrationFaultPoint 선례 — 환경변수 금지: 상시 스위치는
+// 오설정 한 줄로 sync 를 깬다).
+let __syncFaultHook: ((point: string) => void) | null = null;
+export function setSyncFaultPoint(point: string | null, fn: (() => void) | null): void {
+  __syncFaultHook = point && fn ? (p) => { if (p === point) fn(); } : null;
+}
+
+export interface ReuseCandidate {
+  rowid: number; text: string; input_hash: string | null;
+  profile_id: number | null; provenance_state: string | null; embedding: Buffer | null;
+}
+
+// Pure vector-reuse decision (spec §5.2 조건 1~5). Returns an OWNED Buffer copy:
+// a Buffer read back from SQLite has no byteOffset-0 guarantee, and inserting
+// `.buffer` of a subarray would write the wrong 4,096 bytes (advisor r5-9).
+export function selectReusableVector(
+  candidates: ReuseCandidate[], text: string, currentProfileId: number, sha256hex: (s: string) => string
+): { vec: Buffer; provenance: 'verified' | 'legacy_assumed' } | null {
+  const h = sha256hex(text);
+  for (const r of candidates) {
+    if (!r.embedding) continue;                                             // 조건 1: 벡터 실존
+    if (r.input_hash !== h) continue;                                       // 조건 2: input_hash 일치
+    if (r.text !== text) continue;                                          // 조건 3: exact text 최종판정
+    if (r.profile_id !== currentProfileId) continue;                        // 조건 4: 현행 프로필
+    if (r.provenance_state !== 'verified' && r.provenance_state !== 'legacy_assumed') continue; // 조건 5 (NULL 제외)
+    return { vec: Buffer.from(r.embedding), provenance: r.provenance_state };  // owned copy
+  }
+  return null;
+}
+
 function safeRowid(value: unknown): number {
   const n = Number(value);
   if (!Number.isInteger(n) || n < 0) {
@@ -286,6 +320,11 @@ export class RAGKnowledgeGraphManager {
 
     await this.runMigrations();
     this.currentProfileId = this.ensureCurrentProfile();
+    // v14 (spec §7.2): 런타임이 기본 chunker 의 SSOT — 마이그레이션의 리터럴은 동결된
+    // 역사이고, 기본값이 진화하면(c2 등) 이 upsert 가 부팅마다 현재값을 기록한다.
+    this.db.prepare(`INSERT INTO server_meta (key, value) VALUES ('current_default_chunker', ?)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+      .run(effectiveSignature(DEFAULT_MAX_TOKENS));
 
     this.embeddingsMode = opts.skipModel
       ? 'off'
@@ -2218,19 +2257,31 @@ export class RAGKnowledgeGraphManager {
   // CJK), so the function maintains parallel UTF-16 and codepoint cursors and
   // reports codepoint offsets. On a coincidental indexOf miss the char offsets
   // are NULL.
-  private chunkText(text: string, maxTokens = 800, overlap = 160): Chunk[] {
+  private chunkStructured(text: string, maxTokens = DEFAULT_MAX_TOKENS): Chunk[] {
     if (!this.encoding) throw new Error('Tokenizer not initialized');
-    const segments = splitTextIntoChunks(text, this.encoding, maxTokens, overlap);
-    return segments.map((seg, idx) => ({
+    return chunkStructuredText(text, this.encoding, maxTokens).map((seg, idx) => ({
       id: '',
       document_id: '',
       chunk_index: idx,
       text: seg.text,
-      start_pos: seg.start_pos as number,
-      end_pos: seg.end_pos as number,
-      start_token: seg.start_token,
-      end_token: seg.end_token
+      start_pos: seg.start_pos,
+      end_pos: seg.end_pos,
+      // c1 has no token-space offsets (spec §4.3, r4 D4). Legacy rows keep theirs.
+      start_token: null,
+      end_token: null
     }));
+  }
+
+  // spec §7.1 (r4·r5-8): overlap is rejected on BOTH public paths, BEFORE any
+  // content/dedup judgment — silently accepting it on unchanged content would
+  // void the contract. maxTokens must be a positive integer.
+  private validateChunkParams(params?: { maxTokens?: number; overlap?: number }): { maxTokens: number } {
+    const { maxTokens = DEFAULT_MAX_TOKENS, overlap = 0 } = params || {};
+    if (!Number.isInteger(maxTokens) || maxTokens <= 0)
+      throw new Error(`chunkParams.maxTokens must be a positive integer (got ${maxTokens})`);
+    if (overlap !== 0)
+      throw new Error(`chunkParams.overlap is no longer supported (chunker c1 has no overlap); omit it or pass 0 (got ${overlap})`);
+    return { maxTokens };
   }
 
   // Generate embeddings using sentence transformers
@@ -2265,33 +2316,36 @@ export class RAGKnowledgeGraphManager {
       entityNames?: string[];
       chunkParams?: { maxTokens?: number; overlap?: number };
     } = {}
-  ): Promise<{ documentId: string; bytes: number; chunks: number; embeddedChunks: number; linkedEntities: number; explicitlyLinked?: number; warning?: string; skipped?: boolean; reason?: string }> {
+  ): Promise<{
+    documentId: string; bytes: number; chunks: number; embeddedChunks: number; linkedEntities: number;
+    explicitlyLinked?: number; warning?: string; skipped?: boolean; reason?: string; embedding_status?: string;
+    reusedChunks: number; newlyEmbeddedChunks: number; queuedChunks: number; deletedChunks: number; chunkerTransitioned: boolean;
+  }> {
     if (!this.db) throw new Error('Database not initialized');
+    // spec §7.1 + r5-8: 검증은 content 해석·dedup 판정보다 앞 (첫 실행문).
+    const { maxTokens } = this.validateChunkParams(options.chunkParams);
+    const signature = effectiveSignature(maxTokens);
+    const shaHex = (t: string) => createHash('sha256').update(t).digest('hex');
+    const zero = { reusedChunks: 0, newlyEmbeddedChunks: 0, queuedChunks: 0, deletedChunks: 0, chunkerTransitioned: false };
 
-    // 1. Resolve content: raw file verbatim (default) or explicit override.
-    //    Content is read on the server and never routed through the model context.
-    const content = options.content !== undefined
-      ? options.content
-      : fsSync.readFileSync(filePath, 'utf-8');
-    const bytes = Buffer.byteLength(content, 'utf-8');
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      // r6-3: CAS 재시작 = 처음부터 — 파일 읽기·hash·metadata 도 attempt 안에서 재계산한다.
+      const content = options.content !== undefined ? options.content : fsSync.readFileSync(filePath, 'utf-8');
+      const bytes = Buffer.byteLength(content, 'utf-8');
+      const today = new Date().toISOString().slice(0, 10);
+      const contentHash = shaHex(content);
+      // spec §5.1: content_hash 는 system-owned — user metadata 뒤에 쓴다 (r1: spread 가 덮어쓸 수 있었다).
+      const metadata = { source: filePath, updated: today, ...(options.metadata || {}), content_hash: contentHash };
 
-    // 2. Metadata: default source=path, updated=today, content_hash; caller can override.
-    const today = new Date().toISOString().slice(0, 10);
-    const contentHash = createHash('sha256').update(content).digest('hex');
-    const metadata = { source: filePath, updated: today, content_hash: contentHash, ...(options.metadata || {}) };
-
-    // 2b. Dedup gate: skip the full delete/store/chunk/embed pipeline when the
-    //     file is unchanged AND the existing document is fully embedded. The
-    //     completeness check avoids wrongly skipping a partial/failed prior sync.
-    const existingDoc = this.db.prepare(`SELECT metadata FROM documents WHERE id = ?`).get(documentId) as { metadata: string } | undefined;
-    if (existingDoc) {
+      const snap = this.db.prepare(`SELECT content, metadata, chunking_signature FROM documents WHERE id = ?`)
+        .get(documentId) as { content: string; metadata: string; chunking_signature: string } | undefined;
       let existingHash: string | undefined;
-      try { existingHash = JSON.parse(existingDoc.metadata)?.content_hash; } catch { /* ignore */ }
-      if (existingHash === contentHash) {
+      if (snap) { try { existingHash = JSON.parse(snap.metadata)?.content_hash; } catch { /* hash 없으면 full 경로 */ } }
+
+      // dedup gate — spec §5.1 그대로: "content_hash 동일" 만 (r6-8: content=== 확장 금지.
+      // hash 가 없거나 낡은 문서는 full 경로로 가서 hash 가 복구된다). signature 무관.
+      if (snap && existingHash === contentHash) {
         const cmCount = (this.db.prepare(`SELECT count(*) AS n FROM chunk_metadata WHERE document_id = ?`).get(documentId) as { n: number }).n;
-        // "Embedded" for dedup completeness = vector exists AND its profile is
-        // current (or legacy-NULL awaiting grandfather). Raw vector counts
-        // would misjudge old-profile rows as complete (beta 1R supplement).
         const embCount = (this.db.prepare(`
           SELECT count(*) AS n FROM chunks c JOIN chunk_metadata m ON c.rowid = m.rowid
           WHERE m.document_id = ? AND (m.provenance_state IS NULL OR m.profile_id = ?)
@@ -2302,105 +2356,135 @@ export class RAGKnowledgeGraphManager {
         `).get(documentId) as { n: number }).n;
         if (cmCount > 0 && cmCount === embCount) {
           console.error(`⏭️  syncDocumentFromFile: ${documentId} unchanged (hash match, ${cmCount} chunks embedded) — skipped`);
-          return { documentId, bytes, chunks: cmCount, embeddedChunks: embCount, linkedEntities: linked, skipped: true, reason: 'unchanged' };
+          return { documentId, bytes, chunks: cmCount, embeddedChunks: embCount, linkedEntities: linked,
+                   skipped: true, reason: 'unchanged', ...zero };
         }
         if (cmCount > 0 && embCount < cmCount) {
-          // v3.6 (spec §5b M12): identical content with incomplete/stale vectors
-          // keeps the document, chunks, rowids and entity links — only the
-          // missing vectors are re-queued via the coordinator. Full re-chunking
-          // here would churn rowids and links for no content change.
+          // v3.6 (spec §5b M12): identical content with incomplete/stale vectors keeps the
+          // document, chunks, rowids and entity links — only missing vectors are re-queued.
           console.error(`♻️ syncDocumentFromFile: ${documentId} unchanged but ${cmCount - embCount} vectors missing — re-queued (chunks preserved)`);
           this.coordinator?.kick();
-          return { documentId, bytes, chunks: cmCount, embeddedChunks: embCount, linkedEntities: linked, skipped: true, reason: 'unchanged-revectorizing', embedding_status: this.gate.isDisabled ? 'disabled' : 'queued' } as any;
+          return { documentId, bytes, chunks: cmCount, embeddedChunks: embCount, linkedEntities: linked,
+                   skipped: true, reason: 'unchanged-revectorizing',
+                   embedding_status: this.gate.isDisabled ? 'disabled' : 'queued',
+                   ...zero, queuedChunks: cmCount - embCount };
+        }
+        // cmCount === 0 이면 아래 full 경로로 계속 (최초 생성).
+      }
+
+      console.error(`🔄 syncDocumentFromFile: ${documentId} <- ${filePath} (${bytes} bytes)`);
+      const segments = this.chunkStructured(content, maxTokens);
+
+      // spec §5.2-2: 옛 행을 트랜잭션 밖에서 읽는다 (벡터 재사용 후보).
+      const oldRows = this.db.prepare(`
+        SELECT m.rowid, m.text, m.input_hash, m.profile_id, m.provenance_state, c.embedding
+        FROM chunk_metadata m LEFT JOIN chunks c ON c.rowid = m.rowid
+        WHERE m.document_id = ?`).all(documentId) as ReuseCandidate[];
+      const oldRowids = oldRows.map(r => r.rowid);
+      const byHash = new Map<string, ReuseCandidate[]>();
+      for (const r of oldRows) {
+        if (!r.input_hash) continue;
+        const arr = byHash.get(r.input_hash);
+        if (arr) arr.push(r); else byHash.set(r.input_hash, [r]);
+      }
+
+      // 임베딩/재사용 — 트랜잭션 밖, ready 경로 한정 (N2: not-ready 계약 불변).
+      const lazySync = !this.gate.isReady;
+      type Slot = { seg: Chunk; vec: Buffer | null; provenance: 'verified' | 'legacy_assumed' | null };
+      const slots: Slot[] = [];
+      let reusedChunks = 0, newlyEmbeddedChunks = 0;
+      if (lazySync) {
+        for (const seg of segments) slots.push({ seg, vec: null, provenance: null });
+      } else {
+        for (const seg of segments) {
+          const hit = selectReusableVector(byHash.get(shaHex(seg.text)) ?? [], seg.text, this.currentProfileId, shaHex);
+          if (hit) { slots.push({ seg, vec: hit.vec, provenance: hit.provenance }); reusedChunks++; }
+          else {
+            const embedding = await this.generateEmbedding(seg.text, 1024, false, 'bulk');
+            slots.push({ seg, vec: Buffer.from(embedding.buffer), provenance: 'verified' });
+            newlyEmbeddedChunks++;
+          }
         }
       }
-    }
 
-    console.error(`🔄 syncDocumentFromFile: ${documentId} <- ${filePath} (${bytes} bytes)`);
+      __syncFaultHook?.('pre-transaction');
 
-    // 3. Two contracts (spec §5b):
-    //    ready       — pre-compute ALL embeddings BEFORE any DB mutation; if
-    //                  inference throws mid-way the old document stays intact
-    //                  (v3.5.0 atomicity, unchanged).
-    //    not-ready   — intentional lazy sync: store document + chunks + FTS in
-    //                  one transaction with NO vectors (embedding_status:
-    //                  queued); the backfill coordinator recovers them.
-    const { maxTokens = 800, overlap = 160 } = options.chunkParams || {};
-    const segments = this.chunkText(content, maxTokens, overlap);
-    const lazySync = !this.gate.isReady;
-    const embedded: Array<{ seg: typeof segments[number]; embedding: Float32Array | null }> = [];
-    if (lazySync) {
-      for (const seg of segments) embedded.push({ seg, embedding: null });
-    } else {
-      for (const seg of segments) {
-        const embedding = await this.generateEmbedding(seg.text, 1024, false, 'bulk');
-        embedded.push({ seg, embedding });
-      }
-    }
+      // 한 트랜잭션: CAS 첫 문장 -> full delete/insert -> failure 정리 (spec §5.2-4·5).
+      const applyTx = this.db.transaction(() => {
+        const db = this.db!;
+        const now = db.prepare(`SELECT content, metadata, chunking_signature FROM documents WHERE id = ?`)
+          .get(documentId) as { content: string; metadata: string; chunking_signature: string } | undefined;
+        const same = (snap === undefined && now === undefined) ||
+          (snap !== undefined && now !== undefined && now.content === snap.content &&
+           now.metadata === snap.metadata && now.chunking_signature === snap.chunking_signature);
+        if (!same) throw new SyncCasConflictError(documentId);
 
-    // 4. Atomic swap: delete old -> insert doc -> insert chunks (+ embeddings
-    //    with verified provenance when ready), one synchronous transaction.
-    const applyTx = this.db.transaction(() => {
-      const db = this.db!;
-      // 4a. cleanup old doc (inlined sync version of cleanupDocument).
-      const existing = db.prepare(`SELECT rowid FROM chunk_metadata WHERE document_id = ?`).all(documentId) as { rowid: number }[];
-      for (const ch of existing) {
-        db.prepare(`DELETE FROM chunk_entities WHERE chunk_rowid = ?`).run(ch.rowid);
-        db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(ch.rowid)}`);
-      }
-      db.prepare(`DELETE FROM chunk_metadata WHERE document_id = ?`).run(documentId);
-      db.prepare(`DELETE FROM documents WHERE id = ?`).run(documentId);
-
-      // 4b. insert document.
-      db.prepare(`INSERT INTO documents (id, content, metadata) VALUES (?, ?, ?)`)
-        .run(documentId, content, JSON.stringify(metadata));
-
-      // 4c. insert chunk_metadata (FTS5 chunks_fts auto-filled by trigger);
-      //     vectors + provenance only on the ready path (§6a-2).
-      for (const { seg, embedding } of embedded) {
-        const chunkId = `${documentId}_chunk_${seg.chunk_index}`;
-        const info = db.prepare(`
-          INSERT INTO chunk_metadata (chunk_id, document_id, chunk_index, text, start_pos, end_pos, start_token, end_token)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(chunkId, documentId, seg.chunk_index, seg.text, seg.start_pos, seg.end_pos, seg.start_token, seg.end_token);
-        const rowid = Number(info.lastInsertRowid);
-        if (embedding) {
-          db.prepare(`INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)`).run(Buffer.from(embedding.buffer));
-          db.prepare(`UPDATE chunk_metadata SET input_hash = ?, profile_id = ?, provenance_state = 'verified' WHERE rowid = ?`)
-            .run(createHash('sha256').update(seg.text).digest('hex'), this.currentProfileId, rowid);
+        const existing = db.prepare(`SELECT rowid FROM chunk_metadata WHERE document_id = ?`).all(documentId) as { rowid: number }[];
+        for (const ch of existing) {
+          db.prepare(`DELETE FROM chunk_entities WHERE chunk_rowid = ?`).run(ch.rowid);
+          db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(ch.rowid)}`);
         }
+        db.prepare(`DELETE FROM chunk_metadata WHERE document_id = ?`).run(documentId);
+        db.prepare(`DELETE FROM documents WHERE id = ?`).run(documentId);
+        db.prepare(`INSERT INTO documents (id, content, metadata, chunking_signature) VALUES (?, ?, ?, ?)`)
+          .run(documentId, content, JSON.stringify(metadata), signature);
+        for (const { seg, vec, provenance } of slots) {
+          const chunkId = `${documentId}_chunk_${seg.chunk_index}`;
+          const info = db.prepare(`
+            INSERT INTO chunk_metadata (chunk_id, document_id, chunk_index, text, start_pos, end_pos, start_token, end_token)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(chunkId, documentId, seg.chunk_index, seg.text, seg.start_pos, seg.end_pos, seg.start_token, seg.end_token);
+          const rowid = Number(info.lastInsertRowid);
+          if (vec) {
+            db.prepare(`INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)`).run(vec);
+            db.prepare(`UPDATE chunk_metadata SET input_hash = ?, profile_id = ?, provenance_state = ? WHERE rowid = ?`)
+              .run(shaHex(seg.text), this.currentProfileId, provenance, rowid);
+          }
+        }
+        if (oldRowids.length > 0) {
+          // r5-9: 키는 (kind, target_id) — kind 조건 없이 지우면 같은 숫자 ID 의 entity failure 까지 지운다.
+          const ph = oldRowids.map(() => '?').join(',');
+          db.prepare(`DELETE FROM embedding_backfill_failures WHERE kind = 'chunk' AND target_id IN (${ph})`)
+            .run(...oldRowids.map(String));
+        }
+      });
+
+      try { applyTx(); } catch (e) {
+        if (e instanceof SyncCasConflictError) {
+          console.error(`↻ sync CAS conflict on ${documentId} (attempt ${attempt}/3) — restarting from file read`);
+          if (attempt === 3) throw e;
+          continue;
+        }
+        throw e;
       }
-    });
-    applyTx();
-    this.coordinator?.invalidateCoverage();
-    if (lazySync) this.coordinator?.kick();
+      this.coordinator?.invalidateCoverage();
+      if (lazySync) this.coordinator?.kick();
 
-    const embeddedChunks = lazySync ? 0 : embedded.length;
-
-    // 5. Entity linking AFTER commit. Non-destructive + idempotent (INSERT OR
-    //    IGNORE), so a linking failure cannot corrupt the doc/embeddings.
-    const linkedEntities = await this.autoLinkEntities(documentId);
-    let explicitlyLinked: number | undefined;
-    if (options.entityNames && options.entityNames.length > 0) {
-      const linkResult = await this.linkEntitiesToDocument(documentId, options.entityNames);
-      explicitlyLinked = linkResult.linkedEntities;
+      // Entity linking AFTER commit. Non-destructive + idempotent (INSERT OR IGNORE).
+      const linkedEntities = await this.autoLinkEntities(documentId);
+      let explicitlyLinked: number | undefined;
+      if (options.entityNames && options.entityNames.length > 0) {
+        const linkResult = await this.linkEntitiesToDocument(documentId, options.entityNames);
+        explicitlyLinked = linkResult.linkedEntities;
+      }
+      const result: any = {
+        documentId, bytes, chunks: segments.length,
+        embeddedChunks: reusedChunks + newlyEmbeddedChunks,               // spec §5.3
+        linkedEntities,
+        embedding_status: lazySync ? (this.gate.isDisabled ? 'disabled' : 'queued') : 'embedded',
+        reusedChunks, newlyEmbeddedChunks,
+        queuedChunks: lazySync ? segments.length : 0,
+        deletedChunks: oldRowids.length,
+        chunkerTransitioned: snap !== undefined && snap.chunking_signature !== signature,
+        ...(explicitlyLinked !== undefined ? { explicitlyLinked } : {}),
+      };
+      if (linkedEntities === 0 && explicitlyLinked === undefined) {
+        result.warning = 'linkedEntities=0: ensure the file content contains entity-name literals (e.g. a wiki anchor line "RAG entity: ...") so term-matching can link entities.';
+      }
+      console.error(`✅ syncDocumentFromFile done: ${documentId} (${result.chunks} chunks, reused ${reusedChunks}, embedded ${newlyEmbeddedChunks})`);
+      return result;
     }
-
-    // 6. Terse summary only (no chunk text / content echo) to keep caller context flat.
-    const result: { documentId: string; bytes: number; chunks: number; embeddedChunks: number; linkedEntities: number; explicitlyLinked?: number; warning?: string; skipped?: boolean; reason?: string; embedding_status?: string } = {
-      documentId,
-      bytes,
-      chunks: segments.length,
-      embeddedChunks,
-      linkedEntities,
-      embedding_status: lazySync ? (this.gate.isDisabled ? 'disabled' : 'queued') : 'embedded',
-      ...(explicitlyLinked !== undefined ? { explicitlyLinked } : {}),
-    };
-    if (linkedEntities === 0 && explicitlyLinked === undefined) {
-      result.warning = 'linkedEntities=0: ensure the file content contains entity-name literals (e.g. a wiki anchor line "RAG entity: ...") so term-matching can link entities.';
-    }
-    console.error(`✅ syncDocumentFromFile done: ${documentId} (${result.chunks} chunks, ${result.embeddedChunks} embedded, ${linkedEntities} linked)`);
-    return result;
+    throw new Error('unreachable');
   }
 
   async storeDocument(id: string, content: string, metadata: Record<string, any> = {}): Promise<{ id: string; stored: boolean }> {
@@ -2433,15 +2517,15 @@ export class RAGKnowledgeGraphManager {
       throw new Error(`Document with ID ${documentId} not found`);
     }
     
-    const { maxTokens = 800, overlap = 160 } = options;
-    
-    console.error(`🔪 Chunking document: ${documentId} (maxTokens: ${maxTokens}, overlap: ${overlap})`);
+    const { maxTokens } = this.validateChunkParams(options);
+
+    console.error(`🔪 Chunking document: ${documentId} (maxTokens: ${maxTokens}, chunker: c1)`);
     
     // Clean up existing chunks
     await this.cleanupDocument(documentId);
     
     // Create chunks
-    const chunks = this.chunkText(document.content, maxTokens, overlap);
+    const chunks = this.chunkStructured(document.content, maxTokens);
     const resultChunks = [];
     
     for (const chunk of chunks) {
@@ -2474,6 +2558,9 @@ export class RAGKnowledgeGraphManager {
     }
     
     console.error(`✅ Document chunked: ${chunks.length} chunks created`);
+    // spec §7.1: 두 번째 chunk 생성 경로 — 스탬프를 안 박으면 §5.1 관측이 조용히 샌다.
+    this.db.prepare(`UPDATE documents SET chunking_signature = ? WHERE id = ?`)
+      .run(effectiveSignature(maxTokens), documentId);
     // Indirect missing-row producer (spec §5): freshly chunked rows have no
     // vectors yet — let the coordinator recover them without a restart.
     this.coordinator?.invalidateCoverage();
@@ -2537,6 +2624,62 @@ export class RAGKnowledgeGraphManager {
     return /[\u3000-\u9fff\uac00-\ud7af\uff00-\uffef]/.test(text);
   }
 
+  // spec §5.4 (r7-2·r8-1·r9): primary name 의 본문 occurrence range [sCp, eCp).
+  // 의미 = buildEntityMatcher 와 동일 (CJK substring / Latin word-boundary) — 여기서
+  // 어긋나면 'Data' 가 'Database' 에 새로 링크되는 식으로 의미가 확장된다.
+  private buildEntityRangeFinder(content: string): (name: string, isCjk: boolean) => Array<{ s: number; e: number }> {
+    // 원문 UTF-16 -> codepoint 표. Latin 경로는 folded 가 아니라 **원문**에 regex 를 건다
+    // (r9-1: folded 에 걸면 fooİ -> fooi̇ 로 접힌 뒤 매치돼 현행 matcher 의미가 확장된다).
+    const origU16ToCp: number[] = [];
+    let origTotalCp = 0;
+    for (let u = 0; u < content.length; ) {
+      const c = content.codePointAt(u)!;
+      origU16ToCp.push(origTotalCp);
+      if (c > 0xffff) { origU16ToCp.push(origTotalCp); u += 2; } else u += 1;
+      origTotalCp++;
+    }
+    const origCpAt = (u16: number) => (u16 < origU16ToCp.length ? origU16ToCp[u16] : origTotalCp);
+
+    // folded 표 (CJK substring / fallback 경로 전용). unit -> 유래한 원문 cp.
+    let folded = '';
+    const u16ToCp: number[] = [];
+    let cp = 0;
+    for (const ch of content) {                       // for..of = codepoint 순회
+      const f = ch.toLowerCase();                     // 다단위 fold 가능 (İ -> 'i̇')
+      for (let i = 0; i < f.length; i++) u16ToCp.push(cp);
+      folded += f;
+      cp++;
+    }
+    // r9-1: exclusive end = "마지막으로 소비한 unit 의 원문 cp + 1".
+    // 경계 unit 을 읽으면 매치가 fold 전개 중간에서 끝날 때 1 모자란다 (漢İ/漢i 실측 [0,1)).
+    const endCp = (u16: number) => (u16 === 0 ? 0 : u16ToCp[Math.min(u16, u16ToCp.length) - 1] + 1);
+
+    return (name: string, isCjk: boolean) => {
+      const out: Array<{ s: number; e: number }> = [];
+      const lower = name.toLowerCase();
+      const pushAllSubstr = () => {
+        let from = 0;
+        while (true) {
+          const u = folded.indexOf(lower, from);
+          if (u < 0) break;
+          out.push({ s: u16ToCp[u], e: endCp(u + lower.length) });
+          from = u + 1;                               // r9-2: 중첩 occurrence 보존
+        }
+      };
+      if (isCjk) { pushAllSubstr(); return out; }
+      try {
+        const escaped = lower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const re = new RegExp(`\\b${escaped}\\b`, 'gi');    // buildEntityMatcher 와 동일 규칙,
+        let m: RegExpExecArray | null;                          // 단 원문에 실행 (의미 확장 방지)
+        while ((m = re.exec(content)) !== null) {
+          out.push({ s: origCpAt(m.index), e: origCpAt(m.index + m[0].length) });
+          if (re.lastIndex === m.index) re.lastIndex++;
+        }
+      } catch { pushAllSubstr(); }                              // matcher 의 fallback 과 동일
+      return out;
+    };
+  }
+
   // Build a match pattern for an entity name — word-boundary for Latin, substring for CJK
   private buildEntityMatcher(name: string): (text: string) => boolean {
     const lower = name.toLowerCase();
@@ -2561,10 +2704,14 @@ export class RAGKnowledgeGraphManager {
     try {
       // Get all chunk text for this document
       const chunks = this.db.prepare(
-        `SELECT rowid, text FROM chunk_metadata WHERE document_id = ?`
-      ).all(documentId) as Array<{ rowid: number; text: string }>;
+        `SELECT rowid, text, start_pos, end_pos FROM chunk_metadata WHERE document_id = ?`
+      ).all(documentId) as Array<{ rowid: number; text: string; start_pos: number | null; end_pos: number | null }>;
 
       if (chunks.length === 0) return 0;
+
+      // spec §5.4: range 링킹용 — 문서 본문과 finder 를 1회 준비
+      const docRow = this.db.prepare(`SELECT content FROM documents WHERE id = ?`).get(documentId) as { content: string } | undefined;
+      const findRanges = docRow ? this.buildEntityRangeFinder(docRow.content) : null;
 
       // Get all entities with observations for richer matching
       const entities = this.db.prepare(
@@ -2612,6 +2759,19 @@ export class RAGKnowledgeGraphManager {
           if (matched) {
             insertStmt.run(chunk.rowid, entity.id);
             entityLinked = true;
+          }
+        }
+        // spec §5.4 (r7-2): chunk 단위 매칭은 경계에 잘린 이름을 영원히 놓친다 — c1 은
+        // overlap 이 없어 흡수도 안 된다. primary name 의 본문 occurrence range 와
+        // 교차하는 chunk 에 링크한다 (aliases 는 predicate 라 chunk 단위 유지).
+        if (findRanges) {
+          for (const { s, e } of findRanges(entity.name, this.hasCJK(entity.name))) {
+            for (const chunk of chunks) {
+              if (chunk.start_pos !== null && chunk.end_pos !== null && chunk.start_pos < e && chunk.end_pos > s) {
+                insertStmt.run(chunk.rowid, entity.id);         // INSERT OR IGNORE — 중복 무해
+                entityLinked = true;
+              }
+            }
           }
         }
 
@@ -3593,8 +3753,12 @@ export class RAGKnowledgeGraphManager {
       }
       
       // Generate semantic summary (skip when degraded — no embeddings available).
+      // RAG_MEMORY_SEARCH_SUMMARIES=off: diagnostic escape hatch (v5) — the summary
+      // path embeds EVERY sentence of EVERY candidate (~100+ inferences per search,
+      // measured 90-120s cold). Off = preview slices + relevanceScore 0; ranking
+      // then rests on vectorSimilarity + boosts. Default unchanged.
       let summary: string, keyHighlight: string, relevanceScore: number;
-      if (vectorDegraded || !primaryQueryEmbedding) {
+      if (vectorDegraded || !primaryQueryEmbedding || process.env.RAG_MEMORY_SEARCH_SUMMARIES === 'off') {
         keyHighlight = result.text.slice(0, 150);
         summary = result.text.slice(0, 300);
         relevanceScore = 0;
@@ -3801,6 +3965,17 @@ export class RAGKnowledgeGraphManager {
     // reads version, model/reconciliation state, and provenance coverage here.
     const gs = this.gate.status;
     const cov = this.coordinator?.coverage();
+    // v14 (spec §7.2): document 기준 chunking 전환 상태 — 상호배타, 합 = documents.
+    // regex 분류는 SQL 밖(JS)에서: current = 런타임이 인식하는 c1 형식(강한 파서),
+    // legacy = 'legacy-unknown', unknown = 그 외 전부.
+    const sigRows = this.db.prepare(`SELECT chunking_signature AS s, count(*) AS n FROM documents GROUP BY chunking_signature`)
+      .all() as Array<{ s: string; n: number }>;
+    let sigCur = 0, sigLeg = 0, sigUnk = 0;
+    for (const r of sigRows) {
+      if (r.s === LEGACY_SIGNATURE) sigLeg += r.n;
+      else if (isCurrentFormatSignature(r.s)) sigCur += r.n;
+      else sigUnk += r.n;
+    }
     return {
       entities: {
         total: entityStats.reduce((sum, stat) => sum + stat.count, 0),
@@ -3812,6 +3987,8 @@ export class RAGKnowledgeGraphManager {
       },
       documents: documentCount.count,
       chunks: chunkCount.count,
+      chunking: { current: sigCur, legacy: sigLeg, unknown: sigUnk,
+                  default_signature: effectiveSignature(DEFAULT_MAX_TOKENS) },
       server: {
         version: PKG_VERSION,
         node: process.versions.node,
@@ -4121,7 +4298,7 @@ export class RAGKnowledgeGraphManager {
 
 
 
-  async rollbackMigration(targetVersion: number): Promise<{ rolledBack: number; currentVersion: number; rolledBackMigrations: Array<{ version: number; description: string }> }> {
+  async rollbackMigration(targetVersion: number): Promise<{ rolledBack: number; currentVersion: number; rolledBackMigrations: Array<{ version: number; description: string }>; semanticRollback?: boolean; warning?: string }> {
     if (!this.db) throw new Error('Database not initialized');
     
     const migrationManager = new MigrationManager(this.db);
@@ -4146,8 +4323,8 @@ export class RAGKnowledgeGraphManager {
       .sort((a, b) => b.version - a.version);
     
     migrationManager.rollback(targetVersion);
-    
-    return {
+
+    const result = {
       rolledBack: migrationsToRollback.length,
       currentVersion: migrationManager.getCurrentVersion(),
       rolledBackMigrations: migrationsToRollback.map(m => ({
@@ -4155,6 +4332,18 @@ export class RAGKnowledgeGraphManager {
         description: m.description
       }))
     };
+    // v14 rollback is a compatibility rollback ONLY (spec §6.3): dropping the
+    // chunking_signature column does not restore old chunk boundaries — c1 rows
+    // read fine on v13 code. Say so in the RESPONSE, not just the tool
+    // description, so a caller who rolled back sees the limit (advisor r5-10).
+    if (result.rolledBackMigrations.some(m => m.version === 14)) {
+      return {
+        ...result,
+        semanticRollback: false,
+        warning: 'v14 rollback removes the chunking_signature column only; chunk boundaries produced by chunker c1 are NOT restored (compatibility rollback). Data restore path = pre-migration backup snapshot.'
+      };
+    }
+    return result;
   }
 }
 

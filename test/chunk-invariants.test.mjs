@@ -1,115 +1,38 @@
 #!/usr/bin/env node
-// Publish-time invariant test for chunkText().
-//
-// Cross-language position indexing invariant:
-//   For every chunk produced by chunkText(text), if start_pos !== null then
-//   [...text].slice(start_pos, end_pos).join('') === chunk.text
-//
-// SQL substr(content, start_pos+1, end_pos-start_pos) and Python
-// content[start_pos:end_pos] must produce the same result. JS UTF-16 indexing
-// breaks this for supplementary characters (emoji, rare CJK), so chunkText
-// uses parallel UTF-16 + codepoint cursors and reports codepoint offsets.
-//
-// This test imports the built dist/ output (so npm publish exercises the same
-// artifact users consume) and exits non-zero on any violation. Wired as
-// prepublishOnly to block bad publishes at the source.
-//
-// History: Session 12 (2026-04-28) shipped v3.3.5 to fix this exact class of
-// bug. v3.3.6 adds this test so a future regression is caught before publish.
-
+// Publish-time invariant gate for chunker c1 (spec §4.3). Replaces the BPE gate.
+// The old gate skipped rows with start_pos===null — that hole let a
+// text-mutating chunker publish (advisor r1). c1 has a NULL budget of 0:
+// this gate checks EVERY chunk, no skip branch.
+import assert from 'node:assert/strict';
 import { get_encoding } from 'tiktoken';
-import { chunkText } from '../dist/src/chunkText.js';
+import { chunkStructured } from '../dist/src/chunkerC.js';
 
-const encoding = get_encoding('cl100k_base');
+const enc = get_encoding('cl100k_base');
+const MAX = 800;
+const F = '`'.repeat(3);
+const T4 = '~'.repeat(4);
 
-const cases = [
-  {
-    name: 'ASCII English (long)',
-    text: 'The quick brown fox jumps over the lazy dog. '.repeat(120),
-  },
-  {
-    name: 'Korean 한국어',
-    text: '대한민국은 동아시아의 국가입니다. 수도는 서울입니다. '.repeat(80),
-  },
-  {
-    name: 'Emoji-heavy 🟢✅🎉',
-    text: '🟢 Status check ✅ 모든 시스템 정상 🎉 Build OK 💯 '.repeat(80),
-  },
-  {
-    name: 'Mixed CJK + supplementary',
-    text: '𠮷田さん says 안녕! 你好世界 🌍🟢✅ こんにちは '.repeat(80),
-  },
-  {
-    name: 'Pure supplementary plane',
-    text: '🟢✅🎉💯🌍🚀⭐📊'.repeat(60),
-  },
-  {
-    name: 'Short text (single chunk)',
-    text: 'Hello 안녕 🟢',
-  },
+const corpora = [
+  `# doc\n\nplain paragraph\n\n## section\n- bullet 한🎉글\n- two\n\n${F}js\n# not a heading\ncode()\n${F}\ntail\n`,
+  '한글 문단 '.repeat(500) + '\n\n## 절\n' + '- 항목 '.repeat(300) + '\n',
+  'no headings at all\n\n' + 'p '.repeat(2000) + '\n',
+  `${T4}\nfence with # inside\n${T4}\nafter\r\nCRLF line\r\n`,
+  '🎉'.repeat(3000),
+  '/sdkX'.repeat(200),
 ];
 
-let pass = 0;
-let fail = 0;
-const failures = [];
-
-for (const { name, text } of cases) {
-  // Use small maxTokens to force many chunk boundaries (= more invariant checks)
-  const segments = chunkText(text, encoding, 100, 20);
-  const cps = [...text]; // codepoint array for slicing
-
-  let caseFail = 0;
-  let nullCount = 0;
-  for (let i = 0; i < segments.length; i++) {
-    const seg = segments[i];
-    if (seg.start_pos === null) {
-      nullCount++;
-      continue;
-    }
-    const sliced = cps.slice(seg.start_pos, seg.end_pos).join('');
-    if (sliced !== seg.text) {
-      caseFail++;
-      failures.push({
-        case: name,
-        chunkIdx: i,
-        start_pos: seg.start_pos,
-        end_pos: seg.end_pos,
-        expected: seg.text.slice(0, 60),
-        got: sliced.slice(0, 60),
-      });
-    }
+for (const [ci, text] of corpora.entries()) {
+  const segs = chunkStructured(text, enc, MAX);
+  assert.equal(segs.map(s => s.text).join(''), text, `corpus ${ci}: join === content`);
+  let cursor = 0;
+  for (const [i, s] of segs.entries()) {
+    assert.equal(typeof s.start_pos, 'number', `corpus ${ci} chunk ${i}: start_pos NOT NULL`);
+    assert.equal(s.start_pos, cursor, `corpus ${ci} chunk ${i}: contiguous`);
+    assert.equal([...text].slice(s.start_pos, s.end_pos).join(''), s.text,
+      `corpus ${ci} chunk ${i}: cp-slice round-trip`);
+    cursor = s.end_pos;
+    assert.ok(enc.encode(s.text).length <= MAX, `corpus ${ci} chunk ${i}: tokens <= ${MAX}`);
   }
-
-  if (caseFail === 0) {
-    console.log(`  OK: ${name} — ${segments.length} chunks (${nullCount} null)`);
-    pass++;
-  } else {
-    console.error(`  FAIL: ${name} — ${caseFail}/${segments.length} chunks violated invariant`);
-    fail++;
-  }
+  assert.deepEqual(chunkStructured(text, enc, MAX), segs, `corpus ${ci}: deterministic`);
 }
-
-encoding.free();
-
-console.log('');
-console.log(`=== ${pass}/${pass + fail} cases passed ===`);
-
-if (fail > 0) {
-  console.error('');
-  console.error('Detailed failures:');
-  for (const f of failures.slice(0, 10)) {
-    console.error(`  [${f.case}] chunk ${f.chunkIdx}: start=${f.start_pos} end=${f.end_pos}`);
-    console.error(`    expected: ${JSON.stringify(f.expected)}`);
-    console.error(`    got:      ${JSON.stringify(f.got)}`);
-  }
-  if (failures.length > 10) {
-    console.error(`  ... and ${failures.length - 10} more`);
-  }
-  console.error('');
-  console.error('PUBLISH BLOCKED: chunk substr invariant violated.');
-  console.error('See src/chunkText.ts and the migration v11 history.');
-  process.exit(1);
-}
-
-console.log('Publish-time invariants OK.');
-process.exit(0);
+console.log('chunk-invariants (c1): ALL PASS');

@@ -108,6 +108,49 @@ path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
 is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
 the next start becomes a clean download owner.
 
+## v5.0.0 (schema v14): chunker c1 + vector reuse
+
+**Breaking**: `chunkParams.overlap` is rejected on BOTH public paths
+(`syncDocumentFromFile.chunkParams` and `chunkDocument`) unless omitted or
+exactly 0 — chunker c1 has no overlap. `maxTokens` must be a positive integer.
+Validation runs before the dedup gate, so invalid params fail even on
+unchanged content.
+
+**What changes on upgrade**: nothing, immediately. v14 is schema-only —
+`documents.chunking_signature` is added with DEFAULT `legacy-unknown` and no
+data row changes, so there is no coverage cliff and no re-embedding storm.
+A document transitions to c1 only when its CONTENT changes at sync time
+(signature mismatch alone is an observed state, not a trigger). The first
+sync of an edited document pays a cold transition (old BPE chunk texts rarely
+match c1 boundaries); every later sync reuses vectors for unchanged text.
+
+**Observability**: `getKnowledgeGraphStats().chunking = { current, legacy,
+unknown, default_signature }` — mutually exclusive, sums to `documents`. The
+framework's /start Step 5a reads this response.
+
+**Rollback caveat (v14)**: `rollbackMigration` drops the column and returns
+`semanticRollback: false` plus a warning — chunk boundaries produced by c1
+are NOT restored (they read fine on v13 code). Data restore path = the
+pre-migration backup snapshot.
+
+**Manual links**: full replacement re-derives `chunk_entities`; a link made
+via `linkEntitiesToDocument` that is not reproducible from body literals or
+`entityNames` is not preserved (true before v5 too). New in v5: primary
+entity names are also linked by document-level occurrence ranges, so a name
+cut across a chunk boundary still links to the intersecting chunks
+(overlap used to absorb this; c1 has none).
+
+**Fleet prerequisite before releasing/upgrading**: audit every deployment's
+`schema_migrations` for occupied slots `>= 14` — pending migrations are
+selected by MAX(version) arithmetic, so an experimental slot silently skips
+the real v14 (this is exactly how code-v8 never ran in production).
+
+**Diagnostic env (v5)**: `RAG_MEMORY_SEARCH_SUMMARIES=off` disables the per-result
+sentence-similarity summaries in `hybridSearch` (which embed every sentence of every
+candidate — 100+ inferences, 90-120s cold per search, measured). Off = preview-slice
+summaries, `relevance_score` 0, ranking rests on vector similarity + boosts. Default
+unchanged. The 3-arm release harness sets this uniformly across all arms.
+
 ## v3.6 breaking response changes
 
 1. `hybridSearch` returns an envelope: `{results, search_mode, model_state,

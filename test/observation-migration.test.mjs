@@ -6,6 +6,9 @@ import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 
+// 스키마 최신 버전 — 새 마이그레이션 추가 시 여기 한 곳만 올린다 (v14 도입 때 리터럴 13 두 곳이 무더기로 깨졌다)
+const LATEST_VERSION = 14;
+
 process.env.RAG_MEMORY_NO_AUTOSTART = '1';
 
 // v12 상태의 DB 를 만든다: 엔진을 한 번 띄워 마이그레이션을 돌리고,
@@ -19,11 +22,10 @@ async function makeV12Db(observationsByEntity) {
   const mgr = new RAGKnowledgeGraphManager();
   await mgr.initialize({ skipModel: true });
   const db = mgr.db;
-  db.exec(`DROP TABLE IF EXISTS observation_events`);
-  db.exec(`DROP TABLE IF EXISTS observation_sources`);
-  db.exec(`DROP TABLE IF EXISTS entity_observations`);
-  db.exec(`DROP TABLE IF EXISTS observation_roots`);
-  db.prepare(`DELETE FROM schema_migrations WHERE version = 13`).run();
+  // v14 도입 후: "v13 행만 삭제" 위장은 MAX(version)=14 라 v13 이 재실행되지 않는다
+  // (조사 문서의 MAX-산술 함정 그대로). 실기계 down 으로 v12 상태를 만든다 —
+  // v14 down(컬럼+stamp 제거)과 v13 down(4테이블 drop)이 실제로 돈다.
+  await mgr.rollbackMigration(12);
   for (const [name, obs] of Object.entries(observationsByEntity)) {
     const id = `entity_${name.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
     db.prepare(`INSERT OR REPLACE INTO entities (id, name, observations, created_at)
@@ -116,11 +118,10 @@ for (const bad of ['{"a":1}', '[1,2]', '[null]', '[{"x":1}]', 'not json']) {
   const mgr = new RAGKnowledgeGraphManager();
   await mgr.initialize({ skipModel: true });
   const db = mgr.db;
-  db.exec(`DROP TABLE IF EXISTS observation_events`);
-  db.exec(`DROP TABLE IF EXISTS observation_sources`);
-  db.exec(`DROP TABLE IF EXISTS entity_observations`);
-  db.exec(`DROP TABLE IF EXISTS observation_roots`);
-  db.prepare(`DELETE FROM schema_migrations WHERE version = 13`).run();
+  // v14 도입 후: "v13 행만 삭제" 위장은 MAX(version)=14 라 v13 이 재실행되지 않는다
+  // (조사 문서의 MAX-산술 함정 그대로). 실기계 down 으로 v12 상태를 만든다 —
+  // v14 down(컬럼+stamp 제거)과 v13 down(4테이블 drop)이 실제로 돈다.
+  await mgr.rollbackMigration(12);
   db.prepare(`INSERT OR REPLACE INTO entities (id, name, observations, created_at)
               VALUES ('entity_bad','Bad',?, '2020-01-01')`).run(bad);
   mgr.cleanup?.();
@@ -253,7 +254,7 @@ for (const at of ['preflight', 'roots', 'revisions', 'sources', 'gate']) {
   const before = readdirSync(d).filter(f => f.includes('.bak')).sort();
   const m2 = await reopen(dbPath);          // fault 해제 상태 = 정상 재시도
   const db2 = m2.db;
-  assert.equal(db2.prepare(`SELECT MAX(version) v FROM schema_migrations`).get().v, 13,
+  assert.equal(db2.prepare(`SELECT MAX(version) v FROM schema_migrations`).get().v, LATEST_VERSION,
     `T11: retry after fault at '${at}' did not complete the migration`);
   assert.deepEqual(JSON.parse(db2.prepare(
     `SELECT observations FROM entities WHERE id='entity_fault'`).get().observations), ['f1', 'f2'],
@@ -316,7 +317,7 @@ for (const [label, make] of [
   make(base);
   const bytesBefore = readFileSync(base);
   const m = await reopen(dbPath);
-  assert.equal(m.db.prepare(`SELECT MAX(version) v FROM schema_migrations`).get().v, 13,
+  assert.equal(m.db.prepare(`SELECT MAX(version) v FROM schema_migrations`).get().v, LATEST_VERSION,
     `${label} backup blocked the migration`);
   m.cleanup?.();
   assert.deepEqual(readFileSync(base), bytesBefore, `${label} backup was modified`);
