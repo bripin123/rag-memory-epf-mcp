@@ -21,7 +21,8 @@ try {
   assert.equal(counter.calls, 1, 'summaries off: 쿼리 1회만 임베딩 (문장별 임베딩 0)');
   for (const res of r.results) {
     assert.ok(typeof res.content_summary === 'string' && res.content_summary.length > 0, 'preview summary present');
-    assert.equal(res.relevance_score, 0, 'relevanceScore 0 (문장 유사도 미계산)');
+    // 주의: 응답의 relevance_score 는 최종 hybrid 점수(벡터+부스트)라 0 이 아니다 —
+    // 요약 경로 차단의 계약은 위의 "쿼리 1회만 임베딩" assert 가 잠근다.
   }
   console.log('search-summaries-off: ALL PASS');
 } finally { cleanup(); }
