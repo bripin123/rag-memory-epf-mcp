@@ -4,6 +4,7 @@
 import fs from 'node:fs';
 const [cmd, ...args] = process.argv.slice(2);
 process.env.RAG_MEMORY_NO_AUTOSTART = '1';
+process.env.RAG_MEMORY_SEARCH_SUMMARIES = 'off';   // perf: 전 arm 균일 (README 참조)
 const mod = await import('../../dist/index.js');
 const mgr = new mod.RAGKnowledgeGraphManager();
 await mgr.initialize();
