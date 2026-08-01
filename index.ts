@@ -35,7 +35,7 @@ import { addRevision, correctRevision, transitionStatus, linkSources,
 import { getObservationHistory } from './src/observations/history.js';
 
 // Import chunk text algorithm (extracted for publish-time invariant testing)
-import { chunkText as splitTextIntoChunks } from './src/chunkText.js';
+import { chunkStructured as chunkStructuredText, effectiveSignature, isCurrentFormatSignature, LEGACY_SIGNATURE, DEFAULT_MAX_TOKENS } from './src/chunkerC.js';
 import { migrations } from './src/migrations/migrations.js';
 
 // v3.6 lite install: model lifecycle + version-independent cache (A′ boundary)
@@ -2218,19 +2218,31 @@ export class RAGKnowledgeGraphManager {
   // CJK), so the function maintains parallel UTF-16 and codepoint cursors and
   // reports codepoint offsets. On a coincidental indexOf miss the char offsets
   // are NULL.
-  private chunkText(text: string, maxTokens = 800, overlap = 160): Chunk[] {
+  private chunkStructured(text: string, maxTokens = DEFAULT_MAX_TOKENS): Chunk[] {
     if (!this.encoding) throw new Error('Tokenizer not initialized');
-    const segments = splitTextIntoChunks(text, this.encoding, maxTokens, overlap);
-    return segments.map((seg, idx) => ({
+    return chunkStructuredText(text, this.encoding, maxTokens).map((seg, idx) => ({
       id: '',
       document_id: '',
       chunk_index: idx,
       text: seg.text,
-      start_pos: seg.start_pos as number,
-      end_pos: seg.end_pos as number,
-      start_token: seg.start_token,
-      end_token: seg.end_token
+      start_pos: seg.start_pos,
+      end_pos: seg.end_pos,
+      // c1 has no token-space offsets (spec §4.3, r4 D4). Legacy rows keep theirs.
+      start_token: null,
+      end_token: null
     }));
+  }
+
+  // spec §7.1 (r4·r5-8): overlap is rejected on BOTH public paths, BEFORE any
+  // content/dedup judgment — silently accepting it on unchanged content would
+  // void the contract. maxTokens must be a positive integer.
+  private validateChunkParams(params?: { maxTokens?: number; overlap?: number }): { maxTokens: number } {
+    const { maxTokens = DEFAULT_MAX_TOKENS, overlap = 0 } = params || {};
+    if (!Number.isInteger(maxTokens) || maxTokens <= 0)
+      throw new Error(`chunkParams.maxTokens must be a positive integer (got ${maxTokens})`);
+    if (overlap !== 0)
+      throw new Error(`chunkParams.overlap is no longer supported (chunker c1 has no overlap); omit it or pass 0 (got ${overlap})`);
+    return { maxTokens };
   }
 
   // Generate embeddings using sentence transformers
@@ -2267,6 +2279,8 @@ export class RAGKnowledgeGraphManager {
     } = {}
   ): Promise<{ documentId: string; bytes: number; chunks: number; embeddedChunks: number; linkedEntities: number; explicitlyLinked?: number; warning?: string; skipped?: boolean; reason?: string }> {
     if (!this.db) throw new Error('Database not initialized');
+    // spec §7.1 + r5-8: 검증은 content 해석·dedup 판정보다 앞 (첫 실행문).
+    const { maxTokens: __vMaxTokens } = this.validateChunkParams(options.chunkParams);
 
     // 1. Resolve content: raw file verbatim (default) or explicit override.
     //    Content is read on the server and never routed through the model context.
@@ -2325,8 +2339,8 @@ export class RAGKnowledgeGraphManager {
     //    not-ready   — intentional lazy sync: store document + chunks + FTS in
     //                  one transaction with NO vectors (embedding_status:
     //                  queued); the backfill coordinator recovers them.
-    const { maxTokens = 800, overlap = 160 } = options.chunkParams || {};
-    const segments = this.chunkText(content, maxTokens, overlap);
+    const maxTokens = __vMaxTokens;
+    const segments = this.chunkStructured(content, maxTokens);
     const lazySync = !this.gate.isReady;
     const embedded: Array<{ seg: typeof segments[number]; embedding: Float32Array | null }> = [];
     if (lazySync) {
@@ -2352,8 +2366,8 @@ export class RAGKnowledgeGraphManager {
       db.prepare(`DELETE FROM documents WHERE id = ?`).run(documentId);
 
       // 4b. insert document.
-      db.prepare(`INSERT INTO documents (id, content, metadata) VALUES (?, ?, ?)`)
-        .run(documentId, content, JSON.stringify(metadata));
+      db.prepare(`INSERT INTO documents (id, content, metadata, chunking_signature) VALUES (?, ?, ?, ?)`)
+        .run(documentId, content, JSON.stringify(metadata), effectiveSignature(maxTokens));
 
       // 4c. insert chunk_metadata (FTS5 chunks_fts auto-filled by trigger);
       //     vectors + provenance only on the ready path (§6a-2).
@@ -2433,15 +2447,15 @@ export class RAGKnowledgeGraphManager {
       throw new Error(`Document with ID ${documentId} not found`);
     }
     
-    const { maxTokens = 800, overlap = 160 } = options;
-    
-    console.error(`🔪 Chunking document: ${documentId} (maxTokens: ${maxTokens}, overlap: ${overlap})`);
+    const { maxTokens } = this.validateChunkParams(options);
+
+    console.error(`🔪 Chunking document: ${documentId} (maxTokens: ${maxTokens}, chunker: c1)`);
     
     // Clean up existing chunks
     await this.cleanupDocument(documentId);
     
     // Create chunks
-    const chunks = this.chunkText(document.content, maxTokens, overlap);
+    const chunks = this.chunkStructured(document.content, maxTokens);
     const resultChunks = [];
     
     for (const chunk of chunks) {
@@ -2474,6 +2488,9 @@ export class RAGKnowledgeGraphManager {
     }
     
     console.error(`✅ Document chunked: ${chunks.length} chunks created`);
+    // spec §7.1: 두 번째 chunk 생성 경로 — 스탬프를 안 박으면 §5.1 관측이 조용히 샌다.
+    this.db.prepare(`UPDATE documents SET chunking_signature = ? WHERE id = ?`)
+      .run(effectiveSignature(maxTokens), documentId);
     // Indirect missing-row producer (spec §5): freshly chunked rows have no
     // vectors yet — let the coordinator recover them without a restart.
     this.coordinator?.invalidateCoverage();

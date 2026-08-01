@@ -83,12 +83,12 @@ const chunkDocumentCapability: ToolCapabilityInfo = {
       },
       maxTokens: {
         type: 'number',
-        description: 'Maximum tokens per chunk (default: 200)',
+        description: 'Maximum tokens per chunk (default: 800, positive integer)',
         optional: true
       },
       overlap: {
         type: 'number',
-        description: 'Number of overlapping tokens between chunks (default: 20)',
+        description: 'Deprecated since v5.0.0: chunker c1 has no overlap. Omit or pass exactly 0 — any other value is rejected.',
         optional: true
       }
     },
@@ -129,8 +129,8 @@ Create text chunks from a stored document with configurable chunking parameters.
 
 const chunkDocumentSchema: z.ZodRawShape = {
   documentId: z.string().describe('ID of the stored document to chunk'),
-  maxTokens: z.number().default(200).optional().describe('Maximum tokens per chunk'),
-  overlap: z.number().default(20).optional().describe('Number of overlapping tokens'),
+  maxTokens: z.number().optional().default(800).describe('Maximum tokens per chunk (positive integer)'),
+  overlap: z.number().optional().default(0).describe('Deprecated: omit or 0 only (rejected otherwise since v5.0.0)'),
 };
 
 export const chunkDocumentTool: ToolDefinition = {
@@ -592,7 +592,7 @@ const syncDocumentFromFileCapability: ToolCapabilityInfo = {
       },
       chunkParams: {
         type: 'object',
-        description: 'Optional chunking parameters { maxTokens, overlap }',
+        description: 'Optional chunking parameters { maxTokens }. overlap: omit or 0 only (rejected otherwise since v5.0.0 — chunker c1 has no overlap)',
         additionalProperties: true,
         optional: true
       }
@@ -640,7 +640,7 @@ const syncDocumentFromFileSchema: z.ZodRawShape = {
   metadata: z.record(z.any()).optional().describe('Metadata merged into the stored document'),
   content: z.string().optional().describe('Optional content override; stored instead of reading the file'),
   entityNames: z.array(z.string()).optional().describe('Optional entities to explicitly link'),
-  chunkParams: z.record(z.any()).optional().describe('Optional chunking parameters { maxTokens, overlap }'),
+  chunkParams: z.record(z.any()).optional().describe('Optional chunking parameters { maxTokens }. overlap: omit or 0 only (rejected otherwise since v5.0.0)'),
 };
 
 export const syncDocumentFromFileTool: ToolDefinition = {
