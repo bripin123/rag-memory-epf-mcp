@@ -17,7 +17,7 @@ export const LEGACY_SIGNATURE = 'legacy-unknown';
 // chunk (gate regression k05) and short log sections stop forming over-sharp
 // competitor chunks (k09). Derived, not independent: one knob (maxTokens).
 export function mergeMinTokens(maxTokens: number): number {
-  return maxTokens >> 1;
+  return Math.floor(maxTokens / 2);   // NOT >>1 — bitshift wraps at 2^31 (r12)
 }
 
 export function effectiveSignature(maxTokens: number): string {

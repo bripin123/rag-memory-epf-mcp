@@ -3,7 +3,7 @@
 // 출력 불변식 + 음성 대조군 + 비단조 회귀 2건 (r5-5).
 import assert from 'node:assert/strict';
 import { get_encoding } from 'tiktoken';
-import { chunkStructured, effectiveSignature, isCurrentFormatSignature, LEGACY_SIGNATURE } from '../dist/src/chunkerC.js';
+import { chunkStructured, effectiveSignature, isCurrentFormatSignature, LEGACY_SIGNATURE, mergeMinTokens } from '../dist/src/chunkerC.js';
 
 const enc = get_encoding('cl100k_base');
 const cp = (s) => [...s].length;
@@ -169,5 +169,9 @@ assert.ok(!isCurrentFormatSignature('c1:enc=cl100k_base:max=800:overlap=0:fence=
 assert.ok(!isCurrentFormatSignature('c1:enc=cl100k_base:max=800:overlap=0:fence=on:merge=100:fallback=cp-exact-800'), 'merge 파생값 불일치 = unknown');
 assert.ok(!isCurrentFormatSignature('c1:enc=cl100k_base:max=400:overlap=0:fence=on:merge=200:fallback=cp-exact-800'), 'max/fallback mismatch = unknown');
 assert.ok(!isCurrentFormatSignature('c1:enc=cl100k_base:max=0:overlap=0:fence=on:merge=0:fallback=cp-exact-0'), 'max=0 = unknown');
+// r12: >>1 은 2^31 에서 wrap — floor 로 전 양의 정수 범위에서 자기 signature 를 인식해야 한다
+assert.equal(mergeMinTokens(2147483648), 1073741824, '32-bit 경계: floor, not bitshift');
+assert.ok(isCurrentFormatSignature(effectiveSignature(2147483648)), '2^31 signature round-trip');
+assert.ok(isCurrentFormatSignature(effectiveSignature(Number.MAX_SAFE_INTEGER - 1)), 'MAX_SAFE_INTEGER-1 round-trip');
 
 console.log('chunker-c: ALL PASS');

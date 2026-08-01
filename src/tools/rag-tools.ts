@@ -103,7 +103,7 @@ Create text chunks from a stored document with configurable chunking parameters.
 
 <importantNotes>
 - (!important!) **Document must be stored first** using storeDocument
-- (!important!) **Configurable chunking** - adjust maxTokens and overlap as needed
+- (!important!) **Configurable chunking** - adjust maxTokens as needed. overlap is deprecated since v5.0.0 (chunker c1 has no overlap): omit it or pass exactly 0 — any other value is rejected
 - (!important!) **Replaces existing chunks** for the document if any exist
 </importantNotes>
 
@@ -117,14 +117,14 @@ Create text chunks from a stored document with configurable chunking parameters.
 <bestPractices>
 - Smaller chunks (100-150 tokens) for precise retrieval
 - Larger chunks (300-500 tokens) for context preservation
-- Use overlap (10-30 tokens) to maintain continuity
+- Chunker c1 anchors boundaries to markdown structure and merges adjacent sections shorter than floor(maxTokens/2), so continuity needs no overlap
 - Consider document type when choosing chunk size
 </bestPractices>
 
 <examples>
 - Default chunking: {"documentId": "doc1"}
-- Custom size: {"documentId": "doc1", "maxTokens": 150, "overlap": 30}
-- Large context: {"documentId": "legal_doc", "maxTokens": 400, "overlap": 50}
+- Custom size: {"documentId": "doc1", "maxTokens": 150}
+- Large context: {"documentId": "legal_doc", "maxTokens": 400}
 </examples>`;
 
 const chunkDocumentSchema: z.ZodRawShape = {
