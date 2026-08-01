@@ -3753,8 +3753,12 @@ export class RAGKnowledgeGraphManager {
       }
       
       // Generate semantic summary (skip when degraded — no embeddings available).
+      // RAG_MEMORY_SEARCH_SUMMARIES=off: diagnostic escape hatch (v5) — the summary
+      // path embeds EVERY sentence of EVERY candidate (~100+ inferences per search,
+      // measured 90-120s cold). Off = preview slices + relevanceScore 0; ranking
+      // then rests on vectorSimilarity + boosts. Default unchanged.
       let summary: string, keyHighlight: string, relevanceScore: number;
-      if (vectorDegraded || !primaryQueryEmbedding) {
+      if (vectorDegraded || !primaryQueryEmbedding || process.env.RAG_MEMORY_SEARCH_SUMMARIES === 'off') {
         keyHighlight = result.text.slice(0, 150);
         summary = result.text.slice(0, 300);
         relevanceScore = 0;

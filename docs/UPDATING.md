@@ -145,6 +145,12 @@ cut across a chunk boundary still links to the intersecting chunks
 selected by MAX(version) arithmetic, so an experimental slot silently skips
 the real v14 (this is exactly how code-v8 never ran in production).
 
+**Diagnostic env (v5)**: `RAG_MEMORY_SEARCH_SUMMARIES=off` disables the per-result
+sentence-similarity summaries in `hybridSearch` (which embed every sentence of every
+candidate — 100+ inferences, 90-120s cold per search, measured). Off = preview-slice
+summaries, `relevance_score` 0, ranking rests on vector similarity + boosts. Default
+unchanged. The 3-arm release harness sets this uniformly across all arms.
+
 ## v3.6 breaking response changes
 
 1. `hybridSearch` returns an envelope: `{results, search_mode, model_state,
