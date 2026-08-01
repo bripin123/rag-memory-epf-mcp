@@ -34,6 +34,6 @@ try {
     assert.equal(typeof c.startPos, 'number', 'char offsets exact');
   }
   assert.equal(manager.db.prepare(`SELECT chunking_signature FROM documents WHERE id='d1'`).get().chunking_signature,
-    'c1:enc=cl100k_base:max=400:overlap=0:fence=on:fallback=cp-exact-400', 'chunkDocument stamps signature');
+    'c1:enc=cl100k_base:max=400:overlap=0:fence=on:merge=200:fallback=cp-exact-400', 'chunkDocument stamps signature');
   console.log('chunk-params-validation: ALL PASS');
 } finally { cleanup(); }

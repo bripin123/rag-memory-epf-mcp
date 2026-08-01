@@ -44,7 +44,7 @@ const r = await mgr.syncDocumentFromFile('/dev/null', target.id, { content: entr
 assert.equal(r.chunkerTransitioned, true, 'legacy-unknown -> c1 전환 보고');
 assert.ok(r.chunks > 0 && r.deletedChunks === chunksBefore, '대상 delta: 옛 chunk 전량 교체');
 assert.equal(db.prepare(`SELECT chunking_signature FROM documents WHERE id=?`).get(target.id).chunking_signature,
-  'c1:enc=cl100k_base:max=800:overlap=0:fence=on:fallback=cp-exact-800', '대상 signature 기록');
+  'c1:enc=cl100k_base:max=800:overlap=0:fence=on:merge=400:fallback=cp-exact-800', '대상 signature 기록');
 assert.deepEqual(nonTargetFp(), fpBefore, '비대상 documents·chunks·vectors·links byte-보존 (r7-5)');
 assert.equal(db.prepare('PRAGMA foreign_key_check').all().length, 0, 'fk clean');
 assert.equal(db.prepare('PRAGMA quick_check').get().quick_check, 'ok', 'quick_check');

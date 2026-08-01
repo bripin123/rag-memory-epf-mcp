@@ -11,17 +11,26 @@ export interface CSegment { text: string; start_pos: number; end_pos: number }
 export const DEFAULT_MAX_TOKENS = 800;
 export const LEGACY_SIGNATURE = 'legacy-unknown';
 
+// r11: heading is a preferred cut, not a mandatory one. A cut happens only when
+// the accumulated section group AND the next section are both >= this floor —
+// short adjacent sections merge, so cross-section queries still land in one
+// chunk (gate regression k05) and short log sections stop forming over-sharp
+// competitor chunks (k09). Derived, not independent: one knob (maxTokens).
+export function mergeMinTokens(maxTokens: number): number {
+  return maxTokens >> 1;
+}
+
 export function effectiveSignature(maxTokens: number): string {
-  return `c1:enc=cl100k_base:max=${maxTokens}:overlap=0:fence=on:fallback=cp-exact-${maxTokens}`;
+  return `c1:enc=cl100k_base:max=${maxTokens}:overlap=0:fence=on:merge=${mergeMinTokens(maxTokens)}:fallback=cp-exact-${maxTokens}`;
 }
 
 // Strict parse (r5-15): the regex alone classified impossible signatures
 // (max=0, max/fallback mismatch) as current. Cross-check the components.
 export function isCurrentFormatSignature(sig: string): boolean {
-  const m = /^c1:enc=cl100k_base:max=(\d+):overlap=0:fence=on:fallback=cp-exact-(\d+)$/.exec(sig);
+  const m = /^c1:enc=cl100k_base:max=(\d+):overlap=0:fence=on:merge=(\d+):fallback=cp-exact-(\d+)$/.exec(sig);
   if (!m) return false;
   const max = Number(m[1]);
-  return Number.isInteger(max) && max > 0 && m[1] === m[2];
+  return Number.isInteger(max) && max > 0 && m[1] === m[3] && Number(m[2]) === mergeMinTokens(max);
 }
 
 function splitLines(text: string): string[] {
@@ -125,13 +134,46 @@ function splitOversize(block: string, enc: Tiktoken, maxTokens: number): string[
 export function chunkStructured(text: string, enc: Tiktoken, maxTokens: number = DEFAULT_MAX_TOKENS): CSegment[] {
   if (text.length === 0) return [];
   const blocks = buildBlocks(splitLines(text));
+  // r11 section pass: a section = one heading block through the next heading
+  // (preamble = blocks before the first heading). Cut decisions are precomputed
+  // per section so they depend only on section sizes, not packing state.
+  const minSection = mergeMinTokens(maxTokens);
+  const sectionOfBlock = new Array<number>(blocks.length);
+  const sectionTexts: string[] = [];
+  let sec = -1;
+  blocks.forEach((b, bi) => {
+    if (b.heading || sec === -1) { sec++; sectionTexts[sec] = ''; }
+    sectionOfBlock[bi] = sec;
+    sectionTexts[sec] += b.lines.join('');
+  });
+  const secTokens = sectionTexts.map(t => enc.encode(t).length);
+  // Cut at section s iff the group accumulated since the last cut and section s
+  // are BOTH >= minSection. Group size = sum of section token counts (token
+  // counts are not additive across joins; the sum is a deterministic threshold
+  // proxy, never used as a budget).
+  const cutAtSection = new Array<boolean>(secTokens.length).fill(false);
+  {
+    let groupTokens = 0;
+    for (let s = 0; s < secTokens.length; s++) {
+      if (s > 0 && groupTokens >= minSection && secTokens[s] >= minSection) { cutAtSection[s] = true; groupTokens = 0; }
+      groupTokens += secTokens[s];
+    }
+  }
   const pieces: string[] = [];
   let acc = '';
   const flush = () => { if (acc.length > 0) { pieces.push(acc); acc = ''; } };
-  for (const b of blocks) {
+  for (let bi = 0; bi < blocks.length; bi++) {
+    const b = blocks[bi];
     const btext = b.lines.join('');
     if (btext.length === 0) continue;
-    if (b.heading) flush();                                   // heading = 1st-priority boundary
+    if (b.heading) {
+      const s = sectionOfBlock[bi];
+      // Preferred cut: honor the precomputed section cut. Merged headings still
+      // flush when their whole section cannot join the open chunk — splitting
+      // at the heading beats orphaning the heading line at a budget flush.
+      if (cutAtSection[s]) flush();
+      else if (acc.length > 0 && enc.encode(acc + sectionTexts[s]).length > maxTokens) flush();
+    }
     if (acc.length > 0 && enc.encode(acc + btext).length > maxTokens) flush();
     if (acc.length === 0 && enc.encode(btext).length > maxTokens) {
       pieces.push(...splitOversize(btext, enc, maxTokens));   // mega-block fallback

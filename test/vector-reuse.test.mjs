@@ -16,7 +16,10 @@ try {
   await manager.startReconciliation();
   const db = manager.db;
   const file = join(dir, 'doc.md');
-  const V1 = '## A\nalpha body\n\n## B\nbeta body\n\n## C\ngamma body\n';
+  // r11 병합 규칙: 절이 merge 최소치(400tk) 미만이면 이웃과 병합된다. 이 테스트는
+  // A/B/C 가 별개 chunk 여야 하므로 각 절을 패딩으로 ≥ 400tk 로 유지한다.
+  const PAD = 'pad '.repeat(440);
+  const V1 = `## A\nalpha body ${PAD}\n\n## B\nbeta body ${PAD}\n\n## C\ngamma body ${PAD}\n`;
   writeFileSync(file, V1, 'utf-8');
   await manager.syncDocumentFromFile(file, 'd1', {});
 
@@ -98,7 +101,8 @@ try {
     '복사는 검증이 아니다 — legacy_assumed 승계');
 
   // [8] 동일 전문 다회 출현 (r6-4: 실제로 동일한 chunk 전문이 나오는 fixture)
-  const DUP = '## X\nsame paragraph body\n\n## X\nsame paragraph body\n\n## Z\nend\n';
+  // 각 절 ≥ 400tk (r11 병합 억제) — X 두 절은 byte-동일 유지.
+  const DUP = `## X\nsame paragraph body ${PAD}\n\n## X\nsame paragraph body ${PAD}\n\n## Z\nend ${PAD}\n`;
   writeFileSync(file, DUP, 'utf-8');
   await manager.syncDocumentFromFile(file, 'd1', {});
   const dupTexts = db.prepare(`SELECT text FROM chunk_metadata WHERE document_id='d1' ORDER BY chunk_index`).all().map(r => r.text);

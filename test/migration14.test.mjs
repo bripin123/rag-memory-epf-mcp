@@ -11,7 +11,7 @@ try {
 
   assert.ok(cols().includes('chunking_signature'), 'v14 applied on fresh DB');
   assert.equal(db.prepare(`SELECT value FROM server_meta WHERE key='current_default_chunker'`).get().value,
-    'c1:enc=cl100k_base:max=800:overlap=0:fence=on:fallback=cp-exact-800');
+    'c1:enc=cl100k_base:max=800:overlap=0:fence=on:merge=400:fallback=cp-exact-800');
 
   // down: 응답이 semantic 한계를 실어야 한다 (spec §6.3 — description 이 아니라 응답, r5-10)
   const rb = await manager.rollbackMigration(13);

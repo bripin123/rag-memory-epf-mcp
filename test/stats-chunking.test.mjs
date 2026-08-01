@@ -22,7 +22,7 @@ try {
   assert.equal(stats.chunking.unknown, 3, 'unknown = 미인식 3건 (malformed-c1 2종 포함, r5-15)');
   assert.equal(stats.chunking.current + stats.chunking.legacy + stats.chunking.unknown,
     db.prepare(`SELECT count(*) n FROM documents`).get().n, 'partition of documents');
-  assert.equal(stats.chunking.default_signature, 'c1:enc=cl100k_base:max=800:overlap=0:fence=on:fallback=cp-exact-800');
+  assert.equal(stats.chunking.default_signature, 'c1:enc=cl100k_base:max=800:overlap=0:fence=on:merge=400:fallback=cp-exact-800');
 
   // boot upsert (initialize 가 이미 실행됨)
   assert.equal(db.prepare(`SELECT value FROM server_meta WHERE key='current_default_chunker'`).get().value,
