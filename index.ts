@@ -320,6 +320,11 @@ export class RAGKnowledgeGraphManager {
 
     await this.runMigrations();
     this.currentProfileId = this.ensureCurrentProfile();
+    // v14 (spec §7.2): 런타임이 기본 chunker 의 SSOT — 마이그레이션의 리터럴은 동결된
+    // 역사이고, 기본값이 진화하면(c2 등) 이 upsert 가 부팅마다 현재값을 기록한다.
+    this.db.prepare(`INSERT INTO server_meta (key, value) VALUES ('current_default_chunker', ?)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
+      .run(effectiveSignature(DEFAULT_MAX_TOKENS));
 
     this.embeddingsMode = opts.skipModel
       ? 'off'
@@ -3956,6 +3961,17 @@ export class RAGKnowledgeGraphManager {
     // reads version, model/reconciliation state, and provenance coverage here.
     const gs = this.gate.status;
     const cov = this.coordinator?.coverage();
+    // v14 (spec §7.2): document 기준 chunking 전환 상태 — 상호배타, 합 = documents.
+    // regex 분류는 SQL 밖(JS)에서: current = 런타임이 인식하는 c1 형식(강한 파서),
+    // legacy = 'legacy-unknown', unknown = 그 외 전부.
+    const sigRows = this.db.prepare(`SELECT chunking_signature AS s, count(*) AS n FROM documents GROUP BY chunking_signature`)
+      .all() as Array<{ s: string; n: number }>;
+    let sigCur = 0, sigLeg = 0, sigUnk = 0;
+    for (const r of sigRows) {
+      if (r.s === LEGACY_SIGNATURE) sigLeg += r.n;
+      else if (isCurrentFormatSignature(r.s)) sigCur += r.n;
+      else sigUnk += r.n;
+    }
     return {
       entities: {
         total: entityStats.reduce((sum, stat) => sum + stat.count, 0),
@@ -3967,6 +3983,8 @@ export class RAGKnowledgeGraphManager {
       },
       documents: documentCount.count,
       chunks: chunkCount.count,
+      chunking: { current: sigCur, legacy: sigLeg, unknown: sigUnk,
+                  default_signature: effectiveSignature(DEFAULT_MAX_TOKENS) },
       server: {
         version: PKG_VERSION,
         node: process.versions.node,
