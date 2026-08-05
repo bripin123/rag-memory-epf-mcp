@@ -60,8 +60,11 @@ const mgr = new RAGKnowledgeGraphManager();
 await mgr.initialize({ skipModel: true });
 const db = mgr.db;
 
-// 0) 마이그레이션이 실제로 v13 까지 갔다
-assert.equal(db.prepare(`SELECT MAX(version) v FROM schema_migrations`).get().v, 13, 'not at v13');
+// 0) 마이그레이션이 최소 v13 까지 갔다. v13 이 이 파일의 대상(observation lifecycle)이라 하한만 건다.
+//    상한을 고정하면 뒤에 붙는 마이그레이션마다 이 게이트가 거짓 실패로 죽는다 — v14 도입 이후
+//    실제로 그랬고, env 를 걸면 항상 FAIL·안 걸면 SKIP 이라 아무도 걸 수 없는 게이트가 됐다.
+const schemaVersion = db.prepare(`SELECT MAX(version) v FROM schema_migrations`).get().v;
+assert.ok(schemaVersion >= 13, `expected at least v13, got v${schemaVersion}`);
 
 // 1) 전 entity 의 projection 이 원본과 동일하다.
 //    두 층으로 본다: 배열 요소가 정확히 같은가(의미) + 원본 raw 문자열과 byte 동일한가.

@@ -108,6 +108,41 @@ path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
 is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
 the next start becomes a clean download owner.
 
+## v5.1.0 (schema v14, unchanged): destructive-replace reporting + `excludePattern`
+
+**What changes on upgrade**: nothing you have to do. No migration, no schema
+change, no re-embedding. Both changes are additive — existing calls keep their
+arguments and keep working, and the new response fields are extra keys.
+
+**`storeDocument` now says what it destroyed.** It has always deleted the
+previous document's chunks, vectors and entity links before writing, but the
+response was `{ id, stored: true }`, so a caller replacing a document could not
+tell from the return value that anything was removed. It now returns
+`{ id, stored, replaced, deletedChunks }`, matching what `syncDocumentFromFile`
+already reported. `replaced` is decided by the document row, not the chunk
+count — a document that was stored but never chunked still gets overwritten,
+and reporting that as a fresh write would be wrong.
+
+**`syncDocumentFromFile` accepts `excludePattern`** (string or array of
+strings): regions matching these regular expressions are stripped before
+indexing. Previously the only way to leave part of a file out was to read it
+yourself and pass the whole edited text through `content`, which defeats the
+point of a tool that reads server-side to keep content off the model context.
+
+Three properties worth knowing:
+
+1. **The exclusion happens first**, before hashing and chunking, so
+   `content_hash`, the reported `bytes` and the chunk boundaries all describe
+   what was actually indexed. Changing only the pattern therefore invalidates
+   the dedup gate and re-indexes; it does not silently return `unchanged`.
+2. **Patterns are compiled with the dotAll flag**, so one pattern can span
+   lines to drop a marked block (`<!-- SECRET -->[\s\S]*?<!-- /SECRET -->`).
+   JavaScript has no inline `(?s)`, so without this every such pattern would
+   quietly match nothing.
+3. **An invalid expression fails the call.** Degrading to "no exclusion" would
+   index the whole file while the caller believes it was filtered, and an index
+   is a disclosure path — a failed sync is the safer error.
+
 ## v5.0.0 (schema v14): chunker c1 + vector reuse
 
 **Breaking**: `chunkParams.overlap` is rejected on BOTH public paths
