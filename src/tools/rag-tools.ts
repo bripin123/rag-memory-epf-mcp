@@ -639,6 +639,7 @@ const syncDocumentFromFileSchema: z.ZodRawShape = {
   documentId: z.string().describe('RAG document ID to (re)create from the file'),
   metadata: z.record(z.any()).optional().describe('Metadata merged into the stored document'),
   content: z.string().optional().describe('Optional content override; stored instead of reading the file'),
+  excludePattern: z.union([z.string(), z.array(z.string())]).optional().describe('Regular expression(s) whose matches are stripped before indexing. Applied to the file (or to `content`) first, so hash, byte count and chunking all describe what was actually indexed. Compiled with the dotAll flag, so a pattern may span lines to drop a marked block. An invalid expression fails the call rather than indexing the whole file.'),
   entityNames: z.array(z.string()).optional().describe('Optional entities to explicitly link'),
   chunkParams: z.record(z.any()).optional().describe('Optional chunking parameters { maxTokens }. overlap: omit or 0 only (rejected otherwise since v5.0.0)'),
 };

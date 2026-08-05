@@ -263,6 +263,27 @@ function safeRowid(value: unknown): number {
   return n;
 }
 
+// Remove regions the caller does not want indexed. Compiled with `s` because the intended use is
+// spanning a marked block (`<!-- SECRET -->…<!-- /SECRET -->`) and JS has no inline (?s) flag —
+// without it every such pattern would silently match nothing.
+// A malformed pattern throws rather than degrading to "no exclusion": indexing is a disclosure
+// path, so believing you excluded something you did not is worse than a failed sync.
+function applyExcludePatterns(text: string, pattern?: string | string[]): string {
+  if (pattern === undefined) return text;
+  const patterns = Array.isArray(pattern) ? pattern : [pattern];
+  let out = text;
+  for (const p of patterns) {
+    let re: RegExp;
+    try {
+      re = new RegExp(p, 'gs');
+    } catch (e) {
+      throw new Error(`excludePattern is not a valid regular expression: ${JSON.stringify(p)} (${(e as Error).message})`);
+    }
+    out = out.replace(re, '');
+  }
+  return out;
+}
+
 // Enhanced RAG-enabled Knowledge Graph Manager
 export class RAGKnowledgeGraphManager {
   private db: Database.Database | null = null;
@@ -2313,6 +2334,7 @@ export class RAGKnowledgeGraphManager {
     options: {
       metadata?: Record<string, any>;
       content?: string;
+      excludePattern?: string | string[];
       entityNames?: string[];
       chunkParams?: { maxTokens?: number; overlap?: number };
     } = {}
@@ -2330,7 +2352,14 @@ export class RAGKnowledgeGraphManager {
 
     for (let attempt = 1; attempt <= 3; attempt++) {
       // r6-3: CAS 재시작 = 처음부터 — 파일 읽기·hash·metadata 도 attempt 안에서 재계산한다.
-      const content = options.content !== undefined ? options.content : fsSync.readFileSync(filePath, 'utf-8');
+      // Strip excluded regions before anything else looks at the text. Everything downstream —
+      // content_hash, bytes, chunking — then describes what was actually indexed, so changing the
+      // pattern alone still invalidates the dedup gate below. Hashing the raw file instead would
+      // report `unchanged` for a different exclusion, which is the silent-wrong case.
+      const content = applyExcludePatterns(
+        options.content !== undefined ? options.content : fsSync.readFileSync(filePath, 'utf-8'),
+        options.excludePattern,
+      );
       const bytes = Buffer.byteLength(content, 'utf-8');
       const today = new Date().toISOString().slice(0, 10);
       const contentHash = shaHex(content);
@@ -2487,14 +2516,18 @@ export class RAGKnowledgeGraphManager {
     throw new Error('unreachable');
   }
 
-  async storeDocument(id: string, content: string, metadata: Record<string, any> = {}): Promise<{ id: string; stored: boolean }> {
+  async storeDocument(id: string, content: string, metadata: Record<string, any> = {}): Promise<{ id: string; stored: boolean; replaced: boolean; deletedChunks: number }> {
     if (!this.db) throw new Error('Database not initialized');
 
     console.error(`📄 Storing document: ${id}`);
-    
+
+    // Decide `replaced` from the document row, not from the chunk count: a document stored but
+    // never chunked still gets overwritten here, and reporting that as a fresh write would be a lie.
+    const existed = this.db.prepare(`SELECT 1 FROM documents WHERE id = ?`).get(id) !== undefined;
+
     // Clean up existing document
-    await this.cleanupDocument(id);
-    
+    const cleaned = await this.cleanupDocument(id);
+
     // Store document
     this.db.prepare(`
       INSERT OR REPLACE INTO documents (id, content, metadata)
@@ -2502,7 +2535,7 @@ export class RAGKnowledgeGraphManager {
     `).run(id, content, JSON.stringify(metadata));
     
     console.error(`✅ Document stored: ${id}`);
-    return { id, stored: true };
+    return { id, stored: true, replaced: existed, deletedChunks: cleaned.deletedChunks };
   }
 
   async chunkDocument(documentId: string, options: { maxTokens?: number; overlap?: number } = {}): Promise<{ documentId: string; chunks: Array<{ id: string; text: string; startPos: number | null; endPos: number | null; startToken: number | null; endToken: number | null }> }> {
@@ -2868,8 +2901,12 @@ export class RAGKnowledgeGraphManager {
     return { documentId, linkedEntities: linkedCount };
   }
 
-  private async cleanupDocument(documentId: string): Promise<void> {
-    if (!this.db) return;
+  // Report what was destroyed. The counts were already computed here and thrown away, so a caller
+  // that replaces a document could not tell from the return value that anything was deleted
+  // (2026-08-05 field report from a deployed project: "{stored:true} came back and I did not know
+  // what I had just wiped"). Silent destruction is the defect; the numbers are free.
+  private async cleanupDocument(documentId: string): Promise<{ deletedChunks: number; deletedAssociations: number; deletedVectors: number }> {
+    if (!this.db) return { deletedChunks: 0, deletedAssociations: 0, deletedVectors: 0 };
     
     console.error(`🧹 Cleaning up document: ${documentId}`);
     
@@ -2904,6 +2941,8 @@ export class RAGKnowledgeGraphManager {
       console.error(`  ├─ Deleted ${deletedVectors} vector embeddings`);
       console.error(`  └─ Deleted ${metadata.changes} chunk metadata records`);
     }
+
+    return { deletedChunks: existingChunks.length, deletedAssociations, deletedVectors };
   }
 
   async deleteDocument(documentId: string): Promise<{ documentId: string; deleted: boolean }> {
@@ -4474,6 +4513,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
           {
             metadata: (validatedArgs as any).metadata,
             content: (validatedArgs as any).content,
+            excludePattern: (validatedArgs as any).excludePattern,
             entityNames: (validatedArgs as any).entityNames,
             chunkParams: (validatedArgs as any).chunkParams,
           }

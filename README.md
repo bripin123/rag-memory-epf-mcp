@@ -64,7 +64,7 @@ Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each 
 ### Document Pipeline (9)
 | Tool | Description | Annotation |
 |------|------------|------------|
-| `storeDocument` | Store documents with metadata | idempotent |
+| `storeDocument` | Store documents with metadata. Replacing an existing document reports what it destroyed: `{ replaced, deletedChunks }` | idempotent |
 | `chunkDocument` | Create text chunks with configurable parameters | — |
 | `embedChunks` | Generate 1024-dim embeddings + auto-link entities | idempotent |
 | `embedAllEntities` | Batch embed all entities (32 parallel) | idempotent |
@@ -72,7 +72,7 @@ Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each 
 | `linkEntitiesToDocument` | Link entities to chunks where they actually appear (text-matched) | idempotent |
 | `deleteDocuments` | Remove documents and associated data | destructive |
 | `listDocuments` | View all stored documents | readOnly |
-| `syncDocumentFromFile` | One-call server-side sync: reads file + delete/store/chunk/embed/link, content stays off model context. Atomic (embed-first transaction swap) + `content_hash` dedup (skips unchanged files) | idempotent |
+| `syncDocumentFromFile` | One-call server-side sync: reads file + delete/store/chunk/embed/link, content stays off model context. Atomic (embed-first transaction swap) + `content_hash` dedup (skips unchanged files). `excludePattern` strips regions before indexing, and the hash follows the stripped text so changing the pattern re-indexes | idempotent |
 
 ### Search & Retrieval (9)
 | Tool | Description | Annotation |
