@@ -19,7 +19,16 @@ export const migrations: Migration[] = [
     version: 1,
     description: 'Complete RAG Knowledge Graph schema - all tables and features',
     up: (db) => {
-      // Disable foreign key enforcement to make deletions easier
+      // ⚠ 이 줄은 **아무 일도 하지 않는다** (2026-08-11 실측). migration-manager 가 각
+      // 마이그레이션을 `db.transaction(...)` 으로 감싸는데, SQLite 에서 `PRAGMA foreign_keys`
+      // 는 **트랜잭션 안에서 no-op** 이기 때문이다. 실측 = 신규 DB 에 13개 마이그레이션을
+      // 전부 적용한 뒤에도 `foreign_keys = 1`.
+      //
+      // **고치지 말 것.** 이 줄이 실제로 동작하게 만들면(트랜잭션 밖으로 빼는 등) FK 는
+      // 마이그레이션 이후 **그 프로세스 수명 내내 꺼진 채로 남는다** — 부팅 게이트(index.ts)
+      // 는 `runMigrations()` **앞**에서 판정하므로 그걸 못 잡는다. 그 상태에서 entity 를
+      // 지우면 observation 계열이 CASCADE 되지 않아 고아·FK 위반이 쌓인다.
+      // 회귀 잠금 = test/observation-cascade.test.mjs T25(신규 DB 부팅 후 FK==1).
       db.pragma('foreign_keys = OFF');
 
       // Original entities table (enhanced)
