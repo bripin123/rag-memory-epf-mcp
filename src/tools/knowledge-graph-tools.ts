@@ -214,6 +214,11 @@ Observations provide the factual foundation that supports entity existence and p
 - (!important!) **Entity must exist** - this tool only adds to existing entities
 - (!important!) Duplicates are filtered - repeating existing text with a **new** sources entry
   adds evidence to the existing revision and returns null for that position
+- (!important!) A \`[YYYY-MM-DD]\` prefix is prepended unless the text already starts with a valid
+  one. The day comes from \`RAG_MEMORY_CALENDAR_TZ\` (default UTC) - see \`calendar_timezone\` in
+  getKnowledgeGraphStats. Text may open with \`[YYYY-MM-DD note]\`; the note is treated as recording
+  metadata and is ignored when deduplicating, so the same sentence filed under two session markers
+  stays one observation
 - (!important!) Observations are cumulative. **This tool never replaces anything** - use
   correctObservation to supersede and retractObservation to withdraw
 - (!important!) **Be specific and factual** - observations should be verifiable statements
