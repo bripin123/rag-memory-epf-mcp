@@ -43,6 +43,7 @@ import { EmbeddingGate, GateNotReadyError, GateDisabledError, TerminalConfigErro
 import type { EmbedFn, EmbedPriority } from './src/embeddingGate.js';
 import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock, handleLoaderFailure } from './src/modelCache.js';
 import { BackfillCoordinator } from './src/backfillCoordinator.js';
+import { calendarDate, resolveCalendarTimeZone, stampDatePrefix, stripDatePrefix } from './src/observations/date-prefix.js';
 import os from 'node:os';
 import { createHash } from 'crypto';
 import { createRequire } from 'module';
@@ -295,6 +296,9 @@ export class RAGKnowledgeGraphManager {
   // default model config, or with the explicit trust opt-in (spec §6b guard).
   grandfatherAllowed = IS_DEFAULT_MODEL_CONFIG || process.env.RAG_MEMORY_TRUST_LEGACY_VECTORS === '1';
   coordinator: BackfillCoordinator | null = null;
+  // The calendar that date-only human labels are written in. Resolved once, here, so an invalid
+  // zone fails at construction instead of quietly writing wrong days for weeks.
+  readonly calendarTimeZone: string = resolveCalendarTimeZone(process.env.RAG_MEMORY_CALENDAR_TZ);
   private embeddingCache: Map<string, Float32Array> = new Map();
   private readonly EMBEDDING_CACHE_MAX = 500;
   private dictionaryCache: { nativeToEn: Record<string, string>; enToNative: Record<string, string> } | null = null;
@@ -688,10 +692,12 @@ export class RAGKnowledgeGraphManager {
   // === ORIGINAL MCP FUNCTIONALITY ===
 
   private _timestampObservation(obs: string): string {
-    // If observation already has a date prefix like [2026-03-21], skip
-    if (/^\[\d{4}-\d{2}-\d{2}\]/.test(obs)) return obs;
-    const today = new Date().toISOString().slice(0, 10);
-    return `[${today}] ${obs}`;
+    // Stamp and dedup share one parser (src/observations/date-prefix.ts). They used to carry
+    // separate regexes and disagreed about "[2026-08-11 session16] ...": stamping treated it as
+    // undated and prepended a second date, while dedup could not strip it — so the same sentence
+    // written in two sessions became two observations. Measured on a live database: 82 rows with
+    // two dates, 29 with a day earlier than the day they were written.
+    return stampDatePrefix(obs, this.calendarTimeZone);
   }
 
   async createEntities(entities: Array<Entity & {
@@ -706,7 +712,7 @@ export class RAGKnowledgeGraphManager {
       INSERT OR IGNORE INTO entities (id, name, entityType, observations, metadata)
       VALUES (?, ?, ?, '[]', ?)
     `);
-    const stripDate = (s2: string) => s2.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '');
+    const stripDate = stripDatePrefix;   // shared with the stamp path — see date-prefix.ts
 
     for (const entity of entities) {
       const entityId = `entity_${entity.name.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
@@ -840,7 +846,7 @@ export class RAGKnowledgeGraphManager {
       // dedup 기준은 v3.6 과 같다: 날짜 prefix 를 뗀 본문이 active 에 이미 있으면
       // 새 revision 을 만들지 않는다. 다만 v13 에서는 같은 사실이 다른 출처에서 다시
       // 온 것이므로 그 revision 에 source link 를 더한다(spec §8.3 T13).
-      const stripDate = (s2: string) => s2.replace(/^\[\d{4}-\d{2}-\d{2}\]\s*/, '');
+      const stripDate = stripDatePrefix;   // shared with the stamp path — see date-prefix.ts
       const activeRows = this.db.prepare(
         `SELECT observation_id, content FROM entity_observations
          WHERE entity_id = ? AND status = 'active'`).all(entityId) as
@@ -2361,7 +2367,10 @@ export class RAGKnowledgeGraphManager {
         options.excludePattern,
       );
       const bytes = Buffer.byteLength(content, 'utf-8');
-      const today = new Date().toISOString().slice(0, 10);
+      // Same calendar as the observation prefix. Deciding this explicitly rather than leaving it
+      // on UTC: both are date-only labels a person reads, and "observations in Seoul days but
+      // documents in UTC days" is not a distinction anyone could explain later.
+      const today = calendarDate(new Date(), this.calendarTimeZone);
       const contentHash = shaHex(content);
       // spec §5.1: content_hash 는 system-owned — user metadata 뒤에 쓴다 (r1: spread 가 덮어쓸 수 있었다).
       const metadata = { source: filePath, updated: today, ...(options.metadata || {}), content_hash: contentHash };
@@ -4031,6 +4040,9 @@ export class RAGKnowledgeGraphManager {
       server: {
         version: PKG_VERSION,
         node: process.versions.node,
+        // Which calendar produced the date-only labels in this database. Surfaced because a
+        // wrong value is otherwise invisible: the labels look plausible either way.
+        calendar_timezone: this.calendarTimeZone,
         embeddings_mode: this.embeddingsMode,
         model: `${EMBEDDING_MODEL}@${MODEL_REVISION}`,
         model_state: gs.state,
