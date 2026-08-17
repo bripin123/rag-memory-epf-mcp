@@ -17,7 +17,7 @@ export async function buildFixture() {
     ['Delta Node', axisVec(-0.5)],      // far
     ['Alpha Node observations', axisVec(0.60)],
   ]);
-  installControlledEmbedder(m, table);
+  const controlled = installControlledEmbedder(m, table);
   await m.createEntities([
     { name: 'Alpha Node', entityType: 'CONCEPT', observations: ['Alpha Node observations'] },
     { name: 'Beta Node',  entityType: 'CONCEPT', observations: ['beta text'] },
@@ -25,6 +25,22 @@ export async function buildFixture() {
     { name: 'Delta Node', entityType: 'CONCEPT', observations: ['delta text'] },
     { name: 'Lonely Node', entityType: 'CONCEPT', observations: ['no relations at all'] },
   ]);
+  // The engine embeds an entity as `${entityType}: ${name}. ${observations}` with the observation
+  // date stamp (buildEntityEmbeddingText), not the bare name, so the table above never matched and
+  // the entity vectors fell through to the char-code fallback — the 0.4-threshold design had no
+  // effect and the vectors changed with the calendar day. Read the real embedding text back from
+  // the projection, register the controlled vector for it, and re-embed (embedEntity always
+  // overwrites; the cache must be dropped or it returns the fallback vector it already computed).
+  const cos = { 'Alpha Node': 0.60, 'Beta Node': 0.31, 'Gamma Node': 0.25, 'Delta Node': -0.5, 'Lonely Node': -0.5 };
+  for (const row of m.db.prepare(`SELECT id, name, entityType, observations FROM entities ORDER BY id`).all()) {
+    const text = `${row.entityType}: ${row.name}. ${JSON.parse(row.observations).join('. ')}`.trim();
+    table.set(text, axisVec(cos[row.name]));
+  }
+  m.embeddingCache = new Map();
+  for (const row of m.db.prepare(`SELECT id FROM entities ORDER BY id`).all()) {
+    if (await m.tryEmbedEntity(row.id, 'interactive') !== 'embedded') throw new Error(`fixture: ${row.id} not embedded`);
+  }
+  if (controlled.calls === 0) throw new Error('fixture: controlled embedder was never called');
   await m.createRelations([
     { from: 'Alpha Node', to: 'Delta Node', relationType: 'REFERENCES' },   // out-edge from seed
     { from: 'Delta Node', to: 'Alpha Node', relationType: 'SUPPORTS' },     // in-edge to seed (bidirectional pair)
