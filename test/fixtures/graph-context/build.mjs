@@ -5,6 +5,11 @@ import { writeFileSync } from 'node:fs';
 import { makeManager, installControlledEmbedder, axisVec } from '../../helpers/engine-test-db.mjs';
 
 export const QUERY = 'graph context probe query';
+// Case c3 ("후보 0" in the delta spec): the graph must find no seed at all. Its vector is the unit
+// vector on axis 2, and every entity vector lives in the span of axes 0 and 1, so the cosine is 0
+// for all five (similarity 0.293 < 0.4). Left to the char-code fallback this query cleared the
+// threshold for every entity instead, which made the case assert the opposite of its name.
+export const NO_SEED_QUERY = 'zzqx nothing matches';
 export async function buildFixture() {
   const { manager: m, dir } = await makeManager();
   m.embeddingsMode = 'lazy';
@@ -41,6 +46,9 @@ export async function buildFixture() {
     if (await m.tryEmbedEntity(row.id, 'interactive') !== 'embedded') throw new Error(`fixture: ${row.id} not embedded`);
   }
   if (controlled.calls === 0) throw new Error('fixture: controlled embedder was never called');
+  // Register every variant, not the raw string: hybridSearch embeds buildCrossLingualVariants(q),
+  // whose first element is the NORMALISED query, so keying on the raw text can silently miss.
+  for (const v of m.buildCrossLingualVariants(NO_SEED_QUERY)) table.set(v, axisVec(0, 2));
   await m.createRelations([
     { from: 'Alpha Node', to: 'Delta Node', relationType: 'REFERENCES' },   // out-edge from seed
     { from: 'Delta Node', to: 'Alpha Node', relationType: 'SUPPORTS' },     // in-edge to seed (bidirectional pair)
@@ -65,7 +73,7 @@ export async function runCases(m) {
   const out = {};
   out.c1_multi_seed_threshold = strip(await m.hybridSearch(QUERY, 10, true));          // Alpha+Beta seeds, Gamma below
   out.c2_default_off          = strip(await m.hybridSearch(QUERY, 10));                // no graph_boost at all
-  out.c3_no_candidate         = strip(await m.hybridSearch('zzqx nothing matches', 10, true));
+  out.c3_no_candidate         = strip(await m.hybridSearch(NO_SEED_QUERY, 10, true));      // zero seeds -> gb 0 everywhere
   out.c4_cross_lingual        = strip(await m.hybridSearch('알파 노드 검색', 10, true)); // variants path (may equal single variant)
   // c5: entity-vector exception forced -> text fallback path
   const origPrepare = m.db.prepare.bind(m.db);
