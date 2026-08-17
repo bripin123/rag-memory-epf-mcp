@@ -15,7 +15,7 @@ await exitOnRefuse(async () => {
     if (r.class === 'K') continue;
     const observed = [];
     for (const path of (r.expected_paths || [])) for (const e of path) {
-      const a = idOf.get(e.from), b = idOf.get(e.to); if (!a || !b) { observed.push({ from: e.from, to: e.to, missing_entity: !a ? e.from : e.to }); continue; }
+      const a = idOf.get(e.from), b = idOf.get(e.to); if (!a || !b) { if (!a) observed.push({ from: e.from, to: e.to, missing_entity: e.from }); if (!b) observed.push({ from: e.from, to: e.to, missing_entity: e.to }); continue; }
       for (const row of edge.all(a, b, b, a)) observed.push({ from: e.from, to: e.to, edge_id: row.id, relation_type: row.relationType, direction: row.source_entity === a ? 'out' : 'in', confidence: row.confidence });
     }
     out.push({ id: r.id, observed_paths: observed });

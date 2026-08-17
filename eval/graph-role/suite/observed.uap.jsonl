@@ -1,0 +1,60 @@
+{"id":"uap-A-1","observed_paths":[]}
+{"id":"uap-A-2","observed_paths":[{"from":"SAAC","to":"SASO","edge_id":"rel_entity_saso_related_to_entity_saac","relation_type":"RELATED_TO","direction":"in","confidence":1}]}
+{"id":"uap-A-3","observed_paths":[]}
+{"id":"uap-A-4","observed_paths":[]}
+{"id":"uap-A-5","observed_paths":[]}
+{"id":"uap-A-6","observed_paths":[]}
+{"id":"uap-A-7","observed_paths":[]}
+{"id":"uap-A-8","observed_paths":[]}
+{"id":"uap-A-9","observed_paths":[]}
+{"id":"uap-A-10","observed_paths":[]}
+{"id":"uap-A-11","observed_paths":[]}
+{"id":"uap-A-12","observed_paths":[]}
+{"id":"uap-A-13","observed_paths":[]}
+{"id":"uap-A-14","observed_paths":[]}
+{"id":"uap-A-15","observed_paths":[]}
+{"id":"uap-A-16","observed_paths":[]}
+{"id":"uap-A-17","observed_paths":[]}
+{"id":"uap-A-18","observed_paths":[]}
+{"id":"uap-A-19","observed_paths":[]}
+{"id":"uap-A-20","observed_paths":[]}
+{"id":"uap-A-21","observed_paths":[]}
+{"id":"uap-A-22","observed_paths":[]}
+{"id":"uap-A-23","observed_paths":[]}
+{"id":"uap-A-24","observed_paths":[]}
+{"id":"uap-A-25","observed_paths":[]}
+{"id":"uap-A-26","observed_paths":[]}
+{"id":"uap-A-27","observed_paths":[]}
+{"id":"uap-A-28","observed_paths":[]}
+{"id":"uap-A-29","observed_paths":[]}
+{"id":"uap-A-30","observed_paths":[{"from":"raw/2026-08-11_gemini-spark-antigravity_sources.md","to":"wiki/antigravity-and-gemini-spark.md","edge_id":"rel_entity_wiki_antigravity_and_gemini_spark_md_derived_from_entity_raw_2026_08_11_gemini_spark_antigravity_sources_md","relation_type":"DERIVED_FROM","direction":"in","confidence":1}]}
+{"id":"uap-M-1","observed_paths":[{"from":"JAKIM","to":"말레이시아 대사관 전달 패키지 2026-07-27","edge_id":"rel_entity_말레이시아_대사관_전달_패키지_2026_07_27_addressed_to_entity_jakim","relation_type":"ADDRESSED_TO","direction":"in","confidence":1}]}
+{"id":"uap-M-2","observed_paths":[]}
+{"id":"uap-M-3","observed_paths":[]}
+{"id":"uap-M-4","observed_paths":[]}
+{"id":"uap-M-5","observed_paths":[{"from":"Motaded","to":"Halal Office","edge_id":"rel_entity_halal_office_parallel_with_entity_motaded","relation_type":"PARALLEL_WITH","direction":"in","confidence":1}]}
+{"id":"uap-M-6","observed_paths":[]}
+{"id":"uap-M-7","observed_paths":[{"from":"KSA Korea Consulting & Trading","to":"Halal Office","edge_id":"rel_entity_ksa_korea_consulting___trading_parallel_with_entity_halal_office","relation_type":"PARALLEL_WITH","direction":"out","confidence":1}]}
+{"id":"uap-M-8","observed_paths":[{"from":"Legal AI Service","to":"BRIPIN","edge_id":"rel_entity_legal_ai_service_part_of_entity_bripin","relation_type":"PART_OF","direction":"out","confidence":1}]}
+{"id":"uap-M-9","observed_paths":[]}
+{"id":"uap-M-10","observed_paths":[]}
+{"id":"uap-M-11","observed_paths":[{"from":"Orca","to":"Paseo","edge_id":"rel_entity_paseo_parallel_with_entity_orca","relation_type":"PARALLEL_WITH","direction":"in","confidence":1}]}
+{"id":"uap-M-12","observed_paths":[{"from":"Muslim_Gye_App","to":"BRIPIN","edge_id":"rel_entity_muslim_gye_app_part_of_entity_bripin","relation_type":"PART_OF","direction":"out","confidence":1}]}
+{"id":"uap-M-13","observed_paths":[]}
+{"id":"uap-M-14","observed_paths":[{"from":"INHART","to":"IIUM","edge_id":"rel_entity_inhart_part_of_entity_iium","relation_type":"PART_OF","direction":"out","confidence":1}]}
+{"id":"uap-M-15","observed_paths":[]}
+{"id":"uap-M-16","observed_paths":[{"from":"HAI Korea","to":"INHART","edge_id":"rel_entity_hai_korea_partner_with_entity_inhart","relation_type":"PARTNER_WITH","direction":"out","confidence":1}]}
+{"id":"uap-M-17","observed_paths":[]}
+{"id":"uap-M-18","observed_paths":[]}
+{"id":"uap-M-19","observed_paths":[]}
+{"id":"uap-M-20","observed_paths":[]}
+{"id":"uap-M-21","observed_paths":[]}
+{"id":"uap-M-22","observed_paths":[{"from":"Halal Office","to":"Motaded","edge_id":"rel_entity_halal_office_parallel_with_entity_motaded","relation_type":"PARALLEL_WITH","direction":"out","confidence":1}]}
+{"id":"uap-M-23","observed_paths":[]}
+{"id":"uap-M-24","observed_paths":[]}
+{"id":"uap-M-25","observed_paths":[]}
+{"id":"uap-M-26","observed_paths":[]}
+{"id":"uap-M-27","observed_paths":[]}
+{"id":"uap-M-28","observed_paths":[]}
+{"id":"uap-M-29","observed_paths":[]}
+{"id":"uap-M-30","observed_paths":[]}
