@@ -311,8 +311,8 @@ const hybridSearchCapability: ToolCapabilityInfo = {
       },
       useGraph: {
         type: 'boolean',
-        description: 'Whether to enhance results with knowledge graph connections',
-        default: true
+        description: 'Opt-in legacy/experimental graph re-ranker (default false since v5.3.0 — measured to hurt known-item retrieval). It only re-orders the vector/FTS candidate pool; for relationship exploration use openNodes -> getNeighbors instead',
+        default: false
       }
     },
     required: ['query'],
@@ -320,14 +320,16 @@ const hybridSearchCapability: ToolCapabilityInfo = {
 };
 
 const hybridSearchDescription: ToolRegistrationDescription = () => `<description>
-Perform sophisticated hybrid search that combines vector similarity with knowledge graph traversal for superior results.
-**The most powerful search tool in the system** - leverages both semantic similarity and structural relationships.
-Perfect for complex queries that benefit from both content matching and conceptual connections.
+Hybrid document search: vector similarity + FTS5 BM25 over document chunks, with an **opt-in** knowledge-graph re-ranker.
+Default (useGraph false) is the harm-reduced default for finding a fact you know exists (known-item retrieval).
+useGraph: true is a legacy/experimental re-ranker kept for backward compatibility and controlled evaluation — it does not
+add candidates, it only re-orders the vector/FTS pool, and measured on three real corpora (2026-08-17) it pushed the exact
+chunk out of the top-5 in ~40% of known-item queries. For relationship exploration use openNodes -> getNeighbors.
 </description>
 
 <importantNotes>
-- (!important!) **Hybrid approach is more powerful** than pure vector or graph search alone
-- (!important!) Graph enhancement finds related concepts even if not directly mentioned
+- (!important!) **Graph re-ranking is opt-in (default false since v5.3.0)** — it re-orders candidates by matched/connected entity links, which is measured to hurt known-item retrieval; enable it only for backward compatibility or controlled evaluation
+- (!important!) Graph re-ranking does not generate candidates — for "what is connected to X" use openNodes -> getNeighbors
 - (!important!) Results include similarity scores, graph boost, and hybrid rankings
 - (!important!) **Best results when knowledge graph is well-populated** with entities and relationships
 </importantNotes>
@@ -352,7 +354,7 @@ Perfect for complex queries that benefit from both content matching and conceptu
 
 <bestPractices>
 - Use natural language queries rather than keywords
-- Enable graph enhancement for better conceptual coverage
+- Keep graph re-ranking off for "find the fact I know exists"; for "what is connected to this" use openNodes -> getNeighbors, not useGraph
 - Start with broader queries, then narrow down based on results
 - Review entity associations to understand why results were selected
 - Use appropriate limits based on your analysis needs
@@ -362,20 +364,19 @@ Perfect for complex queries that benefit from both content matching and conceptu
 <parameters>
 - query: Natural language search query (string, required)
 - limit: Maximum results to return, default 5 (number, optional)
-- useGraph: Enable knowledge graph enhancement, default true (boolean, optional)
+- useGraph: Enable knowledge graph re-ranking, default false / opt-in (boolean, optional)
 </parameters>
 
 <examples>
-- Conceptual search: {"query": "machine learning applications in healthcare", "limit": 10}
-- Technical research: {"query": "React performance optimization techniques", "useGraph": true}
-- Discovery mode: {"query": "Einstein's contributions to modern physics", "limit": 15}
-- Quick lookup: {"query": "quantum computing advantages", "limit": 3, "useGraph": false}
+- Known-item lookup (default, graph off): {"query": "machine learning applications in healthcare", "limit": 10}
+- Legacy re-ranker (opt-in, evaluation/back-compat only): {"query": "React performance optimization techniques", "useGraph": true}
+- Discovery / relationship exploration: use openNodes then getNeighbors on the entity, not this tool's useGraph
 </examples>`;
 
 const hybridSearchSchema: z.ZodRawShape = {
   query: z.string().describe('The search query to find relevant information'),
   limit: z.number().optional().default(5).describe('Maximum number of results to return'),
-  useGraph: z.boolean().optional().default(true).describe('Whether to enhance results with knowledge graph connections'),
+  useGraph: z.boolean().optional().default(false).describe('Opt-in legacy/experimental graph re-ranker (default false since v5.3.0; measured to hurt known-item retrieval; for exploration use openNodes -> getNeighbors)'),
 };
 
 export const hybridSearchTool: ToolDefinition = {

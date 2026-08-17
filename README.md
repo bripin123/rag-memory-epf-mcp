@@ -10,9 +10,9 @@ A **project-local RAG memory** MCP server — knowledge graph + multilingual vec
 ## Key Features
 
 - **Project-local isolation** — each project gets its own `.memory/rag-memory.db`. Multiple projects run simultaneously without interference.
-- **3-signal hybrid search** — vector similarity (bge-m3, 1024-dim) + FTS5 BM25 keyword matching + knowledge graph re-ranking, combined via Reciprocal Rank Fusion
+- **Hybrid search** — vector similarity (bge-m3, 1024-dim) + FTS5 BM25 keyword matching (RRF-fused). Knowledge-graph re-ranking is an **opt-in legacy/experimental** signal since v5.3.0 (measured to hurt known-item retrieval)
 - **100+ languages** — Korean, Chinese, Japanese, Arabic, and more. Cross-lingual search works out of the box.
-- **Graph-aware scoring** — per-entity geometric decay (0.5^i) with hard cap prevents any single document from dominating results
+- **Graph re-ranker (opt-in)** — per-entity geometric decay (0.5^i) with a hard cap 0.4; the cap bounds the boost but was measured (2026-08-17) to let heavily-linked chunks saturate it and outrank the exact chunk — hence off by default
 - **38 MCP tools** — knowledge graph CRUD, observation lifecycle (correct / retract / history), document pipeline, hybrid search, multi-hop traversal, graph analytics (centrality / community detection / structure), export/import, temporal queries
 - **Observations that hold their history** — corrections supersede instead of overwrite, search returns only current facts, and every revision keeps its provenance
 - **Structure-anchored chunking (c1, v5)** — boundaries anchor to markdown structure (fence-aware, H1–H4 first, block-greedy, exact-token fallback), so editing the top of a file no longer re-embeds the whole document: unchanged text reuses its stored vectors at sync time. Chunk offsets are Unicode codepoints, language-neutral across SQL `substr`, Python slicing, and JS `[...str]` iteration; a publish-time invariant gate locks the gap-free partition. `overlap` is retired (omit or 0).
@@ -77,7 +77,7 @@ Place this `.mcp.json` in each project folder with its own `DB_FILE_PATH`. Each 
 ### Search & Retrieval (9)
 | Tool | Description | Annotation |
 |------|------------|------------|
-| `hybridSearch` | Vector + FTS5 BM25 + graph traversal (3-signal). Degrades to FTS5-only (`search_mode`) when the embedding model is down | readOnly |
+| `hybridSearch` | Vector + FTS5 BM25, plus an **opt-in** graph re-ranker (`useGraph: true`; default off since v5.3.0). Degrades to FTS5-only (`search_mode`) when the embedding model is down | readOnly |
 | `searchNodes` | Semantic entity search with `since`/`until` temporal filtering | readOnly |
 | `openNodes` | Retrieve specific entities by name | readOnly |
 | `readGraph` | Get complete knowledge graph | readOnly |
@@ -152,6 +152,10 @@ storeDocument(id, content, metadata)
 | `RAG_MEMORY_TRUST_LEGACY_VECTORS` | unset | Set `1` to grandfather pre-existing vectors under a **custom** `EMBEDDING_MODEL` (default model configs grandfather automatically) |
 
 ## Changelog
+
+### v5.3.0-rc.1
+- **Behavior change — `hybridSearch` graph re-ranking is now opt-in** (`useGraph` default `true` → `false`; tool schema, MCP exposure and the manager signature agree). Omitting the argument now means "no graph re-ranking" — a behavior change for callers that relied on the old default, hence a release-candidate first (`next` dist-tag, fleet canary) before stable. Measured 2026-08-17 on three real corpora (self-retrieval, usable samples 120/117/120, summaries off): with the additive graph boost on, the known-item chunk got worse in 46/49/52 samples and better in 3/2/0 (sign test p < 7e-11 per corpus), 106 targets left the top-10 entirely; reproduced on the summaries-on product path (HAL, 20 paired samples: hit@1 10→7, hit@5 18→13). Mechanism: only query-matched/connected entities score, but the per-entity boost saturates the cap quickly, so heavily-linked chunks can outrank the exact chunk even at `vector_similarity` 0. This is a harm-reduced default, not a validated graph improvement: the boost path is unchanged for `useGraph: true` (legacy/experimental re-ranker for back-compat and evaluation; the graph does not generate candidates — for relationship exploration use `openNodes` → `getNeighbors`). Regression lock: `test/search-graph-default.test.mjs`.
+- (v5.0.0–v5.2.0 notes live in the git tags / `docs/UPDATING.md`.)
 
 ### v4.0.0
 
