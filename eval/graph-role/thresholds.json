@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "MCID_candidate_recall30_doc": 0.05,
+  "MCID_rerank_ndcg10": 0.05,
+  "MCID_semantics_vs_shuffle_null": 0.03,
+  "p_null_max": 0.05,
+  "K_noninferiority_delta_hit5": 0.02,
+  "latency_slo_ms": { "warm_p95_max": 1000, "record_cold_p95": true },
+  "upstream_gate": { "seed_recall_min": 0.70, "link_precision_name_min": 0.60, "edge_validity_min": 0.80 },
+  "kappa_gate_weighted": 0.67,
+  "human_audit": { "pairs_per_corpus": 50, "max_disagreement_rate": 0.20 },
+  "judging_budget_per_corpus": 8000,
+  "bootstrap": { "iters": 10000, "seed": 20260817 },
+  "power": { "target": 0.8, "alpha": 0.05 },
+  "budgets_K": [10, 30, 100],
+  "controls": { "shuffled_replicates": 20, "typeshuf_replicates": 5, "swap_passes_per_edge": 20, "n2_fanout_cap": 50 },
+  "rationale": "MCID_rerank raised from +0.02 (needs ~784 queries per r4) to a product-meaningful +0.05; all values are pre-registered, not validated; may only change before holdout is opened (log in FREEZE.md)."
+}
