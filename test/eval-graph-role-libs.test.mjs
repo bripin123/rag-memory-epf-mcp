@@ -56,4 +56,17 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   assert.equal(er.length, edges.length, 'ER keeps |E|');
   console.log('  OK: controls — degree-preserving swap (node-level), type-preserving, ER');
 }
+// stages: graph chunk ranking (pure) + chunk/document budgets — no DB, no model
+{
+  const { rankGraphChunks, applyBudgets } = await import('../eval/graph-role/lib/stages.mjs');
+  // rankGraphChunks: chunk score = sum over distinct matched entities of entity score; tie -> chunk_id asc
+  const linked = [ { chunk_id: 'c2', entity_id: 'B' }, { chunk_id: 'c1', entity_id: 'A' }, { chunk_id: 'c1', entity_id: 'B' }, { chunk_id: 'c1', entity_id: 'B' } ];
+  const ranked = rankGraphChunks(linked, new Map([['A', 0.6], ['B', 0.3]]));
+  assert.deepEqual(ranked.map(r => r.chunk_id), ['c1', 'c2']); assert.ok(Math.abs(ranked[0].score - 0.9) < 1e-9, 'B counted once for c1');
+  const tie = rankGraphChunks([{ chunk_id: 'z', entity_id: 'A' }, { chunk_id: 'y', entity_id: 'A' }], new Map([['A', 1]]));
+  assert.deepEqual(tie.map(r => r.chunk_id), ['y', 'z'], 'tie-break chunk_id asc');
+  const b = applyBudgets(['d1_c1', 'd1_c2', 'd2_c1', 'd3_c1'], [2, 3], id => id.split('_')[0]);
+  assert.deepEqual(b.chunk[2], ['d1_c1', 'd1_c2']); assert.deepEqual(b.doc[2].map(x => x.id ?? x), ['d1_c1', 'd2_c1']);
+  console.log('  OK: stages — graph chunk ranking (dedup, tie-break) and chunk/doc budgets');
+}
 console.log('eval-graph-role-libs: ALL OK');
