@@ -108,7 +108,7 @@ path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
 is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
 the next start becomes a clean download owner.
 
-## v5.3.0-rc.1 (schema v14, unchanged): `hybridSearch` graph re-ranking is opt-in
+## v5.3.0 (schema v14, unchanged): `hybridSearch` graph re-ranking is opt-in
 
 **What changed.** `useGraph` defaults to `false` (was `true`) — in the manager signature, the tool JSON
 schema, the zod schema (`validateToolArgs` fills `false`) and the MCP dispatch (`=== true`). Nothing else
@@ -124,9 +124,11 @@ a validated graph improvement — the graph's role (candidate generation vs. re-
 still open and will be decided on a graph-required query suite. Note that `useGraph: true` does not add
 candidates (it re-orders the vector/FTS pool): for relationship exploration use `openNodes` → `getNeighbors`.
 
-**Fleet rollout.** No migration, no schema change. Published first as a release candidate on the `next`
-dist-tag (omitting an argument changes behavior, so it gets a canary before `latest`): pin one project to
-`rag-memory-epf-mcp@next`, run its normal /start and /sync searches, then promote to stable. A caller that
+**Fleet rollout.** No migration, no schema change. Published first as `5.3.0-rc.1` on the `next`
+dist-tag (omitting an argument changes behavior, so it got a canary before `latest`): the published rc was
+installed fresh and run against a real project database — default call had no `graph_boost` and matched
+explicit `useGraph:false`, the known-item probe returned the right chunk at rank 1, opt-in `true` kept
+`graph_boost`, schema/MCP defaults read `false` — then `5.3.0` was published to `latest`. A caller that
 relied on graph re-ranking by default must now pass `useGraph: true`. Callers that already choose per query
 see no change. Regression lock: `test/search-graph-default.test.mjs`.
 

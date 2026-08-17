@@ -153,7 +153,8 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
-### v5.3.0-rc.1
+### v5.3.0
+- (Published first as `5.3.0-rc.1` on the `next` dist-tag; promoted to `latest` after a canary run of the published artifact against a real project database: default call carries no `graph_boost` and equals explicit `useGraph:false`, the known-item probe from the 2026-08-17 measurement returns the correct gotcha at rank 1, opt-in `true` still exposes `graph_boost`, schema/MCP defaults read `false`.)
 - **Behavior change — `hybridSearch` graph re-ranking is now opt-in** (`useGraph` default `true` → `false`; tool schema, MCP exposure and the manager signature agree). Omitting the argument now means "no graph re-ranking" — a behavior change for callers that relied on the old default, hence a release-candidate first (`next` dist-tag, fleet canary) before stable. Measured 2026-08-17 on three real corpora (self-retrieval, usable samples 120/117/120, summaries off): with the additive graph boost on, the known-item chunk got worse in 46/49/52 samples and better in 3/2/0 (sign test p < 7e-11 per corpus), 106 targets left the top-10 entirely; reproduced on the summaries-on product path (HAL, 20 paired samples: hit@1 10→7, hit@5 18→13). Mechanism: only query-matched/connected entities score, but the per-entity boost saturates the cap quickly, so heavily-linked chunks can outrank the exact chunk even at `vector_similarity` 0. This is a harm-reduced default, not a validated graph improvement: the boost path is unchanged for `useGraph: true` (legacy/experimental re-ranker for back-compat and evaluation; the graph does not generate candidates — for relationship exploration use `openNodes` → `getNeighbors`). Regression lock: `test/search-graph-default.test.mjs`.
 - (v5.0.0–v5.2.0 notes live in the git tags / `docs/UPDATING.md`.)
 
