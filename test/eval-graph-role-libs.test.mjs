@@ -39,4 +39,21 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   assert.equal(LIVE_PATHS.size, 3);
   console.log('  OK: readFreeze parses table; 3 live paths registered');
 }
+// controls: node-level (in,out) degree preserved exactly; no self-loops; no duplicates; type-preserving keeps per-type degrees
+{
+  const { degreePreservingSwap, degreeSignature, sameSignature, erdosRenyi } = await import('../eval/graph-role/lib/controls.mjs');
+  const mk = (i, s, t, ty) => ({ id: `e${i}`, source: s, target: t, type: ty, confidence: 1, metadata: '{}', created_at: 'x' });
+  const edges = [mk(1,'a','b','R'), mk(2,'a','c','R'), mk(3,'b','c','S'), mk(4,'c','d','S'), mk(5,'d','a','R'), mk(6,'b','d','R'), mk(7,'e','a','S'), mk(8,'e','b','R')];
+  const { edges: sh, swaps } = degreePreservingSwap(edges, { seed: 1, passes: 20 });
+  assert.ok(sameSignature(degreeSignature(edges), degreeSignature(sh)), 'node-level (in,out) must be identical');
+  assert.ok(sh.every(e => e.source !== e.target), 'no self-loops');
+  assert.equal(new Set(sh.map(e => `${e.source}>${e.target}`)).size, sh.length, 'no duplicate directed edges');
+  assert.ok(swaps > 0 && JSON.stringify(sh) !== JSON.stringify(edges), 'graph actually changed');
+  const { edges: ts } = degreePreservingSwap(edges, { seed: 2, passes: 20, typePreserving: true });
+  const byType = (es) => { const m = new Map(); for (const e of es) { const k = e.type; const sig = m.get(k) || new Map(); const s = sig.get(e.source) || [0,0]; s[1]++; sig.set(e.source, s); const t = sig.get(e.target) || [0,0]; t[0]++; sig.set(e.target, t); m.set(k, sig); } return m; };
+  for (const [ty, sig] of byType(edges)) assert.ok(sameSignature(sig, byType(ts).get(ty)), `per-type degrees kept for ${ty}`);
+  const er = erdosRenyi(edges, ['a','b','c','d','e'], 3);
+  assert.equal(er.length, edges.length, 'ER keeps |E|');
+  console.log('  OK: controls — degree-preserving swap (node-level), type-preserving, ER');
+}
 console.log('eval-graph-role-libs: ALL OK');
