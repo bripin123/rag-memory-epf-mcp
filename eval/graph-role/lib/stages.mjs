@@ -18,8 +18,20 @@ export async function channelsForQuery({ m, db, query, Ks = [10, 30, 100], n2cap
   const docOfStmt = db.prepare(`SELECT document_id FROM chunk_metadata WHERE chunk_id = ?`); const docCache = new Map();
   const docOf = (id) => { if (!docCache.has(id)) docCache.set(id, docOfStmt.get(id)?.document_id ?? id); return docCache.get(id); };
   const KMAX = Math.max(...Ks); const ms = {};
+  // Fix round 1: pre-warm the query embedding OUTSIDE every timed channel. The manager caches
+  // embeddings per process (index.ts embeddingCache, key = text_dims_isQuery), so whichever channel
+  // ran first paid for the embedding and the others read the cache — the channel ms were marginal
+  // costs wearing absolute clothes. Warm the raw query (graph-vec below reuses this exact vector)
+  // and every cross-lingual variant, because hybridSearch and the seam embed the normalized
+  // variants, not the raw string. Measured on hub dev: 113/113 queries yield one variant identical
+  // to the raw text, so the loop is normally a no-op; other corpora may differ.
+  let t = now();
+  const qEmb = await m.generateEmbedding(query, 1024, true);
+  const variants = typeof m.buildCrossLingualVariants === 'function' ? m.buildCrossLingualVariants(query) : [];
+  for (const v of variants) if (v !== query) await m.generateEmbedding(v, 1024, true);
+  const embed_ms = now() - t;
   // vector channel: product path with graph off at limit=KMAX (limit*3 pool -> top KMAX)
-  let t = now(); const off = await m.hybridSearch(query, KMAX, false); ms.vector = now() - t;
+  t = now(); const off = await m.hybridSearch(query, KMAX, false); ms.vector = now() - t;
   const vector = off.results.map(r => r.chunk_id);
   // fts channel: BM25 only (same expression builder as the product)
   t = now();
@@ -44,12 +56,12 @@ export async function channelsForQuery({ m, db, query, Ks = [10, 30, 100], n2cap
   // graph-vec: graph-n1 eligible set ordered by query-chunk vector similarity (upper bound, not semantics)
   t = now(); let gVec = [];
   if (gN1.length && seam.status === 'vector') {
-    const emb = await m.generateEmbedding(query, 1024, true);
+    const emb = qEmb;                                            // pre-warmed above, so this region times only the vector scan
     const rows = db.prepare(`SELECT cm.chunk_id, c.distance FROM chunks c JOIN chunk_metadata cm ON cm.rowid = c.rowid WHERE c.embedding MATCH ? AND k = ?`).all(Buffer.from(emb.buffer), Math.min(4096, Math.max(KMAX * 10, gN1.length)));
     const inSet = new Set(gN1); gVec = rows.filter(r => inSet.has(r.chunk_id)).sort((a, b) => a.distance - b.distance || (a.chunk_id < b.chunk_id ? -1 : 1)).map(r => r.chunk_id);
   } ms['graph-vec'] = now() - t;
   const rrf2 = rrf([vector, fts]).map(x => x.id), rrf3 = rrf([vector, fts, gN1]).map(x => x.id), rrf3n2 = rrf([vector, fts, gN1, gN2]).map(x => x.id);
   const chans = { vector, fts, 'graph-seed': gSeed, 'graph-n1': gN1, 'graph-n2': gN2, 'graph-vec': gVec, rrf2, rrf3, 'rrf3-n2': rrf3n2 };
   const channels = {}; for (const [name, ids] of Object.entries(chans)) channels[name] = { ...applyBudgets(ids, Ks, docOf), ms: ms[name] ?? null };
-  return { seam, seeds: seam.seeds, n_connected: seam.connected.length, n2_count: n2Score.size, channels, reach: { chunks: reachSet.size, docs: [...new Set([...reachSet].map(docOf))] }, docOf };
+  return { seam, seeds: seam.seeds, n_connected: seam.connected.length, n2_count: n2Score.size, embed_ms, seam_ms: ms.seam, channels, reach: { chunks: reachSet.size, docs: [...new Set([...reachSet].map(docOf))] }, docOf };
 }

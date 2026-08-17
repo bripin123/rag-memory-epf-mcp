@@ -19,7 +19,7 @@ await exitOnRefuse(async () => {
   for (const r of rows) {
     i++; const fb0 = fallbackHits();
     const c = await channelsForQuery({ m, db, query: r.text, Ks: th.budgets_K, n2cap: th.controls.n2_fanout_cap });
-    const rec = { id: r.id, class: r.class, split: r.split, cond, seam_status: c.seam.status, seeds: c.seeds.map(s => ({ name: s.name, sim: +s.similarity.toFixed(4) })), n_connected: c.n_connected, n2_count: c.n2_count,
+    const rec = { id: r.id, class: r.class, split: r.split, cond, seam_status: c.seam.status, seeds: c.seeds.map(s => ({ name: s.name, sim: +s.similarity.toFixed(4) })), n_connected: c.n_connected, n2_count: c.n2_count, embed_ms: c.embed_ms, seam_ms: c.seam_ms,
                   channels: Object.fromEntries(Object.entries(c.channels).map(([k, v]) => [k, { chunk10: v.chunk[10], chunk30: v.chunk[30], chunk100: v.chunk[100], doc10: v.doc[10], doc30: v.doc[30], doc100: v.doc[100], ms: v.ms }])),
                   reach: { chunks: c.reach.chunks, docs_n: c.reach.docs.length }, fallback: fallbackHits() - fb0, unfrozen: !frozen };
     appendFileSync(outPath, JSON.stringify(rec) + '\n');
