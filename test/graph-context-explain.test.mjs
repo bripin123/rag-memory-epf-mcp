@@ -1,7 +1,7 @@
 // explainGraphContext contract (evaluation seam) + differential parity with the pre-extraction golden.
 import { readFileSync, rmSync } from 'node:fs';
 import assert from 'node:assert/strict';
-import { buildFixture, runCases, QUERY } from './fixtures/graph-context/build.mjs';
+import { buildFixture, runCases, QUERY, NO_SEED_QUERY } from './fixtures/graph-context/build.mjs';
 
 const { m, dir } = await buildFixture();
 const golden = JSON.parse(readFileSync(new URL('./fixtures/graph-context-golden.json', import.meta.url), 'utf8'));
@@ -47,6 +47,45 @@ const golden = JSON.parse(readFileSync(new URL('./fixtures/graph-context-golden.
   const r = await m.hybridSearch(QUERY, 5);
   for (const x of r.results) assert.equal(x.graph_boost, undefined);
   console.log('  OK: default call has no graph_boost');
+}
+// (E) case c3 is a real zero-seed case: the query is orthogonal to every entity vector, so the
+// graph contributes nothing at all rather than saturating the cap (review finding I1)
+{
+  const g = await m.explainGraphContext(NO_SEED_QUERY);
+  assert.equal(g.status, 'vector', 'the vector path ran — this is not a disabled or fallback result');
+  assert.deepEqual(g.seeds, [], 'no entity clears the 0.4 threshold');
+  assert.deepEqual(g.connected, [], 'no seeds means nothing connected');
+  const r = await m.hybridSearch(NO_SEED_QUERY, 10, true);
+  for (const x of r.results) assert.equal(x.graph_boost, 0, 'zero seeds must leave graph_boost at 0');
+  console.log('  OK: zero-seed case (status vector, seeds none, connected none, graph_boost 0)');
+}
+// (F) the caller's latched chunk-vector decision wins over the live coordinator state, and
+// hybridSearch hands its own latched flag over (review finding I2)
+{
+  assert.equal(m.coordinator.eligible, true, 'precondition: the coordinator is eligible');
+  const forced = await m.explainGraphContext(QUERY, undefined, { chunkVectorDegraded: true });
+  assert.equal(forced.status, 'chunk-vector-disabled', 'the caller said degraded, so the seam stops');
+  assert.deepEqual(forced.seeds, []); assert.deepEqual(forced.connected, []);
+
+  // Other direction: the model is down but the caller latched "not degraded" before it went down.
+  // The seam must still attempt the entity-vector search and fall back on the throw — that is what
+  // the pre-extraction code did in this race, and it is why hybridSearch passes its own value.
+  const { simulateModelDown } = await import('./helpers/engine-test-db.mjs');
+  const savedFn = m.gate.embedFn, savedState = m.gate.state;
+  simulateModelDown(m);
+  assert.equal(m.coordinator.eligible, false, 'precondition: the coordinator is now ineligible');
+  const attempted = await m.explainGraphContext(QUERY, undefined, { chunkVectorDegraded: false });
+  m.gate.state = savedState; m.gate.embedFn = savedFn; m.embeddingCache = new Map();
+  assert.equal(attempted.status, 'entity-text-fallback', 'the caller overrode the live state, so the seam tried');
+
+  const seen = [];
+  const orig = m.explainGraphContext.bind(m);
+  m.explainGraphContext = async (...args) => { seen.push(args); return orig(...args); };
+  await m.hybridSearch(QUERY, 10, true);
+  delete m.explainGraphContext;
+  assert.equal(seen.length, 1, 'hybridSearch calls the seam exactly once');
+  assert.deepEqual(seen[0][2], { chunkVectorDegraded: false }, 'hybridSearch passes its latched vectorDegraded');
+  console.log('  OK: caller-latched chunkVectorDegraded wins, and hybridSearch passes its own');
 }
 m.cleanup(); rmSync(dir, { recursive: true, force: true });
 console.log('graph-context-explain: ALL OK');

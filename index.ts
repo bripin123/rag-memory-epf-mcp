@@ -3445,8 +3445,11 @@ export class RAGKnowledgeGraphManager {
    * 1-hop connected entities exactly as hybridSearch(useGraph:true) computes them, plus edge detail
    * that hybridSearch itself does not use (edge id, type, direction, confidence). It never generates
    * candidates and never changes ranking; hybridSearch consumes only the name sets.
+   * `opts.chunkVectorDegraded` lets a caller hand over a decision it has already made; omit it and
+   * the seam derives eligibility itself.
    */
-  async explainGraphContext(query: string, queryVariants?: string[]): Promise<{
+  async explainGraphContext(query: string, queryVariants?: string[],
+                            opts?: { chunkVectorDegraded?: boolean }): Promise<{
     status: 'vector' | 'entity-text-fallback' | 'chunk-vector-disabled' | 'error';
     query_variants: string[];
     seeds: Array<{ entity_id: string; name: string; similarity: number }>;
@@ -3456,7 +3459,13 @@ export class RAGKnowledgeGraphManager {
     if (!this.db) throw new Error('Database not initialized');
     const variants = queryVariants ?? this.buildCrossLingualVariants(query);
     const empty = { query_variants: variants, seeds: [] as any[], connected: [] as any[] };
-    if (!(this.coordinator?.eligible ?? false)) return { status: 'chunk-vector-disabled', ...empty };
+    // The caller's latched decision wins (review finding I2). hybridSearch decides chunk-vector
+    // degradation once, before the chunk-embedding awaits, and passes that value down; re-deriving
+    // it here would let an eligibility flip during those awaits give the seam a different answer
+    // than the ranking path already acted on — the pre-extraction code read it once, so this keeps
+    // behaviour identical. A standalone caller passes nothing and gets the live derivation.
+    const chunkVectorDegraded = opts?.chunkVectorDegraded ?? !(this.coordinator?.eligible ?? false);
+    if (chunkVectorDegraded) return { status: 'chunk-vector-disabled', ...empty };
     try {
       const searchEntities = (embedding: Float32Array) => this.db!.prepare(`
             SELECT em.entity_id, e.name, ee.distance
@@ -3740,7 +3749,7 @@ export class RAGKnowledgeGraphManager {
     let connectedEntities = new Set<string>();
     let queryMatchedEntities = new Set<string>();
     if (useGraph && !vectorDegraded) {
-      const ctx = await this.explainGraphContext(query, queryVariants);
+      const ctx = await this.explainGraphContext(query, queryVariants, { chunkVectorDegraded: vectorDegraded });
       for (const s of ctx.seeds) queryMatchedEntities.add(s.name);
       for (const c of ctx.connected) connectedEntities.add(c.name);
     }
