@@ -23,7 +23,7 @@ export function validateSuite(rows) {
     if (!r.id || ids.has(r.id)) errs.push(`${at}: missing/duplicate id`); ids.add(r.id);
     if (!CLASSES.has(r.class)) errs.push(`${at}: class`); if (!SPLITS.has(r.split)) errs.push(`${at}: split`);
     if (!r.family) errs.push(`${at}: family`); if (typeof r.text !== 'string' || r.text.length < 8) errs.push(`${at}: text`);
-    if (famSplit.has(r.family) && famSplit.get(r.family) !== r.split) errs.push(`${at}: family ${r.family} spans splits`); famSplit.set(r.family, r.split);
+    if (famSplit.has(r.family)) { if (famSplit.get(r.family) !== r.split) errs.push(`${at}: family ${r.family} spans splits`); } else { famSplit.set(r.family, r.split); }
     if (r.class === 'K') { if (!r.oracle_chunk_id || !r.document_id) errs.push(`${at}: K needs oracle_chunk_id+document_id`); if (kDocs.has(r.document_id)) errs.push(`${at}: document ${r.document_id} used twice in K`); kDocs.set(r.document_id, r.id); }
     else {
       if (!Array.isArray(r.expected_entities) || r.expected_entities.length === 0) errs.push(`${at}: expected_entities`);
