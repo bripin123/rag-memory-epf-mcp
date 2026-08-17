@@ -23,7 +23,7 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   const ok = [{ id: 'k1', class: 'K', split: 'dev', family: 'doc1', text: 'known item query text', oracle_chunk_id: 'c1', document_id: 'doc1' },
               { id: 'a1', class: 'A', split: 'dev', family: 'fam1', text: 'what relates to X', expected_entities: ['X'], seed_candidates: ['X'], source_docs: ['d'], author_mode: 'source-grounded', expected_paths: [] }];
   assert.deepEqual(validateSuite(ok), []);
-  const bad = ok.concat([{ id: 'k2', class: 'K', split: 'holdout', family: 'doc1', text: 'another', oracle_chunk_id: 'c2', document_id: 'doc1' }]);
+  const bad = ok.concat([{ id: 'k2', class: 'K', split: 'holdout', family: 'doc1', text: 'another query', oracle_chunk_id: 'c2', document_id: 'doc1' }]);
   const errs = validateSuite(bad);
   assert.ok(errs.some(e => /spans splits/.test(e)) && errs.some(e => /used twice/.test(e)));
   console.log('  OK: validateSuite catches leakage/family');
