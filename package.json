@@ -1,6 +1,6 @@
 {
   "name": "rag-memory-epf-mcp",
-  "version": "5.2.0",
+  "version": "5.3.0-rc.1",
   "engines": {
     "node": ">=24"
   },
@@ -45,7 +45,7 @@
     "prepare": "npm run build",
     "watch": "tsc --watch",
     "verify:invariants": "node test/chunk-invariants.test.mjs",
-    "verify:engine": "node test/engine-smoke.test.mjs && node test/launch-smoke.test.mjs && node test/sync-atomicity.test.mjs && node test/dedup.test.mjs && node test/search-degradation.test.mjs && node test/entity-embed-cap.test.mjs && node test/migration12.test.mjs && node test/model-cache.test.mjs && node test/embedding-gate.test.mjs && node test/lazy-boot.test.mjs && node test/reconciliation.test.mjs && node test/backfill.test.mjs && node test/fts-query.test.mjs && node test/search-contracts.test.mjs && node test/tool-contracts.test.mjs && node test/bounded-exit.test.mjs && node test/observation-schema.test.mjs && node test/observation-migration.test.mjs && node test/observation-lifecycle.test.mjs && node test/observation-contracts.test.mjs && node test/observation-search.test.mjs && node test/observation-cascade.test.mjs && node test/observation-realdata.test.mjs && node test/chunker-c.test.mjs && node test/migration14.test.mjs && node test/chunk-params-validation.test.mjs && node test/vector-reuse.test.mjs && node test/entity-range-linking.test.mjs && node test/stats-chunking.test.mjs && node test/migration14-realdata.test.mjs && node test/migration14-realdata-sync.test.mjs && node test/search-summaries-off.test.mjs && node test/document-return-contracts.test.mjs && node test/observation-date-prefix.test.mjs && node test/delete-entities-cascade.test.mjs",
+    "verify:engine": "node test/engine-smoke.test.mjs && node test/launch-smoke.test.mjs && node test/sync-atomicity.test.mjs && node test/dedup.test.mjs && node test/search-degradation.test.mjs && node test/entity-embed-cap.test.mjs && node test/migration12.test.mjs && node test/model-cache.test.mjs && node test/embedding-gate.test.mjs && node test/lazy-boot.test.mjs && node test/reconciliation.test.mjs && node test/backfill.test.mjs && node test/fts-query.test.mjs && node test/search-contracts.test.mjs && node test/tool-contracts.test.mjs && node test/bounded-exit.test.mjs && node test/observation-schema.test.mjs && node test/search-graph-default.test.mjs && node test/observation-migration.test.mjs && node test/observation-lifecycle.test.mjs && node test/observation-contracts.test.mjs && node test/observation-search.test.mjs && node test/observation-cascade.test.mjs && node test/observation-realdata.test.mjs && node test/chunker-c.test.mjs && node test/migration14.test.mjs && node test/chunk-params-validation.test.mjs && node test/vector-reuse.test.mjs && node test/entity-range-linking.test.mjs && node test/stats-chunking.test.mjs && node test/migration14-realdata.test.mjs && node test/migration14-realdata-sync.test.mjs && node test/search-summaries-off.test.mjs && node test/document-return-contracts.test.mjs && node test/observation-date-prefix.test.mjs && node test/delete-entities-cascade.test.mjs",
     "test": "npm run build && npm run verify:invariants && npm run verify:engine",
     "prepublishOnly": "npm run build && npm run verify:invariants && npm run verify:engine"
   },

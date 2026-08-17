@@ -3439,7 +3439,19 @@ export class RAGKnowledgeGraphManager {
     return { imported, skipped, observation_order_remap: remapReport };
   }
 
-  async hybridSearch(query: string, limit = 5, useGraph = true): Promise<{
+  // v5.3.0: the graph re-ranker is OPT-IN (harm-reduced default, not a validated improvement).
+  // Measured 2026-08-17 on three real corpora (self-retrieval, usable samples 120/117/120,
+  // summaries off): with the additive graph boost on, the known-item chunk got WORSE in
+  // 46/49/52 samples and BETTER in 3/2/0 (sign test p < 7e-11 per corpus); 106 targets left the
+  // top-10 entirely. Reproduced on the summaries-on product path (HAL, 20 paired samples:
+  // hit@1 10 -> 7, hit@5 18 -> 13, worse 8 / better 3). Mechanism: only query-matched or
+  // connected entities score, but the per-entity boost (0.5^i decay, cap 0.4) saturates fast, so
+  // heavily-linked chunks get more chances to match and reach the cap — they can outrank the
+  // exact chunk even at vector_similarity 0. Note the graph does not generate candidates: it only
+  // re-orders the vector/FTS candidate pool, so useGraph:true is a legacy/experimental re-ranker
+  // (backward compatibility, controlled evaluation), not a relationship-exploration path — that
+  // contract is openNodes -> getNeighbors. The boost path itself is unchanged.
+  async hybridSearch(query: string, limit = 5, useGraph = false): Promise<{
     results: EnhancedSearchResult[];
     search_mode: 'hybrid' | 'hybrid-partial' | 'fts-only';
     model_state: string;
@@ -4508,7 +4520,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.linkEntitiesToDocument((validatedArgs as any).documentId as string, (validatedArgs as any).entityNames as string[]), null, 2) }] };
       case "hybridSearch":
         const limit = typeof (validatedArgs as any).limit === 'number' ? (validatedArgs as any).limit : 5;
-        const useGraph = (validatedArgs as any).useGraph !== false;
+        // v5.3.0: graph is opt-in — only an explicit true enables the re-ranker (schema default false).
+        const useGraph = (validatedArgs as any).useGraph === true;
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.hybridSearch((validatedArgs as any).query as string, limit, useGraph), null, 2) }] };
       case "getDetailedContext":
         return { content: [{ type: "text", text: JSON.stringify(await ragKgManager.getDetailedContext((validatedArgs as any).chunkId as string, (validatedArgs as any).includeSurrounding !== false), null, 2) }] };

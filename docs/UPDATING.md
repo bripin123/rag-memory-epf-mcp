@@ -108,6 +108,28 @@ path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
 is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
 the next start becomes a clean download owner.
 
+## v5.3.0-rc.1 (schema v14, unchanged): `hybridSearch` graph re-ranking is opt-in
+
+**What changed.** `useGraph` defaults to `false` (was `true`) — in the manager signature, the tool JSON
+schema, the zod schema (`validateToolArgs` fills `false`) and the MCP dispatch (`=== true`). Nothing else
+in the scoring path moved: `useGraph: true` runs exactly the pre-5.3 graph boost.
+
+**Why.** Measured 2026-08-17 on three real corpora (self-retrieval, usable samples 120/117/120, summaries
+off): with the additive graph boost on, the known-item chunk got WORSE in 46/49/52 samples and BETTER in
+3/2/0 (paired sign test p < 7e-11 per corpus); 106 targets fell out of the top-10 entirely. Reproduced on
+the summaries-on product path (HAL, 20 paired samples: hit@1 10→7, hit@5 18→13). Only query-matched or
+connected entities score, but the per-entity boost (0.5^i decay, cap 0.4) saturates fast, so heavily-linked
+chunks can outrank the exact chunk even at `vector_similarity` 0. This is a reversible harm mitigation, not
+a validated graph improvement — the graph's role (candidate generation vs. re-ranking, explicit mode) is
+still open and will be decided on a graph-required query suite. Note that `useGraph: true` does not add
+candidates (it re-orders the vector/FTS pool): for relationship exploration use `openNodes` → `getNeighbors`.
+
+**Fleet rollout.** No migration, no schema change. Published first as a release candidate on the `next`
+dist-tag (omitting an argument changes behavior, so it gets a canary before `latest`): pin one project to
+`rag-memory-epf-mcp@next`, run its normal /start and /sync searches, then promote to stable. A caller that
+relied on graph re-ranking by default must now pass `useGraph: true`. Callers that already choose per query
+see no change. Regression lock: `test/search-graph-default.test.mjs`.
+
 ## v5.1.0 (schema v14, unchanged): destructive-replace reporting + `excludePattern`
 
 **What changes on upgrade**: nothing you have to do. No migration, no schema
