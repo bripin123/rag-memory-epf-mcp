@@ -36,3 +36,13 @@ export function validateSuite(rows) {
   });
   return errs;
 }
+if (import.meta.url === `file://${process.argv[1]}` && process.argv.includes('--validate')) {
+  const { readFileSync, existsSync, readdirSync } = await import('node:fs');
+  const dir = join(EVAL_DIR, 'suite'); let bad = 0;
+  for (const f of readdirSync(dir).filter(f => /^queries\.\w+\.jsonl$/.test(f))) {
+    const rows = readFileSync(join(dir, f), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
+    const errs = validateSuite(rows); console.log(`${f}: rows ${rows.length} errors ${errs.length}`); errs.forEach(e => console.log('  ' + e)); bad += errs.length;
+  }
+  if (existsSync(join(EVAL_DIR, 'out')) && readdirSync(join(EVAL_DIR, 'out')).length) { console.log('OUT_NOT_EMPTY: runners ran before freeze'); bad++; }
+  process.exit(bad ? 5 : 0);
+}
