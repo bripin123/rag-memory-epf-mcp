@@ -2,10 +2,10 @@
 
 | file | sha256 | frozen_at | commit |
 |---|---|---|---|
-| `queries.hub.jsonl` | `130e4162664d4458662df765485ff030b244bc3df05248e541d1b8e834ad0b0c` | 2026-08-17 21:50:33 UTC | (fill after commit) |
-| `queries.uap.jsonl` | `d324401ab2c1c6cf7dc8fce5f2dc831b56f4710dd7e3f69c201e626998fae608` | 2026-08-17 21:50:33 UTC | (fill after commit) |
-| `queries.hal.jsonl` | `35ddaec9e75e7e8ec62c570f43f7312d420710b81144c5bbb1a2ac31190c294d` | 2026-08-17 21:50:33 UTC | (fill after commit) |
-| `../thresholds.json` | `bdf93c3ac546014685d8a8d387202bbb20172730c43193f2860d5d49201bde09` | 2026-08-17 21:50:33 UTC | (fill after commit) |
+| `queries.hub.jsonl` | 130e4162664d4458662df765485ff030b244bc3df05248e541d1b8e834ad0b0c | 2026-08-17 21:50:33 UTC | `343fa57` |
+| `queries.uap.jsonl` | d324401ab2c1c6cf7dc8fce5f2dc831b56f4710dd7e3f69c201e626998fae608 | 2026-08-17 21:50:33 UTC | `343fa57` |
+| `queries.hal.jsonl` | 35ddaec9e75e7e8ec62c570f43f7312d420710b81144c5bbb1a2ac31190c294d | 2026-08-17 21:50:33 UTC | `343fa57` |
+| `../thresholds.json` | bdf93c3ac546014685d8a8d387202bbb20172730c43193f2860d5d49201bde09 | 2026-08-17 21:50:33 UTC | `343fa57` |
 
 ## Notes — Stage 1 pilot suite (known limitations recorded before freeze)
 
