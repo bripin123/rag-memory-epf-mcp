@@ -20,7 +20,7 @@ Once the driver's `END` line has landed in `out/run-all.log`, the controller run
    `node eval/graph-role/run-purevec.mjs --corpus uap`
    `node eval/graph-role/run-purevec.mjs --corpus hal`
    (one at a time; real copy only — the channel is graph-independent, so there is no `--cond`.)
-4. `node eval/graph-role/make-manifest.mjs --gzip --reruns <path-to-the-JSON-array-from-step-2>`
+4. `node eval/graph-role/make-manifest.mjs --gzip` — add `--reruns <path-to-the-JSON-array-from-step-2>` only if step 2 actually ran (no outliers in step 1 means no reruns file to pass; `--reruns` defaults to an empty array).
    Writes `out/MANIFEST.json` (file · rows · bytes · sha256 for every raw file, plus the `reruns` record). `--gzip` first writes `<name>.gz` for every `final.*.jsonl` and `purevec.*.jsonl` (candidates are skipped) via a deterministic gzip — the header's MTIME/OS bytes are zeroed so the archive is byte-stable across machines and times — then the manifest lists those `.gz` files too. Exit 0 when 165/165 raw files are present, the driver log has an `END` line, and no driver step exited nonzero; otherwise exit 14 (`MANIFEST_INCOMPLETE`), unless `--allow-incomplete` (then exit 0 with `complete: false` left in the file).
 5. `git add eval/graph-role/out/MANIFEST.json eval/graph-role/out/*.jsonl.gz` and commit.
    Raw `out/*.jsonl` and `out/log.*.txt` stay git-ignored (candidates ≈ 7.8 MB/file × 81 files) — R12 amendment: they're re-derivable from the frozen suites + snapshot provenance + these deterministic runners, and `MANIFEST.json`'s per-file sha256 is what makes that re-derivation checkable.
