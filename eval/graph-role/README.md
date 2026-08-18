@@ -2,7 +2,7 @@
 
 Runs ONLY on `.backup` copies (`dbs/`, gitignored). Summaries are forced off. One measuring process at a time.
 Order: snapshot → suite freeze → controls → run-candidates/run-final (all conditions) → pool → judging → qrel freeze → upstream → report → power.
-Exit codes: 3 FROZEN_MISMATCH · 4 REFUSE_LIVE_DB · 5 SUITE_INVALID · 6 CONTROL_DEGREE_MISMATCH · 7 POOL_INCOMPLETE · 8 KAPPA_BELOW_GATE · 9 MODEL_NOT_READY · 10 SOURCE_MTIME_CHANGED · 11 JUDGE_INCOMPLETE · 12 ADJUDICATION_PENDING · 13 OUTLIERS_PRESENT · 14 MANIFEST_INCOMPLETE.
+Exit codes: 3 FROZEN_MISMATCH · 4 REFUSE_LIVE_DB · 5 SUITE_INVALID · 6 CONTROL_DEGREE_MISMATCH · 7 POOL_INCOMPLETE · 8 KAPPA_BELOW_GATE · 9 MODEL_NOT_READY · 10 SOURCE_MTIME_CHANGED · 11 JUDGE_INCOMPLETE · 12 ADJUDICATION_PENDING · 13 OUTLIERS_PRESENT · 14 MANIFEST_INCOMPLETE · 15 LINK_AUDIT_INPUT_MISSING (link-audit-merge.mjs: a required input file -- the sample, the prevalence file, or the judge-A verdicts -- does not exist yet, or judge-A shares no jids with the sample).
 
 Channel labels: `vector` (in `candidates.*.jsonl`) = product base ranking (no graph) — `hybridSearch(q, K, false)` = vector ∨ FTS-boost, not pure vector (its `rrf2`/`rrf3` therefore fold FTS twice). `purevec` (in `purevec.*.jsonl`, Task 5b) = pure vector — a raw chunk vector scan on the query embedding (k=100), independent of the product ranking path and of the graph seam.
 

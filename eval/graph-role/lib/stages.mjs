@@ -65,3 +65,18 @@ export async function channelsForQuery({ m, db, query, Ks = [10, 30, 100], n2cap
   const channels = {}; for (const [name, ids] of Object.entries(chans)) channels[name] = { ...applyBudgets(ids, Ks, docOf), ms: ms[name] ?? null };
   return { seam, seeds: seam.seeds, n_connected: seam.connected.length, n2_count: n2Score.size, embed_ms, seam_ms: ms.seam, channels, reach: { chunks: reachSet.size, docs: [...new Set([...reachSet].map(docOf))] }, docOf };
 }
+
+// Task 7 Step 1 — provenance classifier for the link-precision audit (used by link-audit-sample.mjs).
+// Mirrors buildEntityMatcher in the repo-root index.ts (NOT src/index.ts) exactly: CJK names match
+// by substring, Latin/mixed names match by word boundary. hasCJK's character ranges are copied
+// verbatim from index.ts's private hasCJK() (　-鿿가-힯＀-￯) rather than
+// the narrower literal-character-class form the task brief sketched (`[぀-ヿ㐀-鿿가-힯]`, which
+// misses 　-〿 CJK punctuation and ＀-￯ fullwidth/halfwidth forms) — this makes
+// provenanceOf agree with what the product actually linked instead of a close approximation of it.
+const hasCJK = (s) => /[　-鿿가-힯＀-￯]/.test(s);
+export function provenanceOf(text, name) {
+  const lower = name.toLowerCase(), t = text.toLowerCase();
+  if (hasCJK(name)) return t.includes(lower) ? 'name' : 'nonliteral';
+  const esc = lower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\b${esc}\\b`, 'i').test(text) ? 'name' : 'nonliteral';
+}

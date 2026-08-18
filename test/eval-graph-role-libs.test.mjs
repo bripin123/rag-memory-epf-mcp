@@ -205,4 +205,124 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   assert.equal(trimContext(row, -1), row, 'negative n: row returned unchanged (same reference)');
   console.log('  OK: trimContext \u2014 bounded prev/next window, cut markers, chunk_text untouched, n<=0 unchanged');
 }
+// stages: provenanceOf — mirrors product buildEntityMatcher (repo-root index.ts): CJK substring
+// vs. Latin/mixed word-boundary. hasCJK ranges are copied verbatim from index.ts's hasCJK()
+// (　-鿿가-힯＀-￯), not from the task brief's narrower literal-character-
+// class approximation (`[぀-ヿ㐀-鿿가-힯]`, missing 　-〿 CJK punctuation and ＀-￯
+// fullwidth/halfwidth forms) — the extra assertion below is a real, empirically-verified divergence
+// between the two, not a hypothetical one (brief regex would call it 'nonliteral').
+{
+  const { provenanceOf } = await import('../eval/graph-role/lib/stages.mjs');
+  assert.equal(provenanceOf('The Alpha Node appears here', 'Alpha Node'), 'name');
+  assert.equal(provenanceOf('The AlphaNode appears here', 'Alpha Node'), 'nonliteral');
+  assert.equal(provenanceOf('할랄 인증 기준', '할랄'), 'name');
+  assert.equal(provenanceOf('SuperAPI runs', 'API'), 'nonliteral');   // word boundary for Latin
+  assert.equal(provenanceOf('some ＡＢＣ text here', 'ＡＢＣ'), 'name',
+    'fullwidth Latin (U+FF21-FF23, in \\uff00-\\uffef) counts as CJK under product hasCJK -> substring match; verified against index.ts, not guessed');
+  console.log('  OK: provenance name/nonliteral');
+}
+
+// run-upstream: computeEdgeValidity — per-query edge_validity against extract-observed.mjs's
+// observed_paths rows ({from,to,edge_id,relation_type,direction} when the edge exists in the KG;
+// {from,to,missing_entity} -- no edge_id -- when an endpoint entity itself is missing from the KG).
+{
+  const { computeEdgeValidity } = await import('../eval/graph-role/run-upstream.mjs');
+  const expEdges = [
+    { from: 'A', to: 'B', type: 'REFERENCES', direction: 'out', required: true },   // exists, direction+type match
+    { from: 'B', to: 'C', type: 'USES', direction: 'in', required: true },          // exists, direction+type mismatch
+    { from: 'X', to: 'Y', type: 'any', direction: 'any', required: true },          // missing entirely, required -> required_missing++
+    { from: 'P', to: 'Q', type: 'any', direction: 'any', required: false },         // missing_entity row only (no edge_id) -> not "exists"; not required -> no increment
+  ];
+  const obs = [
+    { from: 'A', to: 'B', edge_id: 'e1', relation_type: 'REFERENCES', direction: 'out' },
+    { from: 'B', to: 'C', edge_id: 'e2', relation_type: 'CONTAINS', direction: 'out' },   // wrong type AND wrong direction
+    { from: 'P', to: 'Q', missing_entity: 'Q' },   // no edge_id -> the exists filter excludes it
+  ];
+  const ev = computeEdgeValidity(expEdges, obs);
+  assert.deepEqual(ev, { total: 4, exists: 2, direction_ok: 1, type_ok: 1, required_missing: 1 });
+  // 'any' bypasses both checks whenever the edge exists at all, regardless of the observed row's actual type/direction
+  const anyEv = computeEdgeValidity(
+    [{ from: 'A', to: 'B', type: 'any', direction: 'any', required: true }],
+    [{ from: 'A', to: 'B', edge_id: 'e1', relation_type: 'WHATEVER', direction: 'in' }]
+  );
+  assert.deepEqual(anyEv, { total: 1, exists: 1, direction_ok: 1, type_ok: 1, required_missing: 0 });
+  console.log('  OK: computeEdgeValidity — exists/direction_ok/type_ok/required_missing, any-bypass, missing_entity rows excluded');
+}
+
+// link-audit-merge: precisionOf/clusterByChunk — chunk-level grouping so a bootstrap resamples
+// chunks (independent passages), not pairs (up to 15 pairs can share one passage/judge read).
+{
+  const { precisionOf, clusterByChunk } = await import('../eval/graph-role/link-audit-merge.mjs');
+  assert.equal(precisionOf([]), null, 'no judged rows -> precision undefined, not 0');
+  assert.equal(precisionOf([{ ok: 1 }, { ok: 0 }, { ok: 1 }]), 2 / 3);
+
+  const items = [
+    { jid: 'j1', chunk_id: 'c1', stratum: 'low', provenance: 'name' },
+    { jid: 'j2', chunk_id: 'c1', stratum: 'low', provenance: 'nonliteral' },
+    { jid: 'j3', chunk_id: 'c2', stratum: 'mid', provenance: 'name' },
+    { jid: 'j4', chunk_id: 'c3', stratum: 'high', provenance: 'name' },   // unjudged -> excluded entirely
+  ];
+  const judgeMap = new Map([['j1', 1], ['j2', 0], ['j3', 1]]);            // j4 has no verdict
+  const clusters = clusterByChunk(items, judgeMap);
+  assert.equal(clusters.length, 2, 'c3 dropped entirely: its only row (j4) has no judgment');
+  const byId = Object.fromEntries(clusters.map(c => [c[0].chunk_id, c]));
+  assert.deepEqual(byId.c1.map(r => r.ok), [1, 0], 'both c1 pairs kept, judge-A verdicts attached as .ok');
+  assert.deepEqual(byId.c2.map(r => r.ok), [1]);
+  console.log('  OK: precisionOf/clusterByChunk — null-on-empty, chunk grouping drops unjudged jids');
+}
+// link-audit-merge: byStratum/byProvenance/weightedPrecision — hand-computed on a 4-cluster fixture
+// (2 low clusters, 1 mid, 1 high; prevalence weights favor low 50%/mid 25%/high 25% of the corpus).
+{
+  const { byStratum, byProvenance, weightedPrecision } = await import('../eval/graph-role/link-audit-merge.mjs');
+  const L1 = [{ stratum: 'low', provenance: 'name', ok: 1 }, { stratum: 'low', provenance: 'name', ok: 1 }];
+  const L2 = [{ stratum: 'low', provenance: 'nonliteral', ok: 0 }];
+  const M1 = [{ stratum: 'mid', provenance: 'name', ok: 1 }, { stratum: 'mid', provenance: 'name', ok: 0 }, { stratum: 'mid', provenance: 'nonliteral', ok: 1 }];
+  const H1 = [{ stratum: 'high', provenance: 'name', ok: 1 }, { stratum: 'high', provenance: 'nonliteral', ok: 1 }];
+  const clusters = [L1, L2, M1, H1];
+
+  const bs = byStratum(clusters);
+  assert.deepEqual(bs.low, { n: 3, precision: 2 / 3 }, 'low = L1+L2 flat = [1,1,0]');
+  assert.deepEqual(bs.mid, { n: 3, precision: 2 / 3 }, 'mid = M1 = [1,0,1]');
+  assert.deepEqual(bs.high, { n: 2, precision: 1 }, 'high = H1 = [1,1]');
+
+  const bp = byProvenance(clusters);
+  assert.deepEqual(bp.name, { n: 5, precision: 0.8 }, 'name rows across all clusters = [1,1,1,0,1] = 4/5');
+  assert.deepEqual(bp.nonliteral, { n: 3, precision: 2 / 3 }, 'nonliteral rows = [0,1,1] = 2/3');
+
+  // weighted = precision(low)*w(low) + precision(mid)*w(mid) + precision(high)*w(high)
+  //          = (2/3)*(100/200) + (2/3)*(50/200) + 1*(50/200) = 1/3 + 1/6 + 1/4 = 0.75 exactly
+  const wp = weightedPrecision(clusters, { low: 100, mid: 50, high: 50 });
+  assert.ok(Math.abs(wp - 0.75) < 1e-9, `hand-computed weighted precision = 0.75, got ${wp}`);
+  // a stratum absent from the sample (precision null) contributes 0, not NaN
+  const wpMissing = weightedPrecision([L1, L2], { low: 100, mid: 50, high: 50 });
+  assert.ok(Math.abs(wpMissing - (2 / 3) * 0.5) < 1e-9, 'mid/high absent from sample -> precision null -> contribute 0, no NaN');
+  console.log('  OK: byStratum/byProvenance/weightedPrecision — hand-computed against a 4-cluster fixture');
+}
+// link-audit-merge: bootstrapCI — chunk-cluster percentile bootstrap. Degenerate rng (always 0)
+// against a single-cluster fixture makes every resample identical to the point estimate (exact,
+// no PRNG sequence to hand-simulate); a second case checks determinism + bounds sanity with the
+// real mulberry32 PRNG on the 4-cluster fixture above.
+{
+  const { bootstrapCI, weightedPrecision } = await import('../eval/graph-role/link-audit-merge.mjs');
+  const single = [[{ stratum: 'low', provenance: 'name', ok: 1 }, { stratum: 'low', provenance: 'name', ok: 1 }]];
+  const prev1 = { low: 10, mid: 5, high: 5 };
+  assert.ok(Math.abs(weightedPrecision(single, prev1) - 0.5) < 1e-9, 'point estimate: precision(low)=1 * w(low)=10/20 = 0.5');
+  const degenerate = bootstrapCI(single, prev1, 5, () => 0);
+  assert.deepEqual(degenerate.boots, [0.5, 0.5, 0.5, 0.5, 0.5], 'rng always 0 -> Math.floor(0*len)=0 always -> every resample is [clusters[0]] (len 1)');
+  assert.equal(degenerate.lo, 0.5); assert.equal(degenerate.hi, 0.5);
+
+  const L1 = [{ stratum: 'low', provenance: 'name', ok: 1 }, { stratum: 'low', provenance: 'name', ok: 1 }];
+  const L2 = [{ stratum: 'low', provenance: 'nonliteral', ok: 0 }];
+  const M1 = [{ stratum: 'mid', provenance: 'name', ok: 1 }, { stratum: 'mid', provenance: 'name', ok: 0 }, { stratum: 'mid', provenance: 'nonliteral', ok: 1 }];
+  const H1 = [{ stratum: 'high', provenance: 'name', ok: 1 }, { stratum: 'high', provenance: 'nonliteral', ok: 1 }];
+  const clusters = [L1, L2, M1, H1];
+  const prev = { low: 100, mid: 50, high: 50 };
+  const ciA = bootstrapCI(clusters, prev, 200, mulberry32(99));
+  const ciB = bootstrapCI(clusters, prev, 200, mulberry32(99));
+  assert.deepEqual(ciA, ciB, 'same seed -> identical bootstrap CI (determinism)');
+  assert.ok(ciA.lo <= ciA.hi, 'lo <= hi');
+  assert.ok(ciA.lo >= 0 && ciA.hi <= 1, 'CI bounds within [0,1]');
+  console.log('  OK: bootstrapCI — degenerate-rng exactness, determinism, bounds sanity');
+}
+
 console.log('eval-graph-role-libs: ALL OK');
