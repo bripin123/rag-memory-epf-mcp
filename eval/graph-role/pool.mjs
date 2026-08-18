@@ -9,15 +9,24 @@ const files = need.flatMap(c => [`candidates.${label}.${c}.jsonl`, `final.${labe
 const missing = files.filter(f => !existsSync(f)); if (missing.length) { console.error(`POOL_INCOMPLETE missing ${missing.map(f => f.split('/').pop()).join(', ')}`); process.exit(7); }
 const readJsonl = (p) => readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
 const queries = new Map(readJsonl(join(EVAL_DIR, 'suite', `queries.${label}.jsonl`)).map(q => [q.id, q]));
-const pooled = new Map();   // qid -> Map(chunk_id -> tier) ; tier 'top30' = in some channel's top-30 or a final list, 'deep' = only in ranks 31..100
-const add = (qid, ids, tier) => { const s = pooled.get(qid) || new Map(); for (const id of ids) if (id && (tier === 'top30' || !s.has(id))) s.set(id, tier === 'top30' ? 'top30' : (s.get(id) || 'deep')); pooled.set(qid, s); };
+const pooled = new Map();   // qid -> Map(chunk_id -> { tier, channels: Set<name>, conds: Set<cond> }) ; tier 'top30' = in some channel's top-30 or a final list, 'deep' = only in ranks 31..100. channels/conds accumulate ONLY from top30 occurrences (D2: provenance for the incremental-pooling saturation test); deep-only chunks keep empty channels/conds.
+const add = (qid, ids, tier, channel, cond) => {
+  const s = pooled.get(qid) || new Map();
+  for (const id of ids) {
+    if (!id) continue;
+    let cur = s.get(id); if (!cur) { cur = { tier: 'deep', channels: new Set(), conds: new Set() }; s.set(id, cur); }
+    if (tier === 'top30') { cur.tier = 'top30'; cur.channels.add(channel); cur.conds.add(cond); }
+    else if (cur.tier !== 'top30') { cur.tier = 'deep'; }
+  }
+  pooled.set(qid, s);
+};
 for (const c of need) {
-  for (const r of readJsonl(join(EVAL_DIR, 'out', `candidates.${label}.${c}.jsonl`))) { if (r.class === 'K') continue; for (const ch of Object.values(r.channels)) { add(r.id, ch.chunk30, 'top30'); add(r.id, ch.chunk100.slice(30), 'deep'); } }
-  for (const r of readJsonl(join(EVAL_DIR, 'out', `final.${label}.${c}.jsonl`))) { if (r.class === 'K') continue; add(r.id, r.off.top10.map(x => x.chunk_id), 'top30'); add(r.id, r.on.top10.map(x => x.chunk_id), 'top30'); add(r.id, r.fixedpool_rerank.with_graph, 'top30'); }
+  for (const r of readJsonl(join(EVAL_DIR, 'out', `candidates.${label}.${c}.jsonl`))) { if (r.class === 'K') continue; for (const [chName, ch] of Object.entries(r.channels)) { add(r.id, ch.chunk30, 'top30', chName, r.cond); add(r.id, ch.chunk100.slice(30), 'deep'); } }
+  for (const r of readJsonl(join(EVAL_DIR, 'out', `final.${label}.${c}.jsonl`))) { if (r.class === 'K') continue; add(r.id, r.off.top10.map(x => x.chunk_id), 'top30', 'final-off', r.cond); add(r.id, r.on.top10.map(x => x.chunk_id), 'top30', 'final-on', r.cond); add(r.id, r.fixedpool_rerank.with_graph, 'top30', 'final-fixedpool', r.cond); }
 }
-// purevec channel (T5b, real-only, post-hoc; not part of `need`/the exit-7 completeness gate — pool it when present, skip silently when not).
+// purevec channel (T5b, real-only, post-hoc; not part of `need`/the exit-7 completeness gate — pool it when present, skip silently when not). Its channel names are prefixed `purevec:` so they never collide with the candidates-file channel names of the same corpus/condition.
 const purevecPath = join(EVAL_DIR, 'out', `purevec.${label}.jsonl`);
-if (existsSync(purevecPath)) { for (const r of readJsonl(purevecPath)) { if (r.class === 'K') continue; for (const ch of Object.values(r.channels)) { add(r.id, ch.chunk30, 'top30'); add(r.id, ch.chunk100.slice(30), 'deep'); } } }
+if (existsSync(purevecPath)) { for (const r of readJsonl(purevecPath)) { if (r.class === 'K') continue; for (const [chName, ch] of Object.entries(r.channels)) { add(r.id, ch.chunk30, 'top30', `purevec:${chName}`, r.cond); add(r.id, ch.chunk100.slice(30), 'deep'); } } }
 const db = new Database(CORPORA[label].copy, { readonly: true });
 const meta = db.prepare(`SELECT cm.chunk_id, cm.document_id, cm.chunk_index, cm.text FROM chunk_metadata cm WHERE cm.chunk_id = ?`);
 const neighbor = db.prepare(`SELECT text FROM chunk_metadata WHERE document_id = ? AND chunk_index = ?`);
@@ -27,17 +36,21 @@ const rows = []; let jn = 0; const stats = { queries: 0, chunks: 0, docs: 0 };
 for (const [qid, set] of pooled) {
   const q = queries.get(qid); stats.queries++;
   const docsSeen = new Set();
-  for (const [chunk_id, tier] of [...set.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+  for (const [chunk_id, prov] of [...set.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
     const m = meta.get(chunk_id); if (!m) continue; stats.chunks++; docsSeen.add(m.document_id);
-    rows.push({ jid: `${label}-J${++jn}`, tier, qid, class: q.class, query: q.text, doc_id: m.document_id, doc_title: (title.get(m.document_id)?.t || m.document_id).replace(/\s+/g, ' ').slice(0, 100), chunk_id, chunk_text: m.text,
+    rows.push({ jid: `${label}-J${++jn}`, tier: prov.tier, qid, class: q.class, query: q.text, doc_id: m.document_id, doc_title: (title.get(m.document_id)?.t || m.document_id).replace(/\s+/g, ' ').slice(0, 100), chunk_id, chunk_text: m.text,
                 prev_text: neighbor.get(m.document_id, m.chunk_index - 1)?.text ?? '', next_text: neighbor.get(m.document_id, m.chunk_index + 1)?.text ?? '' });
   }
   stats.docs += docsSeen.size;
 }
 const corpusIndex = { hub: 0, uap: 1, hal: 2 }[label];
 const shuffled = shuffle(rows, mulberry32(th.bootstrap.seed + corpusIndex));
-writeFileSync(join(EVAL_DIR, 'pool', `${label}.pool.jsonl`), rows.map(r => JSON.stringify({ qid: r.qid, chunk_id: r.chunk_id, doc_id: r.doc_id, jid: r.jid })).join('\n') + '\n');
-writeFileSync(join(EVAL_DIR, 'pool', `${label}.judge.jsonl`), shuffled.map(r => JSON.stringify(r)).join('\n') + '\n');
+// pool.jsonl carries provenance (tier/channels/conds) for the D2 incremental-pooling saturation test; judge.jsonl
+// stays exactly the blind row shape below (jid, tier, qid, class, query, doc_id, doc_title, chunk_id, chunk_text,
+// prev_text, next_text) — tier is present there too (unchanged from before D2) but channels/conds are NOT, so a
+// judge never sees which channel/condition surfaced an item.
+writeFileSync(join(EVAL_DIR, 'pool', `${label}.pool.jsonl`), rows.map(r => { const prov = pooled.get(r.qid).get(r.chunk_id); return JSON.stringify({ qid: r.qid, chunk_id: r.chunk_id, doc_id: r.doc_id, jid: r.jid, tier: r.tier, channels: [...prov.channels].sort(), conds: [...prov.conds].sort() }); }).join('\n') + '\n');
+writeFileSync(join(EVAL_DIR, 'pool', `${label}.judge.jsonl`), shuffled.map(r => JSON.stringify({ jid: r.jid, tier: r.tier, qid: r.qid, class: r.class, query: r.query, doc_id: r.doc_id, doc_title: r.doc_title, chunk_id: r.chunk_id, chunk_text: r.chunk_text, prev_text: r.prev_text, next_text: r.next_text })).join('\n') + '\n');
 // unpooled random sample (missed-relevant rate): 100 (query, chunk) pairs not in the pool
 const allChunks = db.prepare(`SELECT chunk_id, document_id FROM chunk_metadata WHERE chunk_type='document'`).all();
 const rng = mulberry32(th.bootstrap.seed + 100 + corpusIndex); const unp = [];

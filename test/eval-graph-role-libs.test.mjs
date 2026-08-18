@@ -80,4 +80,41 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   assert.ok(Math.abs(weightedKappa([0,0,1,1,2,2], [0,1,1,2,2,0]) - 0.25) < 1e-9, 'quadratic weighted kappa hand-computed');
   console.log('  OK: weighted kappa');
 }
+// pooling: D2 incremental deep-tier planning — saturation, qualification, ascending-qid budget truncation, judge.jsonl order
+{
+  const { planDeep } = await import('../eval/graph-role/lib/pooling.mjs');
+  const poolRows = [
+    // q1: one relevant doc (max grade 2) found by 2 channels -> saturated, does NOT qualify
+    { qid: 'q1', chunk_id: 'q1c1', doc_id: 'q1d1', jid: 'q1c1', tier: 'top30', channels: ['vector'], conds: ['real'] },
+    { qid: 'q1', chunk_id: 'q1c2', doc_id: 'q1d1', jid: 'q1c2', tier: 'top30', channels: ['fts'], conds: ['real'] },
+    { qid: 'q1', chunk_id: 'q1x1', doc_id: 'q1d9', jid: 'q1_deep', tier: 'deep', channels: [], conds: [] },
+    // q2: one relevant doc found by exactly 1 channel -> qualifies
+    { qid: 'q2', chunk_id: 'q2c1', doc_id: 'q2d1', jid: 'q2c1', tier: 'top30', channels: ['vector'], conds: ['real'] },
+    { qid: 'q2', chunk_id: 'q2x1', doc_id: 'q2d9', jid: 'q2_deep_a', tier: 'deep', channels: [], conds: [] },
+    { qid: 'q2', chunk_id: 'q2x2', doc_id: 'q2d9', jid: 'q2_deep_b', tier: 'deep', channels: [], conds: [] },
+    // q3: no relevant docs at all -> does NOT qualify
+    { qid: 'q3', chunk_id: 'q3c1', doc_id: 'q3d1', jid: 'q3c1', tier: 'top30', channels: ['vector'], conds: ['real'] },
+    { qid: 'q3', chunk_id: 'q3x1', doc_id: 'q3d9', jid: 'q3_deep', tier: 'deep', channels: [], conds: [] },
+    // q4: one relevant doc found by exactly 1 channel -> qualifies, but its 3 deep rows overflow the budget
+    { qid: 'q4', chunk_id: 'q4c1', doc_id: 'q4d1', jid: 'q4c1', tier: 'top30', channels: ['fts'], conds: ['real'] },
+    { qid: 'q4', chunk_id: 'q4x1', doc_id: 'q4d9', jid: 'q4_deep_a', tier: 'deep', channels: [], conds: [] },
+    { qid: 'q4', chunk_id: 'q4x2', doc_id: 'q4d9', jid: 'q4_deep_b', tier: 'deep', channels: [], conds: [] },
+    { qid: 'q4', chunk_id: 'q4x3', doc_id: 'q4d9', jid: 'q4_deep_c', tier: 'deep', channels: [], conds: [] },
+  ];
+  // judge.jsonl file order deliberately scrambled (not qid-grouped) to prove pass2_jids follows file order, not qid order.
+  const judgeRows = [
+    { jid: 'q3c1', tier: 'top30', qid: 'q3' }, { jid: 'q4_deep_b', tier: 'deep', qid: 'q4' }, { jid: 'q2c1', tier: 'top30', qid: 'q2' },
+    { jid: 'q1c1', tier: 'top30', qid: 'q1' }, { jid: 'q2_deep_a', tier: 'deep', qid: 'q2' }, { jid: 'q4c1', tier: 'top30', qid: 'q4' },
+    { jid: 'q1_deep', tier: 'deep', qid: 'q1' }, { jid: 'q1c2', tier: 'top30', qid: 'q1' }, { jid: 'q4_deep_a', tier: 'deep', qid: 'q4' },
+    { jid: 'q3_deep', tier: 'deep', qid: 'q3' }, { jid: 'q2_deep_b', tier: 'deep', qid: 'q2' }, { jid: 'q4_deep_c', tier: 'deep', qid: 'q4' },
+  ];
+  const grades = new Map([['q1c1', 2], ['q1c2', 0], ['q2c1', 2], ['q3c1', 0], ['q4c1', 2]]);
+  const plan = planDeep({ poolRows, judgeRows, grades, budget: 7 });
+  assert.deepEqual(plan.qualifying, ['q2', 'q4'], 'q1 saturated (relevant doc found by 2 channels) and q3 (no relevant docs) do not qualify; q2/q4 do');
+  assert.deepEqual(plan.truncated, ['q4'], 'q4 is the 2nd qualifying query in ascending qid order; pass1(5)+q2(2)=7 fits budget 7, +q4(3)=10 overflows');
+  assert.equal(plan.pass1_rows, 5, 'every top30 row across all 4 queries counts toward pass 1, regardless of qualification');
+  assert.equal(plan.pass2_rows, 2, 'only q2 deep rows are planned; q4 truncated, q1/q3 never qualified');
+  assert.deepEqual(plan.pass2_jids, ['q2_deep_a', 'q2_deep_b'], 'deep jids of planned queries only, in judge.jsonl file order');
+  console.log('  OK: planDeep — saturation, qualification, ascending-qid budget truncation, judge.jsonl-order jids');
+}
 console.log('eval-graph-role-libs: ALL OK');
