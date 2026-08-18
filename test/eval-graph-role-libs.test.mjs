@@ -80,64 +80,104 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   assert.ok(Math.abs(weightedKappa([0,0,1,1,2,2], [0,1,1,2,2,0]) - 0.25) < 1e-9, 'quadratic weighted kappa hand-computed');
   console.log('  OK: weighted kappa');
 }
-// pooling: D2 incremental deep-tier planning — saturation, qualification, ascending-qid budget truncation, judge.jsonl order
-{
-  const { planDeep } = await import('../eval/graph-role/lib/pooling.mjs');
-  const poolRows = [
-    // q1: one relevant doc (max grade 2) found by 2 channels -> saturated, does NOT qualify
-    { qid: 'q1', chunk_id: 'q1c1', doc_id: 'q1d1', jid: 'q1c1', tier: 'top30', channels: ['vector'], conds: ['real'] },
-    { qid: 'q1', chunk_id: 'q1c2', doc_id: 'q1d1', jid: 'q1c2', tier: 'top30', channels: ['fts'], conds: ['real'] },
-    { qid: 'q1', chunk_id: 'q1x1', doc_id: 'q1d9', jid: 'q1_deep', tier: 'deep', channels: [], conds: [] },
-    // q2: one relevant doc found by exactly 1 channel -> qualifies
-    { qid: 'q2', chunk_id: 'q2c1', doc_id: 'q2d1', jid: 'q2c1', tier: 'top30', channels: ['vector'], conds: ['real'] },
-    { qid: 'q2', chunk_id: 'q2x1', doc_id: 'q2d9', jid: 'q2_deep_a', tier: 'deep', channels: [], conds: [] },
-    { qid: 'q2', chunk_id: 'q2x2', doc_id: 'q2d9', jid: 'q2_deep_b', tier: 'deep', channels: [], conds: [] },
-    // q3: no relevant docs at all -> does NOT qualify
-    { qid: 'q3', chunk_id: 'q3c1', doc_id: 'q3d1', jid: 'q3c1', tier: 'top30', channels: ['vector'], conds: ['real'] },
-    { qid: 'q3', chunk_id: 'q3x1', doc_id: 'q3d9', jid: 'q3_deep', tier: 'deep', channels: [], conds: [] },
-    // q4: one relevant doc found by exactly 1 channel -> qualifies, but its 3 deep rows overflow the budget
-    { qid: 'q4', chunk_id: 'q4c1', doc_id: 'q4d1', jid: 'q4c1', tier: 'top30', channels: ['fts'], conds: ['real'] },
-    { qid: 'q4', chunk_id: 'q4x1', doc_id: 'q4d9', jid: 'q4_deep_a', tier: 'deep', channels: [], conds: [] },
-    { qid: 'q4', chunk_id: 'q4x2', doc_id: 'q4d9', jid: 'q4_deep_b', tier: 'deep', channels: [], conds: [] },
-    { qid: 'q4', chunk_id: 'q4x3', doc_id: 'q4d9', jid: 'q4_deep_c', tier: 'deep', channels: [], conds: [] },
-  ];
-  // judge.jsonl file order deliberately scrambled (not qid-grouped) to prove pass2_jids follows file order, not qid order.
-  const judgeRows = [
-    { jid: 'q3c1', tier: 'top30', qid: 'q3' }, { jid: 'q4_deep_b', tier: 'deep', qid: 'q4' }, { jid: 'q2c1', tier: 'top30', qid: 'q2' },
-    { jid: 'q1c1', tier: 'top30', qid: 'q1' }, { jid: 'q2_deep_a', tier: 'deep', qid: 'q2' }, { jid: 'q4c1', tier: 'top30', qid: 'q4' },
-    { jid: 'q1_deep', tier: 'deep', qid: 'q1' }, { jid: 'q1c2', tier: 'top30', qid: 'q1' }, { jid: 'q4_deep_a', tier: 'deep', qid: 'q4' },
-    { jid: 'q3_deep', tier: 'deep', qid: 'q3' }, { jid: 'q2_deep_b', tier: 'deep', qid: 'q2' }, { jid: 'q4_deep_c', tier: 'deep', qid: 'q4' },
-  ];
-  const grades = new Map([['q1c1', 2], ['q1c2', 0], ['q2c1', 2], ['q3c1', 0], ['q4c1', 2]]);
-  const plan = planDeep({ poolRows, judgeRows, grades, budget: 7 });
-  assert.deepEqual(plan.qualifying, ['q2', 'q4'], 'q1 saturated (relevant doc found by 2 channels) and q3 (no relevant docs) do not qualify; q2/q4 do');
-  assert.deepEqual(plan.truncated, ['q4'], 'q4 is the 2nd qualifying query in ascending qid order; pass1(5)+q2(2)=7 fits budget 7, +q4(3)=10 overflows');
-  assert.equal(plan.pass1_rows, 5, 'every top30 row across all 4 queries counts toward pass 1, regardless of qualification');
-  assert.equal(plan.pass2_rows, 2, 'only q2 deep rows are planned; q4 truncated, q1/q3 never qualified');
-  assert.deepEqual(plan.pass2_jids, ['q2_deep_a', 'q2_deep_b'], 'deep jids of planned queries only, in judge.jsonl file order');
-  console.log('  OK: planDeep — saturation, qualification, ascending-qid budget truncation, judge.jsonl-order jids');
-}
 // pooling: naturalCompare — "ascending qid order" must be natural (numeric within digit runs), not lexicographic.
 // Real ids are `<corpus>-<class>-<n>` with unpadded n (hub-A-1..hub-A-53), where default string sort is wrong
 // (would put hub-A-10 before hub-A-2). This case uses multi-digit ids that diverge under the two orderings.
 {
-  const { planDeep, naturalCompare } = await import('../eval/graph-role/lib/pooling.mjs');
+  const { naturalCompare } = await import('../eval/graph-role/lib/pooling.mjs');
   assert.ok(naturalCompare('q-2', 'q-10') < 0, 'q-2 before q-10 under natural order (default string sort would reverse this)');
   assert.ok(naturalCompare('q-10', 'q-2') > 0);
   assert.equal(naturalCompare('q-1', 'q-1'), 0);
   assert.deepEqual(['q-2', 'q-10', 'q-1'].sort(naturalCompare), ['q-1', 'q-2', 'q-10'], 'natural sort ascending');
   assert.deepEqual(['q-2', 'q-10', 'q-1'].sort(), ['q-1', 'q-10', 'q-2'], 'default string sort puts q-10 before q-2 -- the bug naturalCompare fixes');
+  console.log('  OK: naturalCompare — digit runs numeric, non-digit runs lexicographic');
+}
+// pooling: planPass2 — fixed-depth-10 pass 1 + predeclared, seeded, class-alternating (A/M) depth-30 subset for
+// pass 2. Replaces the D2 saturation design (measured: top10 alone already exceeds budget on all 3 corpora;
+// advisor: outcome-dependent extension has an unfixed-direction bias; fixed depth + predeclared stratified
+// coverage is the standard alternative).
+{
+  const { planPass2 } = await import('../eval/graph-role/lib/pooling.mjs');
+  // 8 candidates (4 A + 4 M) with varying top30 sizes (1..3); 2 top10 rows; budget 7 -> remaining after pass1 = 5,
+  // enough to fit 4 of the 8 (13 total top30 rows). File order deliberately scrambled (not grouped by qid) to
+  // prove pass2_jids follows judgeRows order, not selection order.
+  const classOf = (qid) => qid[0] === 'a' ? 'A' : 'M';
+  const top30Row = (qid, i) => ({ jid: `${qid}x${i}`, tier: 'top30', qid, class: classOf(qid) });
+  const judgeRows = [
+    top30Row('m-3', 1), { jid: 't1', tier: 'top10', qid: 'k1', class: 'A' }, top30Row('a-4', 1), top30Row('a-1', 1),
+    top30Row('m-1', 1), top30Row('a-2', 1), top30Row('m-4', 1), { jid: 't2', tier: 'top10', qid: 'k2', class: 'A' },
+    top30Row('a-4', 2), top30Row('m-2', 1), top30Row('a-3', 1), top30Row('m-1', 2),
+    top30Row('a-2', 2), top30Row('m-4', 2), top30Row('a-4', 3),
+  ];   // sizes: a-1=1 a-2=2 a-3=1 a-4=3 m-1=2 m-2=1 m-3=1 m-4=2 (13 top30 rows) + 2 top10 rows = 15
+  assert.equal(judgeRows.filter(r => r.tier === 'top30').length, 13, 'fixture sanity: 13 top30 rows');
 
-  // planDeep itself must use natural order for both the qualifying scan and the truncation walk.
-  const mkTop30 = (qid) => ({ qid, chunk_id: `${qid}c1`, doc_id: `${qid}d1`, jid: `${qid}c1`, tier: 'top30', channels: ['vector'], conds: ['real'] });
-  const mkDeep = (qid) => ({ qid, chunk_id: `${qid}x1`, doc_id: `${qid}d9`, jid: `${qid}_deep`, tier: 'deep', channels: [], conds: [] });
-  const ids = ['q-2', 'q-10', 'q-1'];   // deliberately out of natural order in the input
-  const poolRows = ids.flatMap(qid => [mkTop30(qid), mkDeep(qid)]);
-  const judgeRows = ids.flatMap(qid => [{ jid: `${qid}c1`, tier: 'top30', qid }, { jid: `${qid}_deep`, tier: 'deep', qid }]);
-  const grades = new Map(ids.map(qid => [`${qid}c1`, 2]));   // every query's one top30 doc is relevant, found by exactly 1 channel -> all 3 qualify
-  const plan = planDeep({ poolRows, judgeRows, grades, budget: 5 });   // pass1_rows=3 (one top30 row each); budget fits exactly 2 queries' single deep row
-  assert.deepEqual(plan.qualifying, ['q-1', 'q-2', 'q-10'], 'qualifying scan must use natural order, not default string sort (which would give q-1,q-10,q-2)');
-  assert.deepEqual(plan.truncated, ['q-10'], 'natural order: q-1(3+1=4) then q-2(4+1=5) fit budget 5, q-10(5+1=6) overflows -- under default string sort order it would be q-2 that truncates instead');
-  console.log('  OK: naturalCompare — digit runs numeric, ascending id order for qualifying scan and truncation');
+  const plan = planPass2({ judgeRows, budget: 7, seed: 42 });
+  assert.equal(plan.pass1_rows, 2);
+  assert.deepEqual(plan.selected, ['a-1', 'm-4', 'm-2', 'a-3'], 'balanced A/M alternation (seed 42): alternation order is a-1,m-4,a-4,m-2,a-2,m-1,a-3,m-3');
+  assert.deepEqual(plan.skipped_budget, ['a-4', 'a-2', 'm-1', 'm-3'], 'skip-and-continue: a-4 (size 3) does not fit after a-1+m-4 consume 3 of 5 remaining, but the walk keeps trying later (smaller) queries rather than stopping');
+  assert.deepEqual(plan.not_selected, plan.skipped_budget);
+  assert.equal(plan.pass2_rows, 5);
+  assert.equal(plan.remaining_after, 0, 'pass1(2) + pass2(5) == budget(7) exactly');
+  assert.deepEqual(plan.pass2_jids, ['a-1x1', 'm-4x1', 'm-2x1', 'a-3x1', 'm-4x2'], 'pass2_jids in judgeRows file order, not selection order -- m-4s two jids land apart because other rows sit between them in the file');
+  assert.deepEqual(plan.per_class.A, { selected: ['a-1', 'a-3'], candidates: ['a-1', 'a-2', 'a-3', 'a-4'] });
+  assert.deepEqual(plan.per_class.M, { selected: ['m-4', 'm-2'], candidates: ['m-1', 'm-2', 'm-3', 'm-4'] });
+
+  const again = planPass2({ judgeRows, budget: 7, seed: 42 });
+  assert.deepEqual(again, plan, 'determinism: identical input + same seed -> identical output');
+  const other = planPass2({ judgeRows, budget: 7, seed: 43 });
+  assert.notDeepEqual(other.selected, plan.selected, 'different seed -> different pick order');
+  console.log('  OK: planPass2 — balanced A/M alternation, budget skip-and-continue, determinism, file-order pass2_jids');
+}
+// judging: splitRows — batch sizes and zero-padded NNN naming (batches/<c>/<set>-NNN.jsonl)
+{
+  const { splitRows } = await import('../eval/graph-role/lib/judging.mjs');
+  const rows = Array.from({ length: 7 }, (_, i) => ({ jid: `j${i + 1}` }));
+  const b3 = splitRows(rows, 3);
+  assert.equal(b3.length, 3);
+  assert.deepEqual(b3.map(b => b.nnn), ['001', '002', '003']);
+  assert.deepEqual(b3.map(b => b.rows.length), [3, 3, 1]);
+  assert.deepEqual(b3[0].jids, ['j1', 'j2', 'j3']); assert.deepEqual(b3[2].jids, ['j7']);
+  const many = Array.from({ length: 12 }, (_, i) => ({ jid: `k${i + 1}` }));
+  const b1 = splitRows(many, 1);
+  assert.equal(b1.length, 12);
+  assert.deepEqual([b1[8].nnn, b1[9].nnn, b1[11].nnn], ['009', '010', '012'], 'zero-padding stays 3 digits past 9 batches');
+  console.log('  OK: splitRows — batch sizes and zero-padded NNN naming');
+}
+// judging: wordCount — whitespace-delimited word count for the 25-word rationale cap
+{
+  const { wordCount } = await import('../eval/graph-role/lib/judging.mjs');
+  assert.equal(wordCount(''), 0);
+  assert.equal(wordCount('   '), 0);
+  assert.equal(wordCount('one'), 1);
+  assert.equal(wordCount('one two three'), 3);
+  assert.equal(wordCount('  extra   spaces   between  '), 3);
+  console.log('  OK: wordCount — whitespace-delimited, trims, collapses runs');
+}
+// judging: validateBatch — each error class (missing meta, missing jid, foreign jid, dup jid, bad grade, long rationale)
+{
+  const { validateBatch } = await import('../eval/graph-role/lib/judging.mjs');
+  const meta = { meta: true, judge: 'A', model: 'x', at: '2026-01-01T00:00:00Z' };
+  const good = (jid, grade = 1) => ({ jid, grade, rationale: 'a short reason' });
+  { const v = validateBatch(['j1', 'j2'], [meta, good('j1'), good('j2')]); assert.equal(v.ok, true); assert.deepEqual(v.errors, []); assert.deepEqual(v.meta, meta); assert.equal(v.rows.length, 2); }
+  { const v = validateBatch(['j1'], [good('j1')]); assert.equal(v.ok, false); assert.ok(v.errors.some(e => /meta/.test(e)), 'missing meta: first line is a data row'); }
+  { const v = validateBatch(['j1'], []); assert.equal(v.ok, false); assert.ok(v.errors.some(e => /meta/.test(e)), 'missing meta: empty batch'); }
+  { const v = validateBatch(['j1', 'j2'], [meta, good('j1')]); assert.equal(v.ok, false); assert.ok(v.errors.some(e => /missing jid j2/.test(e))); }
+  { const v = validateBatch(['j1'], [meta, good('j1'), good('zzz')]); assert.equal(v.ok, false); assert.ok(v.errors.some(e => /foreign jid zzz/.test(e))); }
+  { const v = validateBatch(['j1'], [meta, good('j1'), good('j1')]); assert.equal(v.ok, false); assert.ok(v.errors.some(e => /duplicate jid j1/.test(e))); }
+  { const v = validateBatch(['j1'], [meta, { jid: 'j1', grade: 3, rationale: 'x' }]); assert.equal(v.ok, false); assert.ok(v.errors.some(e => /bad grade/.test(e)), 'out of range'); }
+  { const v = validateBatch(['j1'], [meta, { jid: 'j1', grade: 1.5, rationale: 'x' }]); assert.equal(v.ok, false); assert.ok(v.errors.some(e => /bad grade/.test(e)), 'non-integer'); }
+  { const long = Array.from({ length: 26 }, (_, i) => `w${i}`).join(' '); const v = validateBatch(['j1'], [meta, { jid: 'j1', grade: 1, rationale: long }]); assert.equal(v.ok, false); assert.ok(v.errors.some(e => /too long/.test(e))); }
+  { const ok25 = Array.from({ length: 25 }, (_, i) => `w${i}`).join(' '); const v = validateBatch(['j1'], [meta, { jid: 'j1', grade: 1, rationale: ok25 }]); assert.equal(v.ok, true, 'exactly 25 words is the boundary, still valid'); }
+  console.log('  OK: validateBatch — meta/jid-set/grade/rationale error classes, 25-word boundary');
+}
+// judging: mergeRows — jid-based dedup on merge (existing rows win; only genuinely new jids get appended)
+{
+  const { mergeRows } = await import('../eval/graph-role/lib/judging.mjs');
+  const existing = [{ jid: 'a', grade: 1 }, { jid: 'b', grade: 2 }];
+  const incoming = [{ jid: 'b', grade: 9 }, { jid: 'c', grade: 0 }];
+  const merged = mergeRows(existing, incoming);
+  assert.deepEqual(merged, [{ jid: 'a', grade: 1 }, { jid: 'b', grade: 2 }, { jid: 'c', grade: 0 }], 'dedup by jid keeps the existing row, appends only new jids');
+  assert.deepEqual(mergeRows([], incoming), incoming, 'empty existing -> all incoming rows kept');
+  console.log('  OK: mergeRows — jid-based dedup on merge');
 }
 console.log('eval-graph-role-libs: ALL OK');

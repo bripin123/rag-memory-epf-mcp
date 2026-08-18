@@ -1,6 +1,5 @@
-// Two-pass incremental pooling (D2): after pass-1 (top30) grades exist, decide which queries' deep
-// (ranks 31-100) tier is worth judging in pass 2. Pure, deterministic, no I/O.
-//
+import { mulberry32, shuffle } from './prng.mjs';
+
 // Natural id order: split into digit / non-digit runs, compare digit runs numerically and other runs
 // lexicographically. So "hub-A-2" sorts before "hub-A-10" (numeric run 2 < 10), while class letters
 // ("hub-A-1" vs "hub-M-1") keep their usual lexicographic order. A prefix of another id sorts first
@@ -19,47 +18,68 @@ export function naturalCompare(a, b) {
   }
   return ax.length - bx.length;
 }
-//
-// A query qualifies for the deep tier when its top30 rows contain >= 1 relevant document (doc-level
-// grade = max over that document's judged top30 chunks; relevant = grade >= 1) whose channel union
-// (union of `channels` across that document's top30 rows for this query) has size exactly 1 -- i.e. a
-// relevant document that only one channel surfaced, meaning the top30 pool for this query is not
-// saturated yet. `grades` should already resolve disagreements conservatively (adjudicated grade when
-// present, else max(A, B), never min) -- that only ever makes a query MORE likely to qualify, never less.
-//
-// Qualifying queries are granted their deep tier in ascending qid order -- NATURAL order, not lexicographic
-// (default string sort would put "hub-A-10" before "hub-A-2") -- until the running total of pass-1 + planned
-// pass-2 rows would exceed `budget`; that query and every later qualifying query are then truncated (their
-// deep rows are not planned).
-export function planDeep({ poolRows, judgeRows, grades, budget }) {
-  const byQid = new Map();
-  for (const r of poolRows) { const a = byQid.get(r.qid); if (a) a.push(r); else byQid.set(r.qid, [r]); }
 
-  const qualifying = [];
-  for (const qid of [...byQid.keys()].sort(naturalCompare)) {
-    const byDoc = new Map();
-    for (const r of byQid.get(qid)) { if (r.tier !== 'top30') continue; const a = byDoc.get(r.doc_id); if (a) a.push(r); else byDoc.set(r.doc_id, [r]); }
-    let qualifies = false;
-    for (const docRows of byDoc.values()) {
-      const grade = Math.max(...docRows.map(r => grades.get(r.jid) ?? -1));
-      if (grade < 1) continue;
-      const channels = new Set(); for (const r of docRows) for (const ch of r.channels) channels.add(ch);
-      if (channels.size === 1) { qualifies = true; break; }
-    }
-    if (qualifies) qualifying.push(qid);
+// Fixed-depth-10 pooling + predeclared depth-30 subset (replaces the D2 saturation design: measured on the
+// real outputs, the top10 tier alone already exceeds judging_budget_per_corpus on all 3 corpora, and an
+// advisor round found outcome-dependent (saturation-based) extension has an unjudged-as-nonrelevant bias of
+// unfixed direction -- fixed-depth pooling with a predeclared, stratified, representative depth-30 subset is
+// the standard alternative). Pure, deterministic, no I/O.
+//
+// Pass 1 = every `top10` row (fixed-depth-10 pooling over all channels x conditions + finals + purevec),
+// always judged, never budget-gated. Pass 2 = a predeclared subset of WHOLE queries (not individual chunks)
+// promoted to depth 30: every qid with >= 1 `top30` row is a candidate, split by class (A/M); each class list
+// is put into natural id order (reproducible regardless of judgeRows' incidental file order) and then shuffled
+// with `mulberry32(seed)` (one continuous stream: class A first, then class M); candidates are then walked in
+// A, M, A, M, ... alternation (once one class list is exhausted, the walk drains the other) and a query is
+// selected only if its WHOLE top30-row count fits in the remaining budget -- otherwise it is marked
+// `skipped_budget` and the walk keeps trying later (possibly smaller) queries rather than stopping. Because
+// the candidate set, the shuffle, and the fit/skip rule are all fixed before any grade exists, pass 2's
+// coverage cannot be biased by what the pass-1 grades turned out to be.
+export function planPass2({ judgeRows, budget, seed }) {
+  const pass1_rows = judgeRows.filter(r => r.tier === 'top10').length;
+  let remaining = budget - pass1_rows;
+
+  const byQid = new Map();   // qid -> { class, jids: [top30 jids] }
+  for (const r of judgeRows) {
+    if (r.tier !== 'top30') continue;
+    let e = byQid.get(r.qid); if (!e) { e = { class: r.class, jids: [] }; byQid.set(r.qid, e); }
+    e.jids.push(r.jid);
   }
 
-  const pass1_rows = poolRows.filter(r => r.tier === 'top30').length;
-  const deepJidsByQid = new Map();
-  for (const r of judgeRows) { if (r.tier !== 'deep') continue; const a = deepJidsByQid.get(r.qid); if (a) a.push(r.jid); else deepJidsByQid.set(r.qid, [r.jid]); }
+  const classQids = { A: [], M: [] };
+  for (const [qid, e] of byQid) classQids[e.class].push(qid);
+  classQids.A.sort(naturalCompare); classQids.M.sort(naturalCompare);
 
-  const truncated = []; const planned = new Set(); let running = pass1_rows; let truncating = false;
-  for (const qid of qualifying) {
-    const n = (deepJidsByQid.get(qid) || []).length;
-    if (!truncating && running + n <= budget) { planned.add(qid); running += n; }
-    else { truncating = true; truncated.push(qid); }
+  const rng = mulberry32(seed);
+  const shuffledA = shuffle(classQids.A, rng), shuffledM = shuffle(classQids.M, rng);   // one continuous stream: A then M
+
+  const order = [];   // alternate A, M, A, M, ...; once one list is exhausted, drain the other
+  for (let i = 0; i < shuffledA.length || i < shuffledM.length; i++) {
+    if (i < shuffledA.length) order.push(shuffledA[i]);
+    if (i < shuffledM.length) order.push(shuffledM[i]);
   }
 
-  const pass2_jids = judgeRows.filter(r => r.tier === 'deep' && planned.has(r.qid)).map(r => r.jid);
-  return { qualifying, truncated, pass2_jids, pass1_rows, pass2_rows: pass2_jids.length };
+  const selected = []; const skipped_budget = [];
+  for (const qid of order) {
+    const n = byQid.get(qid).jids.length;
+    if (n <= remaining) { selected.push(qid); remaining -= n; } else { skipped_budget.push(qid); }
+  }
+
+  const selectedSet = new Set(selected);
+  const pass2_jids = judgeRows.filter(r => r.tier === 'top30' && selectedSet.has(r.qid)).map(r => r.jid);
+
+  return {
+    selected,
+    not_selected: [...skipped_budget],
+    skipped_budget,
+    per_class: {
+      A: { selected: selected.filter(qid => byQid.get(qid).class === 'A'), candidates: classQids.A },
+      M: { selected: selected.filter(qid => byQid.get(qid).class === 'M'), candidates: classQids.M },
+    },
+    pass1_rows,
+    pass2_rows: pass2_jids.length,
+    pass2_jids,
+    budget,
+    remaining_after: remaining,
+  };
 }
