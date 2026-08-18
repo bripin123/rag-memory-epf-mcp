@@ -9,7 +9,7 @@ import { gunzipSync } from 'node:zlib';
 import { orderByDistance } from '../eval/graph-role/lib/purevec.mjs';
 import {
   CONDS, CORPUS_ORDER, expectedFiles, pairsFromFilenames,
-  collectMs, outlierRows, buildManifest, gzipDeterministic, readDriverLog,
+  collectMs, outlierRows, buildManifest, gzipDeterministic, readDriverLog, parseJsonlTolerant,
 } from '../eval/graph-role/lib/manifest.mjs';
 import { sha256File } from '../eval/graph-role/lib/freeze.mjs';
 
@@ -173,6 +173,42 @@ test('readDriverLog: end is null when the driver has not finished yet', () => {
   assert.equal(d.end, null);
   assert.equal(d.steps, 1);
   assert.deepEqual(d.nonzero, []);
+});
+
+// parseJsonlTolerant: the scan-outliers.mjs parse/recovery loop, extracted so the exact edge case
+// the task exists for (a sleep-interrupted, half-written last line) is unit-tested, not just
+// hand-traced. Empty lines (including the one a trailing newline produces) are silently ignored,
+// same as before extraction -- they never reach JSON.parse and never appear in `skipped`.
+
+test('parseJsonlTolerant: normal file with trailing newline -> all rows, no skips', () => {
+  const text = '{"a":1}\n{"a":2}\n{"a":3}\n';
+  const { rows, skipped } = parseJsonlTolerant(text);
+  assert.deepEqual(rows, [{ a: 1 }, { a: 2 }, { a: 3 }]);
+  assert.deepEqual(skipped, []);
+});
+
+test('parseJsonlTolerant: truncated last line -> rows minus the partial one, skipped has one last:true entry', () => {
+  // No trailing newline: the last "line" is a half-written JSON object, exactly what a writer
+  // interrupted mid-append (e.g. by the Mac sleeping) leaves behind.
+  const text = '{"a":1}\n{"a":2}\n{"a":3';
+  const { rows, skipped } = parseJsonlTolerant(text);
+  assert.deepEqual(rows, [{ a: 1 }, { a: 2 }]);
+  assert.equal(skipped.length, 1);
+  assert.equal(skipped[0].line, 3);
+  assert.equal(skipped[0].last, true);
+  assert.equal(typeof skipped[0].error, 'string');
+  assert.ok(skipped[0].error.length > 0);
+});
+
+test('parseJsonlTolerant: corrupted middle line -> skipped with last:false, later rows still parsed', () => {
+  const text = '{"a":1}\n{not valid json\n{"a":3}\n';
+  const { rows, skipped } = parseJsonlTolerant(text);
+  assert.deepEqual(rows, [{ a: 1 }, { a: 3 }]);
+  assert.equal(skipped.length, 1);
+  assert.equal(skipped[0].line, 2);
+  assert.equal(skipped[0].last, false);
+  assert.equal(typeof skipped[0].error, 'string');
+  assert.ok(skipped[0].error.length > 0);
 });
 
 console.log('eval-graph-role-t5b: test file loaded');

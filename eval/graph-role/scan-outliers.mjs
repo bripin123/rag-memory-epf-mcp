@@ -4,7 +4,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { EVAL_DIR } from './lib/paths.mjs';
-import { CORPUS_ORDER, CONDS, outlierRows, pairsFromFilenames } from './lib/manifest.mjs';
+import { CORPUS_ORDER, CONDS, outlierRows, pairsFromFilenames, parseJsonlTolerant } from './lib/manifest.mjs';
 
 const args = process.argv.slice(2); const get = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };
 const dir = get('--dir', join(EVAL_DIR, 'out'));
@@ -17,18 +17,10 @@ for (const name of names) {
   let text;
   try { text = readFileSync(join(dir, name), 'utf8'); }
   catch (e) { console.error(`SKIP ${name}: unreadable (${e instanceof Error ? e.message : String(e)})`); continue; }
-  const lines = text.split('\n');
-  const rows = [];
-  lines.forEach((line, idx) => {
-    if (!line) return;
-    try { rows.push(JSON.parse(line)); }
-    catch {
-      // A concurrent writer can leave the last line half-written; anywhere else is worth a note,
-      // but neither case should crash the scan.
-      if (idx === lines.length - 1) return;
-      console.error(`SKIP ${name}:${idx + 1} unparsable line`);
-    }
-  });
+  const { rows, skipped } = parseJsonlTolerant(text);
+  // A concurrent writer can leave the last line half-written; that one is silent (expected, not
+  // a problem). Anywhere else is worth a note, but neither case should crash the scan.
+  for (const s of skipped) if (!s.last) console.error(`SKIP ${name}:${s.line} unparsable line`);
   const { n, max_ms } = outlierRows(rows, threshold);
   if (n > 0) outlierFiles.push({ file: name, rows: n, max_ms });
 }

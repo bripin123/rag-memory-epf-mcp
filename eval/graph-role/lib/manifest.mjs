@@ -67,6 +67,22 @@ export function outlierRows(rows, threshold) {
   return { n, max_ms };
 }
 
+// Parses JSONL text one line at a time, skipping (not throwing on) any line JSON.parse rejects --
+// in particular a half-written last line, the shape a concurrent writer leaves behind when
+// interrupted mid-append (e.g. by the Mac sleeping). Empty lines, including the one a trailing
+// newline produces, are not attempted and never appear in `skipped`. `line` is 1-based, matching
+// the SKIP notes scan-outliers.mjs used to print inline before this loop was extracted here.
+export function parseJsonlTolerant(text) {
+  const lines = text.split('\n');
+  const rows = []; const skipped = [];
+  lines.forEach((line, idx) => {
+    if (!line) return;
+    try { rows.push(JSON.parse(line)); }
+    catch (e) { skipped.push({ line: idx + 1, last: idx === lines.length - 1, error: e instanceof Error ? e.message : String(e) }); }
+  });
+  return { rows, skipped };
+}
+
 const DATA_KINDS = new Set(['candidates', 'final', 'purevec']);
 function kindOf(file) {
   if (file.endsWith('.jsonl')) { const prefix = file.split('.')[0]; return DATA_KINDS.has(prefix) ? prefix : 'other'; }
