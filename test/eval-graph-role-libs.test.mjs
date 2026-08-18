@@ -117,4 +117,27 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   assert.deepEqual(plan.pass2_jids, ['q2_deep_a', 'q2_deep_b'], 'deep jids of planned queries only, in judge.jsonl file order');
   console.log('  OK: planDeep — saturation, qualification, ascending-qid budget truncation, judge.jsonl-order jids');
 }
+// pooling: naturalCompare — "ascending qid order" must be natural (numeric within digit runs), not lexicographic.
+// Real ids are `<corpus>-<class>-<n>` with unpadded n (hub-A-1..hub-A-53), where default string sort is wrong
+// (would put hub-A-10 before hub-A-2). This case uses multi-digit ids that diverge under the two orderings.
+{
+  const { planDeep, naturalCompare } = await import('../eval/graph-role/lib/pooling.mjs');
+  assert.ok(naturalCompare('q-2', 'q-10') < 0, 'q-2 before q-10 under natural order (default string sort would reverse this)');
+  assert.ok(naturalCompare('q-10', 'q-2') > 0);
+  assert.equal(naturalCompare('q-1', 'q-1'), 0);
+  assert.deepEqual(['q-2', 'q-10', 'q-1'].sort(naturalCompare), ['q-1', 'q-2', 'q-10'], 'natural sort ascending');
+  assert.deepEqual(['q-2', 'q-10', 'q-1'].sort(), ['q-1', 'q-10', 'q-2'], 'default string sort puts q-10 before q-2 -- the bug naturalCompare fixes');
+
+  // planDeep itself must use natural order for both the qualifying scan and the truncation walk.
+  const mkTop30 = (qid) => ({ qid, chunk_id: `${qid}c1`, doc_id: `${qid}d1`, jid: `${qid}c1`, tier: 'top30', channels: ['vector'], conds: ['real'] });
+  const mkDeep = (qid) => ({ qid, chunk_id: `${qid}x1`, doc_id: `${qid}d9`, jid: `${qid}_deep`, tier: 'deep', channels: [], conds: [] });
+  const ids = ['q-2', 'q-10', 'q-1'];   // deliberately out of natural order in the input
+  const poolRows = ids.flatMap(qid => [mkTop30(qid), mkDeep(qid)]);
+  const judgeRows = ids.flatMap(qid => [{ jid: `${qid}c1`, tier: 'top30', qid }, { jid: `${qid}_deep`, tier: 'deep', qid }]);
+  const grades = new Map(ids.map(qid => [`${qid}c1`, 2]));   // every query's one top30 doc is relevant, found by exactly 1 channel -> all 3 qualify
+  const plan = planDeep({ poolRows, judgeRows, grades, budget: 5 });   // pass1_rows=3 (one top30 row each); budget fits exactly 2 queries' single deep row
+  assert.deepEqual(plan.qualifying, ['q-1', 'q-2', 'q-10'], 'qualifying scan must use natural order, not default string sort (which would give q-1,q-10,q-2)');
+  assert.deepEqual(plan.truncated, ['q-10'], 'natural order: q-1(3+1=4) then q-2(4+1=5) fit budget 5, q-10(5+1=6) overflows -- under default string sort order it would be q-2 that truncates instead');
+  console.log('  OK: naturalCompare — digit runs numeric, ascending id order for qualifying scan and truncation');
+}
 console.log('eval-graph-role-libs: ALL OK');

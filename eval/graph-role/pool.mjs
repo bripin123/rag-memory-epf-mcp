@@ -16,7 +16,6 @@ const add = (qid, ids, tier, channel, cond) => {
     if (!id) continue;
     let cur = s.get(id); if (!cur) { cur = { tier: 'deep', channels: new Set(), conds: new Set() }; s.set(id, cur); }
     if (tier === 'top30') { cur.tier = 'top30'; cur.channels.add(channel); cur.conds.add(cond); }
-    else if (cur.tier !== 'top30') { cur.tier = 'deep'; }
   }
   pooled.set(qid, s);
 };

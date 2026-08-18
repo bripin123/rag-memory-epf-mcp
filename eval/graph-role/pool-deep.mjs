@@ -6,10 +6,15 @@ const label = process.argv[2];
 if (!label) { console.error('usage: pool-deep.mjs <corpus>'); process.exit(2); }
 const th = JSON.parse(readFileSync(join(EVAL_DIR, 'thresholds.json'), 'utf8'));
 const readJsonl = (p) => readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(r => !r.meta);
-const poolRows = readJsonl(join(EVAL_DIR, 'pool', `${label}.pool.jsonl`));
-const judgeRows = readJsonl(join(EVAL_DIR, 'pool', `${label}.judge.jsonl`));
-const A = new Map(readJsonl(join(EVAL_DIR, 'pool', `${label}.judge-A.jsonl`)).map(r => [r.jid, r.grade]));
-const B = new Map(readJsonl(join(EVAL_DIR, 'pool', `${label}.judge-B.jsonl`)).map(r => [r.jid, r.grade]));
+const poolP = join(EVAL_DIR, 'pool', `${label}.pool.jsonl`), judgeP = join(EVAL_DIR, 'pool', `${label}.judge.jsonl`);
+if (!existsSync(poolP) || !existsSync(judgeP)) { console.error('POOL_INCOMPLETE run pool.mjs first'); process.exit(7); }
+const poolRows = readJsonl(poolP);
+const judgeRows = readJsonl(judgeP);
+const Ap = join(EVAL_DIR, 'pool', `${label}.judge-A.jsonl`), Bp = join(EVAL_DIR, 'pool', `${label}.judge-B.jsonl`);
+const missingJudgeFiles = [Ap, Bp].filter(p => !existsSync(p));
+if (missingJudgeFiles.length) { console.error(`JUDGE_INCOMPLETE missing ${missingJudgeFiles.map(p => p.split('/').pop()).join(', ')}`); process.exit(11); }
+const A = new Map(readJsonl(Ap).map(r => [r.jid, r.grade]));
+const B = new Map(readJsonl(Bp).map(r => [r.jid, r.grade]));
 const Cp = join(EVAL_DIR, 'pool', `${label}.adjudicated.jsonl`); const C = existsSync(Cp) ? new Map(readJsonl(Cp).map(r => [r.jid, r.grade])) : new Map();
 // Pass-1 grades only: every top30 row must already have both A and B before deep planning can run.
 const top30 = judgeRows.filter(r => r.tier === 'top30');
