@@ -12,8 +12,20 @@ const SETS = ['pass1', 'pass2', 'unpooled', 'deepsample'];
 const srcFile = (set) => ({ pass1: `${label}.judge.jsonl`, pass2: `${label}.judge-pass2.jsonl`, unpooled: `${label}.unpooled.jsonl`, deepsample: `${label}.deepsample.jsonl` }[set]);
 
 if (cmd === 'split') {
-  const set = get('--set'); const size = Number(get('--size', 25)); const contextChars = Number(get('--context-chars', 500));
+  const set = get('--set');
   if (!label || !SETS.includes(set)) { console.error('usage: judge-batches.mjs split <corpus> --set pass1|pass2|unpooled|deepsample [--size N] [--context-chars N]'); process.exit(2); }
+  // Defensive numeric flags: a flag with no value or a non-numeric/out-of-range value must exit 2 with a
+  // usage message naming the flag, not silently become NaN (Number(undefined) is NaN, which used to sail
+  // through and either hang splitRows forever or corrupt context_chars).
+  const getNum = (flag, d, min) => {
+    const i = rest.indexOf(flag);
+    if (i < 0) return d;
+    const v = Number(rest[i + 1]);
+    if (!Number.isInteger(v) || v < min) { console.error(`usage: judge-batches.mjs split <corpus> --set pass1|pass2|unpooled|deepsample [--size N] [--context-chars N] (${flag} needs an integer >= ${min}, got ${JSON.stringify(rest[i + 1])})`); process.exit(2); }
+    return v;
+  };
+  const size = getNum('--size', 25, 1);
+  const contextChars = getNum('--context-chars', 500, 0);
   const srcP = join(poolDir, srcFile(set));
   if (!existsSync(srcP)) { console.error(`POOL_INCOMPLETE missing ${srcFile(set)}`); process.exit(7); }
   const rows = set === 'pass1' ? readJsonl(srcP).filter(r => r.tier === 'top10') : readJsonl(srcP);
@@ -48,7 +60,7 @@ if (cmd === 'split') {
     const existingLines = existsSync(outP) ? readJsonl(outP) : [];
     const existingHeader = existingLines[0]?.meta ? existingLines[0] : null;
     const existingRows = existingHeader ? existingLines.slice(1) : existingLines;
-    const header = existingHeader || { meta: true, judge, model: meta?.model ?? null, models: [...models], at: now };
+    const header = existingHeader || { meta: true, judge, model: meta?.model ?? null, models: [...models], at: now, ...(judge === 'C' ? { role: 'adjudicator' } : {}) };
     const merged = mergeRows(existingRows, validRows);
     writeFileSync(outP, [header, ...merged].map(r => JSON.stringify(r)).join('\n') + '\n');
     console.log(`${label}/${set}/${judge}: ${merged.length - existingRows.length} new of ${validRows.length} rows merged into ${outP.split('/').pop()} (${merged.length} total) · ${index.batches.length} batches ok`);

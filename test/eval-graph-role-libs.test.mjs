@@ -141,7 +141,9 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   const b1 = splitRows(many, 1);
   assert.equal(b1.length, 12);
   assert.deepEqual([b1[8].nnn, b1[9].nnn, b1[11].nnn], ['009', '010', '012'], 'zero-padding stays 3 digits past 9 batches');
-  console.log('  OK: splitRows — batch sizes and zero-padded NNN naming');
+  for (const bad of [0, -1, NaN, 2.5]) assert.throws(() => splitRows(rows, bad), /size must be an integer >= 1/, `size ${bad} must throw`);
+  assert.equal(splitRows(rows, 1).length, 7, 'size 1 (the minimum) still works');
+  console.log('  OK: splitRows — batch sizes, zero-padded NNN naming, size guard (integer >= 1)');
 }
 // judging: wordCount — whitespace-delimited word count for the 25-word rationale cap
 {

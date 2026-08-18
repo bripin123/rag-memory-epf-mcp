@@ -7,8 +7,11 @@ export function wordCount(s) {
 }
 
 // Split `rows` into batches of at most `size`, each tagged with a zero-padded 3-digit batch number ("001",
-// "002", ...) for the `<set>-NNN.jsonl` filename convention. Order-preserving, no shuffling.
+// "002", ...) for the `<set>-NNN.jsonl` filename convention. Order-preserving, no shuffling. `size` must be a
+// finite integer >= 1 -- 0/negative would loop forever (i never advances) and NaN would silently yield one
+// empty batch, so both are rejected up front instead.
 export function splitRows(rows, size) {
+  if (!Number.isInteger(size) || size < 1) throw new Error('size must be an integer >= 1');
   const batches = [];
   for (let i = 0; i < rows.length; i += size) {
     const chunk = rows.slice(i, i + size);
