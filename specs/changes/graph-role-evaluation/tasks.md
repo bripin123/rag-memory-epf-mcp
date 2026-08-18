@@ -15,7 +15,7 @@
   완료 기준: 3 corpus × (K 60 + A 30 + M 30) 검증 통과 · FREEZE 해시 = 파일 · commit 해시 · `out/` 비어 있음(어떤 러너도 이 전에 안 돌았다는 증거) · observed 파일 3개.
 - [x] **T4 대조군 사본** — `lib/controls.mjs`(directed degree-preserving double-edge swap · type-preserving swap · ER) · `make-controls.mjs --corpus <c>` → shuffled-r0..19 · typeshuf-r0..4 · random 사본 26개/corpus + 노드별 (in,out) 검증(실패 exit 6) + mixing 로그.
   완료 기준: R5 시나리오 pure 테스트(합성 그래프 · 노드별 degree 동일 · self-loop 0 · duplicate 0) GREEN · 3 corpus × 26 사본 · 검증 로그.
-- [ ] **T5 채널·최종 랭킹 러너** — `lib/stages.mjs`(seam 호출 → chunk link → 채널 9종 at K∈{10,30,100} · chunk-K/document-K · graph-reach · 점수 전파·tie-break · warm/cold ms) · `run-candidates.mjs --corpus <c> --cond <cond>` → `out/candidates.<c>.<cond>.jsonl` · `run-final.mjs --corpus <c> --cond <cond>`(제품 off/on · 고정 pool 재랭킹 · ms) → `out/final.<c>.<cond>.jsonl`. dev 전 조건 실행(real · shuffled-r0..19 · typeshuf-r0..4 · random) — 프로세스 한 번에 하나.
+- [x] **T5 채널·최종 랭킹 러너** — `lib/stages.mjs`(seam 호출 → chunk link → 채널 9종 at K∈{10,30,100} · chunk-K/document-K · graph-reach · 점수 전파·tie-break · warm/cold ms) · `run-candidates.mjs --corpus <c> --cond <cond>` → `out/candidates.<c>.<cond>.jsonl` · `run-final.mjs --corpus <c> --cond <cond>`(제품 off/on · 고정 pool 재랭킹 · ms) → `out/final.<c>.<cond>.jsonl`. dev 전 조건 실행(real · shuffled-r0..19 · typeshuf-r0..4 · random) — 프로세스 한 번에 하나.
   완료 기준: R3 pure 테스트(예산 · 결정성 · RRF 컷) GREEN · 3 corpus × 26 조건 × 2 러너 산출 · degraded 0 · `unfrozen:false`.
 - [ ] **T6 pooling·판정·qrel 동결** — `pool.mjs`(모든 채널×조건 + 최종 top-10 · 깊이 100 증분 · real 만이면 exit 7 · 채널 정보 제거 판정 입력 + 문서 제목·인접 청크) · `suite/JUDGING.md`(판정자 A/B/C · temperature · 순서 seed · 루브릭) · 판정 2회 + 조정 · `judge-merge.mjs`(weighted κ 게이트 0.67 · 불일치 목록 · 등급 decision-grade/provisional) · unpooled 100/corpus missed-relevant · `suite/human-audit.<c>.jsonl` 자리(사용자 audit 50쌍/corpus — 하면 decision-grade) · FREEZE 2차.
   완료 기준: A·M 60/corpus 전부 판정 · κ ≥ 0.67(미달 시 재판정 기록) · 조정 후 불일치 0 · missed-relevant rate · qrels 해시 FREEZE.
@@ -23,6 +23,7 @@
   완료 기준: 3 corpus 산출 · provenance 규칙 pure 테스트 GREEN.
 - [ ] **T8 통계·보고 + 검정력 산정** — `lib/metrics.mjs`(recall@K doc · MRR · nDCG@10 · hit@k · sign test 정확 이항 · bootstrap 10,000 고정 seed · cluster 지정 · 비열등성 CI · Holm) · `report.mjs`(primary 5 endpoint gatekeeping · corpus별 + stratified macro · n/usable) → `out/report.md` · `power.mjs`(pilot 짝지은 Δ SD·불일치율 → 검정력 0.8 · corpus 별 holdout N · 판정 예산 대비) → `suite/POWER.md` + FREEZE.
   완료 기준: metrics pure 테스트(손계산 fixture) GREEN · report.md · POWER.md(N 표 · 예산 초과 여부) · **Stage 1 결론 = provisional 표시**.
+  ↳ 완료 2026-08-18: 5a 러너·드라이버(27조건 = real + shuffled 20 + typeshuf 5 + random → 162 파일) · 5b `run-purevec.mjs`(pure-vector 사후 채널 · real 사본만 · `vector` 채널 = product base ranking(no graph)) · `scan-outliers.mjs`(sleep outlier 1쌍 재실행) · `make-manifest.mjs`(`out/MANIFEST.json` + 결정적 gz 84 · 원본 jsonl 은 git 제외 = R12 amendment). ledger `.superpowers/sdd/2026-08-17-graph-role-evaluation-stage1/progress.md`.
 
 ## Stage 2 — holdout 실행 · 결정 · 후속 change 개설 (플랜 = POWER.md 뒤 작성)
 
