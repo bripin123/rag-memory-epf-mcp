@@ -577,4 +577,65 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   console.log('  OK: weightedPrecision — totalPrev===0 guard returns null');
 }
 
+// paired endpoint constructors — the shared definitions report.mjs prints and
+// power.mjs turns into a holdout N. Fixtures are three hand-built rows.
+{
+  const M = await import('../eval/graph-role/lib/metrics.mjs');
+  const qrows = [
+    { id: 'k1', class: 'K', family: 'd1', document_id: 'd1', oracle_chunk_id: 'd1_chunk_0' },
+    { id: 'k2', class: 'K', family: 'd2', document_id: 'd2', oracle_chunk_id: 'd2_chunk_0' },
+    { id: 'a1', class: 'A', family: 'fam', source_docs: ['g1'] },
+    { id: 'm1', class: 'M', family: 'g2', source_docs: ['g1'] },
+    { id: 'a2', class: 'A', family: 'fam2', source_docs: [] },          // no gold -> never usable
+  ];
+  const byId = new Map(qrows.map(r => [r.id, r]));
+  const au = M.buildAuthoredGold(qrows);
+  const top = (...ids) => ids.map(id => ({ chunk_id: id }));
+
+  const fin = [
+    // k1: oracle at rank 1 off, rank 7 on  -> hit@5 1 -> 0 = -1
+    { id: 'k1', class: 'K', off: { top10: top('d1_chunk_0', 'x_chunk_0') }, on: { top10: top('x_chunk_0', 'y_chunk_0', 'y_chunk_1', 'y_chunk_2', 'y_chunk_3', 'y_chunk_4', 'd1_chunk_0') }, fixedpool_rerank: { base: [], with_graph: [] } },
+    // k2: oracle absent off, rank 2 on -> 0 -> 1 = +1
+    { id: 'k2', class: 'K', off: { top10: top('z_chunk_0') }, on: { top10: top('z_chunk_0', 'd2_chunk_0') }, fixedpool_rerank: { base: [], with_graph: [] } },
+    // a1: base puts gold g1 second, with_graph first -> nDCG 1/log2(3) -> 1, both over ideal 1
+    { id: 'a1', class: 'A', off: { top10: [] }, on: { top10: [] }, fixedpool_rerank: { base: ['x_chunk_0', 'g1_chunk_0'], with_graph: ['g1_chunk_0', 'x_chunk_0'] } },
+    { id: 'a2', class: 'A', off: { top10: [] }, on: { top10: [] }, fixedpool_rerank: { base: ['x_chunk_0'], with_graph: ['x_chunk_0'] } },
+  ];
+  const k = M.kSafetyDeltas(fin, byId);
+  assert.deepEqual(k.deltas, [-1, 1], 'hit@5 on-off per K query');
+  assert.deepEqual(k.clusters, ['d1', 'd2'], 'K cluster = document');
+  assert.deepEqual([k.n, k.usable], [2, 2]);
+
+  const r = M.rerankDeltas(fin, byId, au);
+  assert.equal(r.usable, 1, 'a2 has no gold -> not usable; K rows are excluded');
+  assert.equal(r.n, 2, 'n counts every A/M final row, gold or not');
+  assert.ok(Math.abs(r.deltas[0] - (1 - 1 / Math.log2(3))) < 1e-12, 'gold moved rank2 -> rank1: 1 - 1/log2(3)');
+  assert.deepEqual(r.clusters, ['fam']);
+
+  const cand = [
+    { id: 'a1', class: 'A', channels: { rrf3: { chunk10: ['g1_chunk_0'], chunk30: ['g1_chunk_0'] }, rrf2: { chunk10: ['x_chunk_0'], chunk30: ['x_chunk_0'] } } },
+    { id: 'm1', class: 'M', channels: { rrf3: { chunk10: ['x_chunk_0'], chunk30: ['x_chunk_0'] }, rrf2: { chunk10: ['g1_chunk_0'], chunk30: ['g1_chunk_0', 'g2_chunk_0'] } } },
+    { id: 'a2', class: 'A', channels: { rrf3: { chunk10: [], chunk30: [] }, rrf2: { chunk10: [], chunk30: [] } } },
+    { id: 'k1', class: 'K', channels: { rrf3: { chunk10: [], chunk30: [] }, rrf2: { chunk10: [], chunk30: [] } } },
+  ];
+  const c = M.candidateDeltas(cand, byId, au);
+  assert.deepEqual([c.n, c.usable], [3, 2], 'K excluded from n; a2 (no gold) excluded from usable');
+  assert.deepEqual(c.deltas, [1, -1], 'a1: 1-0 · m1 gold {g1,g2}: 0 - 1 = -1');
+  assert.deepEqual(c.clusters, ['fam', 'g2']);
+
+  // judged gold at depth 10 cannot support recall@30 -> usable collapses to the depth-30 queries
+  const j = M.buildJudgedGold([
+    { qid: 'a1', doc_id: 'g1', chunk_id: 'g1_chunk_0', grade: 2, judged_depth: 10, qrels_grade: 'LLM-judged provisional' },
+    { qid: 'm1', doc_id: 'g1', chunk_id: 'g1_chunk_0', grade: 1, judged_depth: 30, qrels_grade: 'LLM-judged provisional' },
+  ]);
+  const cj = M.candidateDeltas(cand, byId, j, 30);
+  assert.equal(cj.usable, 1, 'only m1 was judged to depth 30');
+  const cj10 = M.candidateDeltas(cand, byId, j, 10, 'rrf3', 'rrf2');
+  assert.equal(cj10.n, 3, 'K still excluded at K=10');
+  assert.equal(cj10.usable, 2, 'at K=10 the depth-30 gate does not apply — every judged query counts');
+  const rj = M.rerankDeltas(fin, byId, j);
+  assert.equal(rj.usable, 1, 'nDCG@10 is estimable for every judged query (a1, depth 10)');
+  console.log('  OK: kSafety/candidate/rerank delta constructors (depth gating, K exclusion, clusters)');
+}
+
 console.log('eval-graph-role-libs: ALL OK');
