@@ -57,7 +57,9 @@ const CHANNELS = ['vector', 'fts', 'graph-seed', 'graph-n1', 'graph-n2', 'graph-
 const lines = [];
 const badDenominator = [];
 const line = (s) => lines.push(s);
-const metric = (s) => { if (!/n=/.test(s) || !/usable=/.test(s)) badDenominator.push(s); lines.push(s); };
+// R8's denominator rule as a gate, plus the gold-source rule from the T8 dispatch:
+// a metric line must say what it was computed over AND which gold it used.
+const metric = (s) => { if (!/n=/.test(s) || !/usable=/.test(s) || !/gold=/.test(s)) badDenominator.push(s); lines.push(s); };
 
 const manifest = existsSync(P('out', 'MANIFEST.json')) ? JSON.parse(readFileSync(P('out', 'MANIFEST.json'), 'utf8')) : null;
 
@@ -83,7 +85,7 @@ for (const label of CORPORA) {
   const cand = readJsonl(candPath);
   const fin = readJsonl(P('out', `final.${label}.real.jsonl`));
   const pv = readJsonl(P('out', `purevec.${label}.jsonl`));
-  if (!Qall.length || !cand.length) { line(`## ${label}`); line(''); metric(`- inputs missing: queries=${Qall.length} candidates=${cand.length} → nothing to report · n=0 usable=0`); line(''); continue; }
+  if (!Qall.length || !cand.length) { line(`## ${label}`); line(''); metric(`- inputs missing: queries=${Qall.length} candidates=${cand.length} → nothing to report · gold=none · n=0 usable=0`); line(''); continue; }
 
   const q = new Map(Qall.map(x => [x.id, x]));
   const measuredIds = new Set(cand.map(c => c.id));
@@ -132,7 +134,7 @@ for (const label of CORPORA) {
   const slo = th.latency_slo_ms.warm_p95_max;
   const over = [...chMs.filter(x => x.p95 !== null && x.p95 > slo).map(x => x.c),
                 ...(offP95 > slo ? ['final.off'] : []), ...(onP95 > slo ? ['final.on'] : []), ...(rrP95 > slo ? ['fixedpool_rerank'] : [])];
-  metric(`- **(2) latency-SLO** warm p95 ms ≤ ${slo} → **${allWarm.length ? (over.length ? 'FAIL' : 'PASS') : 'not estimable'}**${over.length ? ` (over: ${over.join(', ')})` : ''} · channels ${chMs.map(x => `${x.c}=${x.p95 ?? 'n/a'}`).join(' · ')} · final off/on=${offP95 ?? 'n/a'}/${onP95 ?? 'n/a'} · fixedpool_rerank=${rrP95 ?? 'n/a'} · cold p95=${coldP95 ?? 'n/a'} (recorded, not gated) · rrf2/rrf3/rrf3-n2 are fused in-process and carry no ms (excluded) · measured under light concurrent load, **this run only** · n=${cand.length} usable=${warm.length} (first row dropped: process warm-up)`);
+  metric(`- **(2) latency-SLO** (gold=n/a — latency is gold-independent) warm p95 ms ≤ ${slo} → **${allWarm.length ? (over.length ? 'FAIL' : 'PASS') : 'not estimable'}**${over.length ? ` (over: ${over.join(', ')})` : ''} · channels ${chMs.map(x => `${x.c}=${x.p95 ?? 'n/a'}`).join(' · ')} · final off/on=${offP95 ?? 'n/a'}/${onP95 ?? 'n/a'} · fixedpool_rerank=${rrP95 ?? 'n/a'} · cold p95=${coldP95 ?? 'n/a'} (recorded, not gated) · rrf2/rrf3/rrf3-n2 are fused in-process and carry no ms (excluded) · measured under light concurrent load, **this run only** · n=${cand.length} usable=${warm.length} (first row dropped: process warm-up)`);
 
   // ---- gold-source dependent endpoints (3) (4) (5) ------------------------------
   const AMcand = cand.filter(c => c.class !== 'K');
@@ -193,7 +195,7 @@ for (const label of CORPORA) {
     perSource[src.source] = { cd, ccl, cP, cci, rd, rcl, rP, rci, pNull, pNullAdd1, realN1, nullMean, dSem, semVerdict };
   }
 
-  if (!judged) metric(`- judged-gold block: **qrels absent** — \`suite/qrels.${label}.jsonl\` not written yet; no judged numbers are shown or imputed · n=0 usable=0`);
+  if (!judged) metric(`- judged-gold block · gold=judged: **qrels absent** — \`suite/qrels.${label}.jsonl\` not written yet; no judged numbers are shown or imputed · n=0 usable=0`);
 
   // ---- Holm over the pre-declared efficacy family (3) ---------------------------
   const ps = perSource[primary.source];
@@ -238,7 +240,7 @@ for (const label of CORPORA) {
     const rec = (get, KK) => f2(M.mean(amPv.map(c => M.recallAtKDoc(get(c), goldOf(c.id), docOf, KK))));
     metric(`- pure-vector channel (separate run, real only) recall@10/@30(doc), A+M · gold=${src.source}: purevec=${rec(c => pvm.get(c.id).channels.purevec.chunk10, 10)}/${rec(c => pvm.get(c.id).channels.purevec.chunk30, 30)} · fts=${rec(c => pvm.get(c.id).channels.fts.chunk10, 10)}/${rec(c => pvm.get(c.id).channels.fts.chunk30, 30)} · **RRF(purevec,fts)**=${rec(c => pvm.get(c.id).channels['rrf-purevec-fts'].chunk10, 10)}/${rec(c => pvm.get(c.id).channels['rrf-purevec-fts'].chunk30, 30)} vs **rrf2**(product base ∪ fts)=${rec(c => c.channels.rrf2.chunk10, 10)}/${rec(c => c.channels.rrf2.chunk30, 30)} · n=${amDepthOk.length} usable=${amPv.length}`);
   } else {
-    metric(`- pure-vector channel: \`out/purevec.${label}.jsonl\` not present — not run · n=0 usable=0`);
+    metric(`- pure-vector channel: \`out/purevec.${label}.jsonl\` not present — not run · gold=${src.source} (nothing to score) · n=0 usable=0`);
   }
   // alternative control families: type-preserving swap (R=5) and same-|E| random (R=1).
   // The pre-registered null for endpoint (4) is the degree-preserving shuffle; these are
@@ -261,7 +263,7 @@ for (const label of CORPORA) {
   }
   // seam / reach descriptive
   const seamStatus = {}; for (const c of cand) seamStatus[c.seam_status] = (seamStatus[c.seam_status] || 0) + 1;
-  metric(`- seam status distribution: ${Object.entries(seamStatus).map(([k, v]) => `${k}=${v}`).join(' · ')} · mean seeds ${f2(M.mean(cand.map(c => c.seeds.length)))} · mean 1-hop connected ${f2(M.mean(cand.map(c => c.n_connected)))} · mean 2-hop entities ${f2(M.mean(cand.map(c => c.n2_count)))} · mean reach chunks ${f2(M.mean(cand.map(c => c.reach.chunks)))} / docs ${f2(M.mean(cand.map(c => c.reach.docs_n ?? (c.reach.docs?.length ?? 0))))} · **reachable-set recall (\`graph-reach\`, D4) is not computable from these outputs** — the runner recorded the reach set SIZES, not the set, so no recall can be derived without re-running · n=${cand.length} usable=${cand.length}`);
+  metric(`- seam status distribution (gold=n/a — run diagnostics, not a retrieval metric): ${Object.entries(seamStatus).map(([k, v]) => `${k}=${v}`).join(' · ')} · mean seeds ${f2(M.mean(cand.map(c => c.seeds.length)))} · mean 1-hop connected ${f2(M.mean(cand.map(c => c.n_connected)))} · mean 2-hop entities ${f2(M.mean(cand.map(c => c.n2_count)))} · mean reach chunks ${f2(M.mean(cand.map(c => c.reach.chunks)))} / docs ${f2(M.mean(cand.map(c => c.reach.docs_n ?? (c.reach.docs?.length ?? 0))))} · **reachable-set recall (\`graph-reach\`, D4) is not computable from these outputs** — the runner recorded the reach set SIZES, not the set, so no recall can be derived without re-running · n=${cand.length} usable=${cand.length}`);
   // upstream
   const up = readJsonl(P('out', `upstream.${label}.jsonl`));
   const lpPath = P('out', `link-precision.${label}.json`);
@@ -270,14 +272,14 @@ for (const label of CORPORA) {
     const evT = up.reduce((a, u) => a + (u.edge_validity?.total ?? 0), 0), evE = up.reduce((a, u) => a + (u.edge_validity?.exists ?? 0), 0);
     const prVals = up.map(u => u.projection_recall).filter(x => x !== null && x !== undefined);
     const sr = up.filter(u => u.seed_recall).length;
-    metric(`- upstream gates (D5): seed_recall ${sr}/${up.length} = ${f3(sr / up.length)} vs ≥${th.upstream_gate.seed_recall_min} · edge_validity ${evE}/${evT} = ${f3(evT ? evE / evT : null)} vs ≥${th.upstream_gate.edge_validity_min} · projection_recall mean ${f3(M.mean(prVals))} · n=${up.length} usable=${up.length}`);
+    metric(`- upstream gates (D5) · gold=authored (the suite's \`seed_candidates\` and \`expected_paths\`): seed_recall ${sr}/${up.length} = ${f3(sr / up.length)} vs ≥${th.upstream_gate.seed_recall_min} · edge_validity ${evE}/${evT} = ${f3(evT ? evE / evT : null)} vs ≥${th.upstream_gate.edge_validity_min} · projection_recall mean ${f3(M.mean(prVals))} · n=${up.length} usable=${up.length}`);
   } else {
-    metric(`- upstream gates: \`out/upstream.${label}.jsonl\` absent — **upstream not run** · n=0 usable=0`);
+    metric(`- upstream gates · gold=authored: \`out/upstream.${label}.jsonl\` absent — **upstream not run** · n=0 usable=0`);
   }
   if (lp) {
-    metric(`- link precision: name ${lp.by_provenance?.name?.precision ?? 'n/a'} (n=${lp.by_provenance?.name?.n ?? 0}) vs ≥${th.upstream_gate.link_precision_name_min} · nonliteral ${lp.by_provenance?.nonliteral?.precision ?? 'n/a'} (n=${lp.by_provenance?.nonliteral?.n ?? 0}) · weighted ${lp.weighted_precision ?? 'n/a'} CI ${JSON.stringify(lp.ci95 ?? null)} · n=${lp.pairs ?? 0} usable=${lp.chunks ?? 0} chunk clusters`);
+    metric(`- link precision · gold=link-audit judge (a separate mention judgement, not qrels): name ${lp.by_provenance?.name?.precision ?? 'n/a'} (n=${lp.by_provenance?.name?.n ?? 0}) vs ≥${th.upstream_gate.link_precision_name_min} · nonliteral ${lp.by_provenance?.nonliteral?.precision ?? 'n/a'} (n=${lp.by_provenance?.nonliteral?.n ?? 0}) · weighted ${lp.weighted_precision ?? 'n/a'} CI ${JSON.stringify(lp.ci95 ?? null)} · n=${lp.pairs ?? 0} usable=${lp.chunks ?? 0} chunk clusters`);
   } else {
-    metric(`- link precision: \`out/link-precision.${label}.json\` absent — **link audit not merged** (judge-A verdicts pending) · n=0 usable=0`);
+    metric(`- link precision · gold=link-audit judge: \`out/link-precision.${label}.json\` absent — **link audit not merged** (judge-A verdicts pending) · n=0 usable=0`);
   }
   line('');
 
@@ -293,9 +295,14 @@ const macro = (key) => {
   return { v: vals.length ? M.mean(vals) : null, k: vals.length };
 };
 const mc = macro('cd'), mr = macro('rd');
-metric(`- candidate Δrecall@30(doc) macro ${f3(mc.v)} · rerank ΔnDCG@10 macro ${f3(mr.v)} · gold per corpus = ${labels.map(l => `${l}:${summary[l].primary}`).join(' ')} · n=${labels.length} usable=${Math.max(mc.k, mr.k)} corpora`);
+metric(`- candidate Δrecall@30(doc) macro ${f3(mc.v)} · rerank ΔnDCG@10 macro ${f3(mr.v)} · gold=per-corpus primary (${labels.map(l => `${l}:${summary[l].primary}`).join(' ')}) · n=${labels.length} usable=${Math.max(mc.k, mr.k)} corpora`);
 const semPass = labels.filter(l => summary[l].semVerdict === 'PASS').length;
-metric(`- K-safety per corpus ${labels.map(l => `${l}:${summary[l].kVerdict}`).join(' ')} · latency-SLO ${labels.map(l => `${l}:${summary[l].sloVerdict}`).join(' ')} · semantics PASS ${semPass}/${labels.length} · n=${labels.length} usable=${labels.length}`);
+metric(`- K-safety per corpus ${labels.map(l => `${l}:${summary[l].kVerdict}`).join(' ')} · latency-SLO ${labels.map(l => `${l}:${summary[l].sloVerdict}`).join(' ')} · semantics PASS ${semPass}/${labels.length} · gold=per-corpus primary · n=${labels.length} usable=${labels.length}`);
+// Branch ② of the D8 table needs "point >= MCID in >= 2/3 corpora"; report the count as an
+// input, not as a verdict — the branch itself is run-decision.mjs's on holdout.
+const geMcid = (key, mcid) => labels.filter(l => { const m = M.mean(summary[l][key]); return m !== null && m >= mcid; }).length;
+const ciAbove0 = (key) => labels.filter(l => { const ci = summary[l][key === 'cd' ? 'cci' : 'rci']; return ci && ci[0] > 0; }).length;
+metric(`- Stage 2 branch inputs (counts only — the branch is decided on holdout): candidate point ≥ MCID ${th.MCID_candidate_recall30_doc} in ${geMcid('cd', th.MCID_candidate_recall30_doc)}/${labels.length} corpora, unadjusted CI lower > 0 in ${ciAbove0('cd')}/${labels.length} · rerank point ≥ MCID ${th.MCID_rerank_ndcg10} in ${geMcid('rd', th.MCID_rerank_ndcg10)}/${labels.length}, CI lower > 0 in ${ciAbove0('rd')}/${labels.length} · gold=per-corpus primary · n=${labels.length} usable=${labels.length}`);
 line('');
 line('## Reading this report');
 line('');
