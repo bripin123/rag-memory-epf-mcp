@@ -355,4 +355,226 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   console.log('  OK: bootstrapCI — degenerate-rng exactness, determinism, bounds sanity');
 }
 
+// ---------------------------------------------------------------------------
+// Task 8 — metrics library + the two gold sources report.mjs/power.mjs share.
+// Every fixture below is hand-computed; the comment carries the arithmetic so a
+// reviewer can re-derive the expected value without running the code.
+// ---------------------------------------------------------------------------
+
+// Step 1 fixture block from the task brief, kept verbatim.
+{
+  const M = await import('../eval/graph-role/lib/metrics.mjs');
+  assert.equal(M.hitAtK(1, 1), 1); assert.equal(M.hitAtK(-1, 5), 0);
+  assert.equal(M.hitAtK(0, 5), 0, 'rank 0 = "not found" (findIndex(-1)+1), never a hit');
+  const docOf = id => id.split('_')[0];
+  assert.equal(M.recallAtKDoc(['d1_c1', 'd2_c1', 'd3_c1'], new Set(['d2', 'd9']), docOf, 2), 0.5);
+  assert.equal(M.mrrDoc(['d1_c1', 'd2_c1'], new Set(['d2']), docOf), 0.5);
+  const grade = { d1: 2, d2: 1 };
+  const nd = M.ndcg10Graded(['d2_c1', 'd1_c1'], d => grade[d] || 0, docOf);   // DCG = 1/log2(2) + 3/log2(3) ; IDCG = 3/log2(2) + 1/log2(3)
+  assert.ok(Math.abs(nd - ((1 + 3 / Math.log2(3)) / (3 + 1 / Math.log2(3)))) < 1e-9);
+  assert.ok(Math.abs(M.signTestExact(8, 2) - 0.109375) < 1e-6, 'two-sided exact binomial 8 vs 2');
+  const ci = M.bootstrapPairedCI([0.1, 0.2, 0.0, 0.3, 0.1, 0.2], ['a', 'a', 'b', 'b', 'c', 'c'], { iters: 2000, seed: 1 });
+  assert.ok(ci[0] <= 0.15 && ci[1] >= 0.15 && ci[0] > -0.2 && ci[1] < 0.5);
+  assert.deepEqual(M.holm([0.01, 0.04, 0.03]).map(x => +x.toFixed(2)), [0.03, 0.06, 0.06]);
+  assert.ok(M.powerN(0.2, 0.05, { alpha: 0.05, power: 0.8 }) >= 120 && M.powerN(0.2, 0.05, { alpha: 0.05, power: 0.8 }) <= 130, 'n ≈ 126 (r4 example)');
+  console.log('  OK: metrics (hit/recall/mrr/ndcg/sign/bootstrap/holm/power)');
+}
+
+// recall/mrr/nDCG edge cases the report actually hits: empty gold, gold outside
+// the budget, the full-gold ideal (report.mjs passes allGoldDocs; the brief's
+// Step 1 case above passes null and therefore uses the retrieved-only ideal).
+{
+  const M = await import('../eval/graph-role/lib/metrics.mjs');
+  const docOf = M.docOfChunk;
+  assert.equal(M.recallAtKDoc(['d1_chunk_0'], new Set(), docOf, 10), null, 'no gold -> null, never 0 (0 would read as "missed everything")');
+  assert.equal(M.recallAtKDoc([], new Set(['d1']), docOf, 10), 0, 'empty ranking with gold = 0 recall');
+  // duplicate documents inside the chunk budget collapse: top-3 chunks are d1,d1,d2 -> 2 unique docs
+  assert.equal(M.recallAtKDoc(['d1_chunk_0', 'd1_chunk_1', 'd2_chunk_0', 'd3_chunk_0'], new Set(['d2', 'd3']), docOf, 3), 0.5);
+  assert.equal(M.mrrDoc(['d1_chunk_0', 'd1_chunk_1', 'd2_chunk_0'], new Set(['d2']), docOf), 0.5, 'rank is over DISTINCT documents: d1(1), d2(2) -> 1/2');
+  assert.equal(M.mrrDoc(['d1_chunk_0'], new Set(['d9']), docOf), 0, 'gold never retrieved -> 0');
+  // full-gold ideal: ranked d2(1), d1(2), d5(0); gold {d1,d2,d3} with grades 2,1,2
+  // DCG   = (2^1-1)/log2(2) + (2^2-1)/log2(3) + 0            = 1 + 3/log2(3)
+  // IDCG  = grades [2,2,1] -> 3/log2(2) + 3/log2(3) + 1/log2(4) = 3 + 3/log2(3) + 0.5
+  const g = { d1: 2, d2: 1, d3: 2 };
+  const ndFull = M.ndcg10Graded(['d2_chunk_0', 'd1_chunk_0', 'd5_chunk_0'], d => g[d] || 0, docOf, new Set(['d1', 'd2', 'd3']));
+  assert.ok(Math.abs(ndFull - ((1 + 3 / Math.log2(3)) / (3.5 + 3 / Math.log2(3)))) < 1e-9, 'full-gold ideal includes the unretrieved gold doc');
+  assert.equal(M.ndcg10Graded(['d5_chunk_0'], () => 0, docOf, new Set()), 0, 'ideal 0 -> 0, not NaN');
+  console.log('  OK: recall/mrr/nDCG edge cases (null gold, doc dedup, full-gold ideal)');
+}
+
+// docOfChunk: the engine id form is `${document_id}_chunk_${index}`, and document
+// ids in these corpora can themselves contain "_chunk_" -> lastIndexOf, not split.
+{
+  const M = await import('../eval/graph-role/lib/metrics.mjs');
+  assert.equal(M.docOfChunk('log-2026-05-09_chunk_12'), 'log-2026-05-09');
+  assert.equal(M.docOfChunk('a_chunk_1_chunk_2'), 'a_chunk_1', 'lastIndexOf: only the final _chunk_ separates doc from index');
+  assert.equal(M.docOfChunk('no-separator-here'), 'no-separator-here', 'ids without the marker are their own document');
+  console.log('  OK: docOfChunk uses lastIndexOf("_chunk_")');
+}
+
+// sign test / Holm / power / pctile / mean / sd — hand-computed
+{
+  const M = await import('../eval/graph-role/lib/metrics.mjs');
+  assert.equal(M.signTestExact(0, 0), 1, 'no discordant pairs -> p = 1');
+  assert.ok(Math.abs(M.signTestExact(0, 5) - 0.0625) < 1e-12, '2 * C(5,0)/2^5 = 2/32');
+  assert.equal(M.signTestExact(5, 5), 1, '2 * 638/1024 = 1.246 -> clamped to 1');
+  assert.deepEqual(M.holm([0.2]), [0.2], 'family of one = unadjusted');
+  assert.deepEqual(M.holm([0.4, 0.5, 0.6]).map(x => +x.toFixed(2)), [1, 1, 1], 'adjusted p is capped at 1');
+  const hm = M.holm([0.001, 1, 1]);   // the report pads non-estimable endpoints with p=1 but keeps m=3
+  assert.ok(Math.abs(hm[0] - 0.003) < 1e-12 && hm[1] === 1 && hm[2] === 1, 'padding with 1 keeps the pre-declared family size m=3');
+  assert.equal(M.powerN(0.2, 0.05, { alpha: 0.05, power: 0.8 }), 126, '((1.959964+0.841621)*0.2/0.05)^2 = 125.6 -> 126');
+  assert.equal(M.powerN(0.2, 0.05, { alpha: 0.10, power: 0.8 }), 99, 'one-sided 0.05 (= two-sided 0.10): ((1.644854+0.841621)*4)^2 = 98.92 -> 99');
+  assert.equal(M.powerN(0, 0.05, { alpha: 0.05, power: 0.8 }), 0, 'zero variance -> 0');
+  assert.equal(M.powerN(0.2, 0, { alpha: 0.05, power: 0.8 }), null, 'MCID 0 would divide by zero -> null, not Infinity');
+  assert.equal(M.pctile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.95), 10, 'floor(0.95*10)=9 -> 10th smallest');
+  assert.equal(M.pctile([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 0.5), 6, 'floor(0.5*10)=5 -> 6th smallest');
+  assert.equal(M.pctile([], 0.95), null, 'empty -> null');
+  assert.equal(M.mean([1, 2, 3, 4]), 2.5);
+  assert.equal(M.mean([]), null);
+  assert.ok(Math.abs(M.sd([1, 2, 3, 4]) - Math.sqrt(5 / 3)) < 1e-12, 'sample SD: sum sq dev 5, /(n-1)=3');
+  assert.equal(M.sd([7]), null, 'n=1 has no sample SD');
+  console.log('  OK: signTest/holm/powerN/pctile/mean/sd hand-computed');
+}
+
+// bootstrapPairedCI: clustering, determinism, and the one-sided lower bound
+{
+  const M = await import('../eval/graph-role/lib/metrics.mjs');
+  // cluster sums must differ, or every resample returns the same mean and the CI is a point.
+  const d = [0.1, 0.2, -0.1, 0.3, 0.0, 0.5], cl = ['a', 'a', 'b', 'b', 'c', 'c'];   // cluster sums 0.3 / 0.2 / 0.5
+  const a = M.bootstrapPairedCI(d, cl, { iters: 1000, seed: 42 });
+  const b = M.bootstrapPairedCI(d, cl, { iters: 1000, seed: 42 });
+  assert.deepEqual(a, b, 'same seed -> identical CI');
+  // With only 3 clusters the 2.5/97.5 percentiles sit on the extreme resamples for
+  // every seed, so seed sensitivity has to be checked where the tail can move.
+  const many = [], manyCl = [];
+  for (let i = 0; i < 10; i++) { many.push(i * 0.05, i * 0.05 + 0.01); manyCl.push('g' + i, 'g' + i); }
+  assert.notDeepEqual(M.bootstrapPairedCI(many, manyCl, { iters: 1000, seed: 42 }),
+                      M.bootstrapPairedCI(many, manyCl, { iters: 1000, seed: 43 }),
+                      'a different seed moves the CI (the resample really is random)');
+  // clustering is not cosmetic: resampling whole families is wider than resampling
+  // observations when the between-cluster variance dominates.
+  const cd = [1, 1, 1, -1, -1, -1, 1, 1, 1, -1, -1, -1], ccl = ['a', 'a', 'a', 'b', 'b', 'b', 'c', 'c', 'c', 'e', 'e', 'e'];
+  const clustered = M.bootstrapPairedCI(cd, ccl, { iters: 2000, seed: 7 });
+  const flat = M.bootstrapPairedCI(cd, null, { iters: 2000, seed: 7 });
+  assert.ok((clustered[1] - clustered[0]) > (flat[1] - flat[0]) * 1.5, 'cluster bootstrap is materially wider than the per-observation one');
+  const one = M.bootstrapPairedCI([0.2, 0.2, 0.2], ['x', 'x', 'x'], { iters: 500, seed: 1 });
+  assert.ok(Math.abs(one[0] - 0.2) < 1e-12 && Math.abs(one[1] - 0.2) < 1e-12, 'a single cluster resamples to itself -> CI collapses to the point estimate');
+  const lo1 = M.oneSidedLowerCI(d, cl, { iters: 1000, seed: 42 });
+  assert.ok(lo1 >= a[0], 'one-sided 95% lower (5th pct) is never below the two-sided 95% lower (2.5th pct)');
+  assert.ok(lo1 <= M.mean(d) + 1e-12, 'lower bound does not exceed the point estimate');
+  const noCluster = M.bootstrapPairedCI(d, null, { iters: 200, seed: 3 });
+  assert.ok(noCluster[0] <= noCluster[1], 'null clusterIds = one cluster per observation');
+  console.log('  OK: bootstrapPairedCI clustering/determinism + oneSidedLowerCI');
+}
+
+// gold sources: (a) authored — the suite's own gold, available with no judging;
+//               (b) judged  — qrels, document grade = max over judged chunks.
+{
+  const M = await import('../eval/graph-role/lib/metrics.mjs');
+  const K = { id: 'c-K-1', class: 'K', family: 'd1', document_id: 'd1', oracle_chunk_id: 'd1_chunk_0' };
+  const A = { id: 'c-A-1', class: 'A', family: 'wiki/x.md', source_docs: ['a', 'b'] };
+  const Mq = { id: 'c-M-1', class: 'M', family: 'c', source_docs: ['a', 'b'] };
+  const Mq2 = { id: 'c-M-2', class: 'M', family: 'a', source_docs: ['a', 'b'] };
+  assert.deepEqual([...M.authoredGoldDocs(K)], ['d1'], 'K gold = its document_id');
+  assert.deepEqual([...M.authoredGoldDocs(A)].sort(), ['a', 'b'], 'A gold = source_docs; family is a seed label, not a doc id');
+  assert.deepEqual([...M.authoredGoldDocs(Mq)].sort(), ['a', 'b', 'c'], 'M gold = source_docs + family (the bridge target document)');
+  assert.deepEqual([...M.authoredGoldDocs(Mq2)].sort(), ['a', 'b'], 'family already in source_docs -> set, no duplicate');
+
+  const au = M.buildAuthoredGold([K, A, Mq]);
+  assert.equal(au.source, 'authored');
+  assert.deepEqual([...au.gold.get('c-A-1')].sort(), ['a', 'b']);
+  assert.equal(au.grade.get('c-A-1').get('a'), 1, 'authored gold is binary: every gold doc gets grade 1');
+  assert.equal(au.grade.get('c-A-1').get('zzz'), undefined, 'non-gold docs are absent (report reads them as 0)');
+  assert.equal(au.oracleChunk.get('c-K-1'), 'd1_chunk_0');
+  assert.equal(au.depth.get('c-A-1'), null, 'authored gold has no judging depth');
+
+  assert.equal(M.buildJudgedGold([]), null, 'no qrels rows -> null, so the caller prints "qrels absent"');
+  const qr = [
+    { qid: 'q1', doc_id: 'd1', chunk_id: 'd1_chunk_0', grade: 2, judged_depth: 10, qrels_grade: 'LLM-judged provisional', pool_truncated: true },
+    { qid: 'q1', doc_id: 'd1', chunk_id: 'd1_chunk_1', grade: 1, judged_depth: 10, qrels_grade: 'LLM-judged provisional' },
+    { qid: 'q1', doc_id: 'd2', chunk_id: 'd2_chunk_0', grade: 0, judged_depth: 10, qrels_grade: 'LLM-judged provisional' },
+    { qid: 'q2', doc_id: 'd3', chunk_id: 'd3_chunk_0', grade: 1, judged_depth: 30, qrels_grade: 'LLM-judged provisional' },
+  ];
+  const j = M.buildJudgedGold(qr);
+  assert.equal(j.source, 'judged');
+  assert.deepEqual([...j.gold.get('q1')], ['d1'], 'grade>=1 only: d2 graded 0 is judged non-relevant, not gold');
+  assert.equal(j.grade.get('q1').get('d1'), 2, 'document grade = max over its judged chunks');
+  assert.equal(j.grade.get('q1').get('d2'), 0, 'a judged-0 document is still in the grade map (nDCG gain 0)');
+  assert.equal(j.depth.get('q1'), 10); assert.equal(j.depth.get('q2'), 30);
+  assert.equal(j.qrels_grade, 'LLM-judged provisional');
+  assert.equal(j.pool_truncated, true);
+  assert.deepEqual(j.deep30, new Set(['q2']), 'only depth-30 queries can carry a recall@30 estimate');
+  console.log('  OK: authored + judged gold sources (doc grade = max over chunks, depth tracking)');
+}
+
+// link-audit reliability: reliabilityOf — Cohen's kappa (weightedKappa(a,b,2), which for 2
+// categories is exactly standard unweighted kappa since the only possible distance between two
+// binary labels is 0 or 1) over the tagged (second_judge) jids present in both judge-A and judge-B.
+{
+  const { reliabilityOf } = await import('../eval/graph-role/lib/reliability.mjs');
+  // perfect agreement -> kappa 1, agreement 1
+  const pA1 = [{ jid: 'a', mention: 1 }, { jid: 'b', mention: 0 }, { jid: 'c', mention: 1 }];
+  const pB1 = [{ jid: 'a', mention: 1 }, { jid: 'b', mention: 0 }, { jid: 'c', mention: 1 }];
+  assert.deepEqual(reliabilityOf(pA1, pB1, ['a', 'b', 'c']), { n: 3, agreement: 1, kappa: 1 });
+
+  // Hand-computed disagreement: a=[1,1,1,0,0,1] b=[1,1,0,0,0,1] (one disagreement, at j3).
+  // O[1][1]=3 O[1][0]=1 O[0][0]=2 O[0][1]=0; ra=[2,4] rb=[3,3]; n=6; w(0,1)=w(1,0)=1 (L=2).
+  // num = 1*O[0][1] + 1*O[1][0] = 0 + 1 = 1
+  // den = 1*ra[0]*rb[1]/n + 1*ra[1]*rb[0]/n = (2*3)/6 + (4*3)/6 = 1 + 2 = 3
+  // kappa = 1 - 1/3 = 2/3 ; agreement = 5/6 (only j3 disagrees)
+  const pA2 = [{ jid: 'j1', mention: 1 }, { jid: 'j2', mention: 1 }, { jid: 'j3', mention: 1 }, { jid: 'j4', mention: 0 }, { jid: 'j5', mention: 0 }, { jid: 'j6', mention: 1 }];
+  const pB2 = [{ jid: 'j1', mention: 1 }, { jid: 'j2', mention: 1 }, { jid: 'j3', mention: 0 }, { jid: 'j4', mention: 0 }, { jid: 'j5', mention: 0 }, { jid: 'j6', mention: 1 }];
+  const disagree = reliabilityOf(pA2, pB2, ['j1', 'j2', 'j3', 'j4', 'j5', 'j6']);
+  assert.equal(disagree.n, 6);
+  assert.ok(Math.abs(disagree.agreement - 5 / 6) < 1e-9);
+  assert.ok(Math.abs(disagree.kappa - 2 / 3) < 1e-9, `hand-computed kappa = 2/3, got ${disagree.kappa}`);
+
+  // `tagged` restricts to a subset (j1,j3,j5): a=[1,1,0] b=[1,0,0]. O[1][1]=1 O[1][0]=1 O[0][0]=1
+  // O[0][1]=0; ra=[1,2] rb=[2,1]; n=3. num=1. den=(1*1)/3+(2*2)/3=1/3+4/3=5/3. kappa=1-3/5=2/5.
+  const subset = reliabilityOf(pA2, pB2, ['j1', 'j3', 'j5']);
+  assert.equal(subset.n, 3);
+  assert.ok(Math.abs(subset.agreement - 2 / 3) < 1e-9);
+  assert.ok(Math.abs(subset.kappa - 2 / 5) < 1e-9, `hand-computed kappa = 2/5, got ${subset.kappa}`);
+
+  // a tagged jid absent from A or B is excluded from the intersection silently, not an error
+  const onlyOverlap = reliabilityOf(pA2, pB2, ['j1', 'not-in-either']);
+  assert.deepEqual(onlyOverlap, { n: 1, agreement: 1, kappa: 1 }, 'single-item overlap, agrees -> kappa 1 (weightedKappa den===0 convention)');
+
+  // missing B (or zero tagged/overlap) -> null, never throws
+  assert.equal(reliabilityOf(pA2, [], ['j1', 'j2']), null, 'no B rows at all -> null');
+  assert.equal(reliabilityOf(pA2, pB2, []), null, 'no tagged jids -> null');
+  console.log('  OK: reliabilityOf — hand-computed kappa (perfect/disagreement/subset), missing-B/no-overlap -> null');
+}
+
+// link-audit-sample: selectSecondJudgeJids — deterministic stratified ~20% subsample (floor 1 per
+// non-empty stratum) that link-audit-sample.mjs tags second_judge:true for the inter-rater check.
+{
+  const { selectSecondJudgeJids } = await import('../eval/graph-role/link-audit-sample.mjs');
+  const mk = (s, n) => Array.from({ length: n }, (_, i) => ({ jid: `${s}${i}`, stratum: s }));
+  const rows = [...mk('low', 20), ...mk('mid', 10), ...mk('high', 1)];
+  const tagged = selectSecondJudgeJids(rows, mulberry32(7));
+  const countIn = (s) => rows.filter(r => r.stratum === s && tagged.has(r.jid)).length;
+  assert.equal(countIn('low'), 4, '20 rows * 20% = 4 exactly');
+  assert.equal(countIn('mid'), 2, '10 rows * 20% = 2 exactly');
+  assert.equal(countIn('high'), 1, 'floor: round(1*0.2)=0, but "at least 1 per stratum" forces 1');
+  assert.equal(tagged.size, 7);
+  assert.ok(tagged.has('high0'), 'the single high-stratum row is always tagged (only candidate, forced by the floor)');
+
+  const again = selectSecondJudgeJids(rows, mulberry32(7));
+  assert.deepEqual([...again].sort(), [...tagged].sort(), 'determinism: same seed -> identical tagged set');
+
+  const emptyHigh = selectSecondJudgeJids([...mk('low', 5), ...mk('mid', 5)], mulberry32(7));
+  assert.equal([...emptyHigh].filter(jid => jid.startsWith('high')).length, 0, 'a stratum absent from the input contributes nothing (no crash on an empty array)');
+  console.log('  OK: selectSecondJudgeJids — stratified ~20% with floor-1, deterministic, handles an absent stratum');
+}
+
+// link-audit-merge: weightedPrecision — totalPrev===0 guard (degenerate/empty prevalence -> null,
+// not NaN/Infinity from a division by zero).
+{
+  const { weightedPrecision } = await import('../eval/graph-role/link-audit-merge.mjs');
+  const clusters = [[{ stratum: 'low', provenance: 'name', ok: 1 }]];
+  assert.equal(weightedPrecision(clusters, { low: 0, mid: 0, high: 0 }), null, 'totalPrev===0 -> null, not NaN');
+  console.log('  OK: weightedPrecision — totalPrev===0 guard returns null');
+}
+
 console.log('eval-graph-role-libs: ALL OK');

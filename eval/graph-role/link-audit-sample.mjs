@@ -11,12 +11,33 @@
 // pool/<label>.links.prevalence.json. pool/ is Task 6's live output directory while judging runs
 // concurrently (never touch anything under it) -- per the Task 7 dispatch, both outputs are
 // redirected to eval/graph-role/links/ instead. link-audit-merge.mjs reads them from there.
+//
+// Fix round 1: every row is also tagged second_judge: true|false -- a seeded ~20% (stratified,
+// floor 1/stratum) subsample the controller sends to a second judge (codex) so
+// link-audit-merge.mjs can report inter-rater reliability (lib/reliability.mjs's reliabilityOf)
+// instead of shipping precision numbers with no agreement signal at all.
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { CORPORA, EVAL_DIR } from './lib/paths.mjs';
 import { mulberry32, shuffle } from './lib/prng.mjs';
 import { provenanceOf } from './lib/stages.mjs';
+
+// Deterministic stratified subsample selection for the second-judge tag: ~20% of rows per
+// stratum, floor 1 per non-empty stratum (so even a tiny high-links stratum still gets an
+// inter-rater data point). Pure: takes the already-built sample rows and an rng, returns the Set
+// of jids to tag -- the caller sets `second_judge` on each row from membership in that set.
+export function selectSecondJudgeJids(rows, rng) {
+  const byStratum = { low: [], mid: [], high: [] };
+  for (const r of rows) byStratum[r.stratum].push(r);
+  const tagged = new Set();
+  for (const s of ['low', 'mid', 'high']) {
+    const arr = byStratum[s]; if (!arr.length) continue;
+    const want = Math.max(1, Math.round(arr.length * 0.2));
+    for (const r of shuffle(arr, rng).slice(0, want)) tagged.add(r.jid);
+  }
+  return tagged;
+}
 
 export function run(label) {
   const th = JSON.parse(readFileSync(join(EVAL_DIR, 'thresholds.json'), 'utf8'));
@@ -33,13 +54,21 @@ export function run(label) {
       for (const nm of names) rows.push({ jid: `${label}-L${++j}`, stratum: s, chunk_id: c.chunk_id, chunk_links: c.links, entity_name: nm, provenance: provenanceOf(c.text, nm), chunk_text: c.text });
     }
   }
+  // second-judge tag: a separate rng stream (seed+9, independent of the seed+7 stream above) so
+  // adding this tag does not perturb which chunks/names were sampled -- re-running produces the
+  // same 572/590/577-style pair counts and jids as before this fix round, only `second_judge` is new.
+  const secondJudgeJids = selectSecondJudgeJids(rows, mulberry32(th.bootstrap.seed + 9));
+  for (const r of rows) r.second_judge = secondJudgeJids.has(r.jid);
+  const bySecond = { low: 0, mid: 0, high: 0 };
+  for (const r of rows) if (r.second_judge) bySecond[r.stratum]++;
+
   const outDir = join(EVAL_DIR, 'links');
   mkdirSync(outDir, { recursive: true });
   writeFileSync(join(outDir, `${label}.links.judge.jsonl`), shuffle(rows, rng).map(r => JSON.stringify(r)).join('\n') + '\n');
   writeFileSync(join(outDir, `${label}.links.prevalence.json`), JSON.stringify(prevalence) + '\n');
-  console.log(`${label}: link pairs ${rows.length} (name ${rows.filter(r => r.provenance === 'name').length} / nonliteral ${rows.filter(r => r.provenance === 'nonliteral').length}) prevalence ${JSON.stringify(prevalence)}`);
+  console.log(`${label}: link pairs ${rows.length} (name ${rows.filter(r => r.provenance === 'name').length} / nonliteral ${rows.filter(r => r.provenance === 'nonliteral').length}) prevalence ${JSON.stringify(prevalence)} second_judge ${secondJudgeJids.size}/${rows.length} (${JSON.stringify(bySecond)})`);
   db.close();
-  return { rows, prevalence };
+  return { rows, prevalence, secondJudgeJids };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

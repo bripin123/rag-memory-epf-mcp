@@ -19,10 +19,18 @@
 //     (e.g. judge-A.jsonl exists but shares no jids with the sample) is reported the same way
 //     instead of throwing inside the bootstrap loop (clusters[Math.floor(rng()*0)] would be
 //     undefined and crash on the first `c[0].stratum` read).
+//
+// Fix round 1 (task review: "no mechanism anywhere ... to compute agreement/kappa" over the
+// brief's stated 20% second-judge sample): reads the optional links/<c>.links.judge-B.jsonl (same
+// {jid, mention} shape as judge-A) and reports inter-rater reliability over the tagged
+// (second_judge:true) subsample via lib/reliability.mjs's reliabilityOf. judge-B not existing yet,
+// or sharing no tagged jids with judge-A, is not an error -- reliability is null with a
+// reliability_note explaining why, same "never crash on a missing later-stage file" policy as (3).
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { CORPORA, EVAL_DIR } from './lib/paths.mjs';
 import { mulberry32 } from './lib/prng.mjs';
+import { reliabilityOf } from './lib/reliability.mjs';
 
 const readJsonl = (p) => readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(r => !r.meta);
 
@@ -57,8 +65,11 @@ export function byProvenance(clusters) {
 // eligible chunks in the corpus (prev), not its share of the sample -- the sample is a fixed 20
 // chunks per stratum, so an unweighted average would over-count whichever stratum happens to be
 // smallest in the corpus. A stratum with no sampled rows (precision === null) contributes 0.
+// totalPrev === 0 (degenerate/empty prevalence, e.g. a corpus with zero linked chunks) returns
+// null instead of dividing by zero (fix round 1 minor).
 export function weightedPrecision(clusters, prev) {
   const totalPrev = Object.values(prev).reduce((a, b) => a + b, 0);
+  if (totalPrev === 0) return null;
   return ['low', 'mid', 'high'].reduce((acc, s) => {
     const rows = clusters.filter(c => c[0].stratum === s).flat();
     const p = precisionOf(rows);
@@ -99,17 +110,41 @@ export function run(label) {
     console.error(`LINK_AUDIT_INPUT_MISSING no judged jids overlap between ${paths.items} and ${paths.judgeA}`);
     process.exit(15);
   }
-  const { lo, hi } = bootstrapCI(clusters, prev, th.bootstrap.iters, mulberry32(th.bootstrap.seed + 8));
+
+  // Inter-rater reliability over the second-judge (tagged) subsample -- never an error/exit:
+  // judge-B not having run yet, or sharing no tagged jids with judge-A, is a normal pipeline state
+  // (Step 3's judging is a later, controller-orchestrated stage), not a failure of this merge.
+  const judgeBPath = join(dir, `${label}.links.judge-B.jsonl`);
+  const taggedJids = items.filter(it => it.second_judge).map(it => it.jid);
+  let reliability = null, reliability_note = null;
+  if (!existsSync(judgeBPath)) {
+    reliability_note = `no judge-B file at ${judgeBPath} (second-judge pass has not run yet)`;
+  } else {
+    const pairsA = [...J.entries()].map(([jid, mention]) => ({ jid, mention }));
+    const pairsB = readJsonl(judgeBPath);
+    reliability = reliabilityOf(pairsA, pairsB, taggedJids);
+    if (!reliability) reliability_note = `judge-B.jsonl exists but shares no jids with the ${taggedJids.length} tagged (second_judge:true) pairs present in judge-A`;
+  }
+
+  const point = weightedPrecision(clusters, prev);
+  let ci95 = null;
+  if (point !== null) {
+    const { lo, hi } = bootstrapCI(clusters, prev, th.bootstrap.iters, mulberry32(th.bootstrap.seed + 8));
+    ci95 = [+lo.toFixed(4), +hi.toFixed(4)];
+  }
   const res = {
     by_stratum: byStratum(clusters),
     by_provenance: byProvenance(clusters),
-    weighted_precision: +weightedPrecision(clusters, prev).toFixed(4),
-    ci95: [+lo.toFixed(4), +hi.toFixed(4)],
+    weighted_precision: point === null ? null : +point.toFixed(4),
+    ci95,
     chunks: clusters.length,
     pairs: clusters.flat().length,
+    reliability,
+    reliability_note,
   };
   writeFileSync(join(EVAL_DIR, 'out', `link-precision.${label}.json`), JSON.stringify(res, null, 2) + '\n');
-  console.log(`${label}: link precision (name) ${res.by_provenance.name.precision} · weighted ${res.weighted_precision} CI ${res.ci95} · pairs ${res.pairs} in ${res.chunks} chunks`);
+  const relSummary = reliability ? `n=${reliability.n} agreement=${reliability.agreement.toFixed(3)} kappa=${reliability.kappa.toFixed(3)}` : `null (${reliability_note})`;
+  console.log(`${label}: link precision (name) ${res.by_provenance.name.precision} · weighted ${res.weighted_precision} CI ${res.ci95} · pairs ${res.pairs} in ${res.chunks} chunks · reliability ${relSummary}`);
   return res;
 }
 
