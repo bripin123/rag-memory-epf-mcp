@@ -128,6 +128,36 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   assert.notDeepEqual(other.selected, plan.selected, 'different seed -> different pick order');
   console.log('  OK: planPass2 — balanced A/M alternation, budget skip-and-continue, determinism, file-order pass2_jids');
 }
+// pooling: requiredItems — qrels merge required-set selection (judge-merge.mjs). Default = every top10 row
+// + top30 rows of queries in plan.selected (see planPass2 above); deep-tier rows and top30 rows of
+// non-selected queries are never included, in either mode. --pass1-only ignores plan.selected entirely --
+// required items are the top10 tier alone.
+{
+  const { requiredItems } = await import('../eval/graph-role/lib/pooling.mjs');
+  const items = [
+    { jid: 't1', tier: 'top10', qid: 'q1' },
+    { jid: 't2', tier: 'top10', qid: 'q2' },
+    { jid: 'a1', tier: 'top30', qid: 'q1' },   // q1 selected
+    { jid: 'a2', tier: 'top30', qid: 'q2' },   // q2 NOT selected
+    { jid: 'd1', tier: 'deep', qid: 'q1' },    // deep tier -- never required, selected or not
+  ];
+  const plan = { selected: ['q1'], not_selected: ['q2'] };
+
+  const def = requiredItems(items, plan, { pass1Only: false });
+  assert.deepEqual(def.map(i => i.jid), ['t1', 't2', 'a1'], 'default: both top10 rows + top30 of selected q1; a2 (q2, not selected) and d1 (deep) excluded');
+  assert.deepEqual(requiredItems(items, plan), def, 'options object itself is optional (defaults to {}, i.e. pass1Only false)');
+
+  const p1 = requiredItems(items, plan, { pass1Only: true });
+  assert.deepEqual(p1.map(i => i.jid), ['t1', 't2'], 'pass1Only: top10 rows only -- a1 excluded even though its query q1 IS in plan.selected');
+
+  const planNothingSelected = { selected: [], not_selected: ['q1', 'q2'] };
+  assert.deepEqual(requiredItems(items, planNothingSelected, { pass1Only: true }).map(i => i.jid), ['t1', 't2'], 'pass1Only result does not depend on plan contents at all');
+
+  assert.ok(!def.some(i => i.tier === 'deep'), 'deep rows never included (default)');
+  assert.ok(!p1.some(i => i.tier === 'deep'), 'deep rows never included (pass1Only)');
+  assert.ok(!def.some(i => i.jid === 'a2'), 'top30 row of a non-selected query never included (default)');
+  console.log('  OK: requiredItems — default (top10 + top30-of-selected), pass1Only (top10 only, selected ignored), deep/non-selected always excluded');
+}
 // judging: splitRows — batch sizes and zero-padded NNN naming (batches/<c>/<set>-NNN.jsonl)
 {
   const { splitRows } = await import('../eval/graph-role/lib/judging.mjs');

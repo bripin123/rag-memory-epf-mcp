@@ -83,3 +83,14 @@ export function planPass2({ judgeRows, budget, seed }) {
     remaining_after: remaining,
   };
 }
+
+// Required-item selection for qrels merge (judge-merge.mjs): pass 1 = every `top10` row (fixed depth,
+// always judged). Pass 2 = `top30` rows of queries in plan.selected (whole-query promotion, see planPass2
+// above) -- non-selected queries' top30 rows, and every `deep`-tier row (ranks 31-100), are never required.
+// With `pass1Only`, plan.selected is ignored entirely: required items are the top10 tier alone (used by
+// judge-merge.mjs's `--pass1-only` flag). Pure, no I/O -- `plan` is a parsed pass2-plan.json object.
+export function requiredItems(items, plan, { pass1Only = false } = {}) {
+  if (pass1Only) return items.filter(i => i.tier === 'top10');
+  const selectedSet = new Set(plan.selected);
+  return items.filter(i => i.tier === 'top10' || (i.tier === 'top30' && selectedSet.has(i.qid)));
+}
