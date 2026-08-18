@@ -48,3 +48,19 @@ export function mergeRows(existingRows, newRows) {
   const added = newRows.filter(r => !seen.has(r.jid));
   return [...existingRows, ...added];
 }
+
+// Bounded prev/next context window for blind judging batches (judge-batches.mjs split --context-chars).
+// prev_text keeps only its LAST n chars, next_text only its FIRST n chars -- the window nearest the passage
+// -- and a cut gets marked so judges know context was truncated. chunk_text (the passage) is never touched.
+// n <= 0 means no window: the row is returned unchanged (same reference, not a copy).
+const CONTEXT_CUT_PREFIX = '…[cut] ';
+const CONTEXT_CUT_SUFFIX = ' …[cut]';
+export function trimContext(row, n) {
+  if (!(n > 0)) return row;
+  const prev = row.prev_text, next = row.next_text;
+  return {
+    ...row,
+    prev_text: prev.length > n ? CONTEXT_CUT_PREFIX + prev.slice(prev.length - n) : prev,
+    next_text: next.length > n ? next.slice(0, n) + CONTEXT_CUT_SUFFIX : next,
+  };
+}

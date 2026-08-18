@@ -180,4 +180,27 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   assert.deepEqual(mergeRows([], incoming), incoming, 'empty existing -> all incoming rows kept');
   console.log('  OK: mergeRows — jid-based dedup on merge');
 }
+// judging: trimContext — bounded prev/next context window (judge-batches.mjs split --context-chars).
+// chunk_text (the passage) is never touched; n <= 0 returns the row unchanged (same reference).
+{
+  const { trimContext } = await import('../eval/graph-role/lib/judging.mjs');
+  const row = { jid: 'j1', chunk_text: 'p'.repeat(50), prev_text: 'a'.repeat(20), next_text: 'b'.repeat(20) };
+  const cut = trimContext(row, 8);
+  assert.equal(cut.prev_text, '\u2026[cut] ' + 'a'.repeat(8), 'prev longer than n: kept LAST n chars, prefixed with the cut marker');
+  assert.equal(cut.next_text, 'b'.repeat(8) + ' \u2026[cut]', 'next longer than n: kept FIRST n chars, suffixed with the cut marker');
+  assert.equal(cut.chunk_text, row.chunk_text, 'chunk_text (the passage) is never touched');
+  assert.notEqual(cut, row, 'n>0 always returns a NEW row object');
+
+  const boundary = trimContext({ jid: 'j2', chunk_text: '', prev_text: 'a'.repeat(8), next_text: 'b'.repeat(8) }, 8);
+  assert.equal(boundary.prev_text, 'a'.repeat(8), 'prev exactly n chars: unchanged (boundary), not >n');
+  assert.equal(boundary.next_text, 'b'.repeat(8), 'next exactly n chars: unchanged (boundary), not >n');
+
+  const short = trimContext({ jid: 'j3', chunk_text: 'c', prev_text: 'short', next_text: 'also short' }, 500);
+  assert.equal(short.prev_text, 'short', 'prev shorter than n: unchanged');
+  assert.equal(short.next_text, 'also short', 'next shorter than n: unmarked');
+
+  assert.equal(trimContext(row, 0), row, 'n=0: row returned unchanged (same reference)');
+  assert.equal(trimContext(row, -1), row, 'negative n: row returned unchanged (same reference)');
+  console.log('  OK: trimContext \u2014 bounded prev/next window, cut markers, chunk_text untouched, n<=0 unchanged');
+}
 console.log('eval-graph-role-libs: ALL OK');

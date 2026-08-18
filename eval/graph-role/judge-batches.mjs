@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { EVAL_DIR } from './lib/paths.mjs';
-import { splitRows, validateBatch, mergeRows } from './lib/judging.mjs';
+import { splitRows, validateBatch, mergeRows, trimContext } from './lib/judging.mjs';
 
 const [cmd, label, ...rest] = process.argv.slice(2);
 const get = (k, d) => { const i = rest.indexOf(k); return i >= 0 ? rest[i + 1] : d; };
@@ -12,17 +12,17 @@ const SETS = ['pass1', 'pass2', 'unpooled', 'deepsample'];
 const srcFile = (set) => ({ pass1: `${label}.judge.jsonl`, pass2: `${label}.judge-pass2.jsonl`, unpooled: `${label}.unpooled.jsonl`, deepsample: `${label}.deepsample.jsonl` }[set]);
 
 if (cmd === 'split') {
-  const set = get('--set'); const size = Number(get('--size', 25));
-  if (!label || !SETS.includes(set)) { console.error('usage: judge-batches.mjs split <corpus> --set pass1|pass2|unpooled|deepsample [--size N]'); process.exit(2); }
+  const set = get('--set'); const size = Number(get('--size', 25)); const contextChars = Number(get('--context-chars', 500));
+  if (!label || !SETS.includes(set)) { console.error('usage: judge-batches.mjs split <corpus> --set pass1|pass2|unpooled|deepsample [--size N] [--context-chars N]'); process.exit(2); }
   const srcP = join(poolDir, srcFile(set));
   if (!existsSync(srcP)) { console.error(`POOL_INCOMPLETE missing ${srcFile(set)}`); process.exit(7); }
   const rows = set === 'pass1' ? readJsonl(srcP).filter(r => r.tier === 'top10') : readJsonl(srcP);
   const batches = splitRows(rows, size);
   mkdirSync(dir, { recursive: true });
-  for (const b of batches) writeFileSync(join(dir, `${set}-${b.nnn}.jsonl`), b.rows.map(r => JSON.stringify(r)).join('\n') + '\n');
-  const index = { set, size, batches: batches.map(b => ({ file: `${set}-${b.nnn}.jsonl`, n: b.rows.length, jids: b.jids })), total: rows.length };
+  for (const b of batches) writeFileSync(join(dir, `${set}-${b.nnn}.jsonl`), b.rows.map(r => JSON.stringify(trimContext(r, contextChars))).join('\n') + '\n');
+  const index = { set, size, context_chars: contextChars, batches: batches.map(b => ({ file: `${set}-${b.nnn}.jsonl`, n: b.rows.length, jids: b.jids })), total: rows.length };
   writeFileSync(join(dir, `${set}.index.json`), JSON.stringify(index, null, 2) + '\n');
-  console.log(`${label}/${set}: split ${rows.length} rows into ${batches.length} batches of <=${size} -> pool/batches/${label}/`);
+  console.log(`${label}/${set}: split ${rows.length} rows into ${batches.length} batches of <=${size} (context <=${contextChars} chars) -> pool/batches/${label}/`);
 
 } else if (cmd === 'merge') {
   const judge = get('--judge'); const set = get('--set');
