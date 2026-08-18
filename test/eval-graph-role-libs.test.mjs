@@ -69,4 +69,15 @@ import { LIVE_PATHS } from '../eval/graph-role/lib/paths.mjs';
   assert.deepEqual(b.chunk[2], ['d1_c1', 'd1_c2']); assert.deepEqual(b.doc[2].map(x => x.id ?? x), ['d1_c1', 'd2_c1']);
   console.log('  OK: stages — graph chunk ranking (dedup, tie-break) and chunk/doc budgets');
 }
+// metrics: quadratic weighted Cohen's kappa — perfect agreement -> 1, hand-computed disagreement case
+{
+  const { weightedKappa } = await import('../eval/graph-role/lib/metrics.mjs');
+  assert.equal(weightedKappa([0,1,2,0,1,2], [0,1,2,0,1,2]), 1);
+  // Hand-computed: O has diagonal 1s at (0,0)(1,1)(2,2) plus off-diagonal 1s at (0,1)(1,2)(2,0); both raters'
+  // marginals are uniform [2,2,2] (n=6), so num=1.5, den=2, kappa=1-0.75=0.25 exactly (mod float rounding).
+  // This is forced by the marginals alone: for any distance weight w(d) with w(0)=0, kappa=0.25 here regardless
+  // of w's shape (linear/quadratic/other all verified to agree) — 0.0526 is not reachable for these vectors.
+  assert.ok(Math.abs(weightedKappa([0,0,1,1,2,2], [0,1,1,2,2,0]) - 0.25) < 1e-9, 'quadratic weighted kappa hand-computed');
+  console.log('  OK: weighted kappa');
+}
 console.log('eval-graph-role-libs: ALL OK');
