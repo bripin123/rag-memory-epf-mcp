@@ -23,7 +23,7 @@
 // Exit codes: 2 usage · 16 REPORT_LINE_MISSING_DENOMINATOR · 17 REPORT_INPUT_MISSING.
 // Every conclusion in the output is PROVISIONAL: this is a dev pilot, not the holdout.
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { EVAL_DIR } from './lib/paths.mjs';
 import * as M from './lib/metrics.mjs';
@@ -297,7 +297,15 @@ const macro = (key) => {
 const mc = macro('cd'), mr = macro('rd');
 metric(`- candidate Δrecall@30(doc) macro ${f3(mc.v)} · rerank ΔnDCG@10 macro ${f3(mr.v)} · gold=per-corpus primary (${labels.map(l => `${l}:${summary[l].primary}`).join(' ')}) · n=${labels.length} usable=${Math.max(mc.k, mr.k)} corpora`);
 const semPass = labels.filter(l => summary[l].semVerdict === 'PASS').length;
-metric(`- K-safety per corpus ${labels.map(l => `${l}:${summary[l].kVerdict}`).join(' ')} · latency-SLO ${labels.map(l => `${l}:${summary[l].sloVerdict}`).join(' ')} · semantics PASS ${semPass}/${labels.length} · gold=per-corpus primary · n=${labels.length} usable=${labels.length}`);
+// The (4) verdict is the pre-registered per-corpus gate (Δ ≥ MCID and the RAW p_null ≤
+// p_null_max); the Holm column for the same endpoint is a different number and it never
+// clears 0.05 at this R. Print both on the same line so "PASS 3/3" cannot be read as
+// adjusted significance.
+const semIdx = (l) => summary[l].fam.findIndex(x => x.name === 'semantics');
+const semAdj = labels.map(l => summary[l].holm[semIdx(l)]).filter(x => x !== null && x !== undefined && !Number.isNaN(x));
+const R20 = th.controls.shuffled_replicates;
+const addOneFloor = 1 / (R20 + 1);
+metric(`- K-safety per corpus ${labels.map(l => `${l}:${summary[l].kVerdict}`).join(' ')} · latency-SLO ${labels.map(l => `${l}:${summary[l].sloVerdict}`).join(' ')} · semantics PASS ${semPass}/${labels.length} — **per-corpus and unadjusted** (gate (4) is Δ ≥ MCID ${th.MCID_semantics_vs_shuffle_null} and the raw \`p_null\` ≤ ${th.p_null_max}); the same endpoint **Holm-adjusted** is ${semAdj.length ? `${f4(Math.min(...semAdj))}–${f4(Math.max(...semAdj))}` : 'n/a'} and never clears 0.05. That is a **resolution limit of R, not a failed endpoint**: with R=${R20} replicates the add-one floor is 1/${R20 + 1}=${f4(addOneFloor)}, already above Holm's first step α/m=${f4(0.05 / 3)}, so at this R the semantics endpoint can never be the family's first rejection and could only clear 0.05 in the last step (i.e. only if the other two are rejected first). Resolution is bought by raising R (a FREEZE.md threshold change), not by raising holdout N — see \`suite/POWER.md\` · gold=per-corpus primary · n=${labels.length} usable=${labels.length}`);
 // Branch ② of the D8 table needs "point >= MCID in >= 2/3 corpora"; report the count as an
 // input, not as a verdict — the branch itself is run-decision.mjs's on holdout.
 const geMcid = (key, mcid) => labels.filter(l => { const m = M.mean(summary[l][key]); return m !== null && m >= mcid; }).length;
@@ -312,9 +320,16 @@ line('- `n=` is the rows the endpoint was eligible for; `usable=` is the rows th
 line('- Anything under **Exploratory** is descriptive only: it is not a gate, is not Holm-adjusted, and must not be quoted as an outcome.');
 line('- `remove-from-ranking` needs futility evidence and `decision-grade` qrels; with `LLM-judged provisional` or absent qrels it is unavailable by construction (proposal D10).');
 
+// The exit-16/17 gates decide whether this run produced a report at all, so the file is
+// written to a temp path and only renamed into place once they pass. A failed run leaves
+// no fresh-looking out/report.md behind: either the previous one survives with its own
+// (older) mtime, or there is none.
 const outPath = P('out', 'report.md');
-writeFileSync(outPath, lines.join('\n') + '\n');
-if (badDenominator.length) { console.error(`REPORT_LINE_MISSING_DENOMINATOR ${badDenominator.length} metric line(s) lack n=/usable=:\n${badDenominator.join('\n')}`); process.exit(16); }
-if (!labels.length) { console.error('REPORT_INPUT_MISSING no corpus had both suite/queries.<c>.jsonl and out/candidates.<c>.real.jsonl'); process.exit(17); }
+const tmpPath = `${outPath}.tmp-${process.pid}`;
+writeFileSync(tmpPath, lines.join('\n') + '\n');
+const abort = (code, msg) => { console.error(msg); rmSync(tmpPath, { force: true }); process.exit(code); };
+if (badDenominator.length) abort(16, `REPORT_LINE_MISSING_DENOMINATOR ${badDenominator.length} metric line(s) lack n=/usable=:\n${badDenominator.join('\n')}`);
+if (!labels.length) abort(17, 'REPORT_INPUT_MISSING no corpus had both suite/queries.<c>.jsonl and out/candidates.<c>.real.jsonl');
+renameSync(tmpPath, outPath);
 console.log(lines.join('\n'));
 console.error(`\nwrote ${outPath} (${lines.length} lines) · corpora ${labels.join(',')}`);

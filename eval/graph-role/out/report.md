@@ -2,7 +2,7 @@
 
 **PROVISIONAL.** Stage 1 is a pilot for variance, not for conclusions (proposal D3/r4). No decision branch is taken here; `run-decision.mjs` (Stage 2) does that on holdout.
 
-Generated 2026-08-18T04:00:57.459Z · engine worktree head `334a409fd85723090f726aab13415276239c27ce` · node v24.12.0.
+Generated 2026-08-20T06:54:21.695Z · engine worktree head `334a409fd85723090f726aab13415276239c27ce` · node v24.12.0.
 Driver run: 2026-08-17T22:25:35Z → 2026-08-18T01:38:16Z (162 steps, nonzero exits []) · measured with light concurrent load (subagent editing only; no builds/tests during the run).
 
 Channel labels: `vector` = **product base ranking (no graph)** — `hybridSearch(q,K,false)` = vector ∨ FTS-boost, so `rrf2`/`rrf3` fold FTS in twice. `purevec` (separate file) = a raw chunk-vector scan, independent of the product path.
@@ -98,7 +98,7 @@ qrels: **absent** (`suite/qrels.hal.jsonl` does not exist — judging pass 1 has
 ## Corpus-stratified macro (mean of corpus means — no naive pooling)
 
 - candidate Δrecall@30(doc) macro 0.014 · rerank ΔnDCG@10 macro 0.021 · gold=per-corpus primary (hub:authored uap:authored hal:authored) · n=3 usable=3 corpora
-- K-safety per corpus hub:FAIL uap:FAIL hal:FAIL · latency-SLO hub:PASS uap:PASS hal:PASS · semantics PASS 3/3 · gold=per-corpus primary · n=3 usable=3
+- K-safety per corpus hub:FAIL uap:FAIL hal:FAIL · latency-SLO hub:PASS uap:PASS hal:PASS · semantics PASS 3/3 — **per-corpus and unadjusted** (gate (4) is Δ ≥ MCID 0.03 and the raw `p_null` ≤ 0.05); the same endpoint **Holm-adjusted** is 0.0952–0.1429 and never clears 0.05. That is a **resolution limit of R, not a failed endpoint**: with R=20 replicates the add-one floor is 1/21=0.0476, already above Holm's first step α/m=0.0167, so at this R the semantics endpoint can never be the family's first rejection and could only clear 0.05 in the last step (i.e. only if the other two are rejected first). Resolution is bought by raising R (a FREEZE.md threshold change), not by raising holdout N — see `suite/POWER.md` · gold=per-corpus primary · n=3 usable=3
 - Stage 2 branch inputs (counts only — the branch is decided on holdout): candidate point ≥ MCID 0.05 in 0/3 corpora, unadjusted CI lower > 0 in 1/3 · rerank point ≥ MCID 0.05 in 0/3, CI lower > 0 in 0/3 · gold=per-corpus primary · n=3 usable=3
 
 ## Reading this report
