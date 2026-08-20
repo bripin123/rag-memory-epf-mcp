@@ -2,7 +2,7 @@
 
 **PROVISIONAL.** Stage 1 is a pilot for variance, not for conclusions (proposal D3/r4). No decision branch is taken here; `run-decision.mjs` (Stage 2) does that on holdout.
 
-Generated 2026-08-20T06:54:21.695Z · engine worktree head `334a409fd85723090f726aab13415276239c27ce` · node v24.12.0.
+Generated 2026-08-20T08:37:04.152Z · engine worktree head `334a409fd85723090f726aab13415276239c27ce` · node v24.12.0.
 Driver run: 2026-08-17T22:25:35Z → 2026-08-18T01:38:16Z (162 steps, nonzero exits []) · measured with light concurrent load (subagent editing only; no builds/tests during the run).
 
 Channel labels: `vector` = **product base ranking (no graph)** — `hybridSearch(q,K,false)` = vector ∨ FTS-boost, so `rrf2`/`rrf3` fold FTS in twice. `purevec` (separate file) = a raw chunk-vector scan, independent of the product path.
@@ -36,8 +36,8 @@ qrels: **absent** (`suite/qrels.hub.jsonl` does not exist — judging pass 1 has
 - pure-vector channel (separate run, real only) recall@10/@30(doc), A+M · gold=authored: purevec=0.53/0.72 · fts=0.59/0.84 · **RRF(purevec,fts)**=0.68/0.88 vs **rrf2**(product base ∪ fts)=0.68/0.88 · n=60 usable=60
 - alternative control families for graph-n1 recall@30(doc), A+M · gold=authored: real 0.300 · type-preserving swap null 0.162 (R=5/5) · same-|E| random null 0.108 (R=1/1) · the pre-registered null for endpoint (4) is the degree-preserving shuffle; these two are the direction/type axis (D6 b/c) and are descriptive only · n=60 usable=60
 - seam status distribution (gold=n/a — run diagnostics, not a retrieval metric): vector=113 · mean seeds 10.00 · mean 1-hop connected 43.76 · mean 2-hop entities 91.00 · mean reach chunks 1769.06 / docs 152.06 · **reachable-set recall (`graph-reach`, D4) is not computable from these outputs** — the runner recorded the reach set SIZES, not the set, so no recall can be derived without re-running · n=113 usable=113
-- upstream gates · gold=authored: `out/upstream.hub.jsonl` absent — **upstream not run** · n=0 usable=0
-- link precision · gold=link-audit judge: `out/link-precision.hub.json` absent — **link audit not merged** (judge-A verdicts pending) · n=0 usable=0
+- upstream gates (D5) · gold=authored (the suite's `seed_candidates` and `expected_paths`): seed_recall 57/60 = 0.950 vs ≥0.7 · edge_validity 12/62 = 0.194 vs ≥0.8 · projection_recall mean n/a · n=60 usable=60
+- link precision · gold=link-audit judge (a separate mention judgement, not qrels): name 1 (n=14) vs ≥0.6 · nonliteral 0.1388888888888889 (n=576) · weighted 0.2367 CI [0.1854,0.289] · n=590 usable=60 chunk clusters
 
 ## uap
 
@@ -64,8 +64,8 @@ qrels: **absent** (`suite/qrels.uap.jsonl` does not exist — judging pass 1 has
 - pure-vector channel (separate run, real only) recall@10/@30(doc), A+M · gold=authored: purevec=0.59/0.78 · fts=0.61/0.82 · **RRF(purevec,fts)**=0.65/0.88 vs **rrf2**(product base ∪ fts)=0.66/0.88 · n=60 usable=60
 - alternative control families for graph-n1 recall@30(doc), A+M · gold=authored: real 0.481 · type-preserving swap null 0.258 (R=5/5) · same-|E| random null 0.217 (R=1/1) · the pre-registered null for endpoint (4) is the degree-preserving shuffle; these two are the direction/type axis (D6 b/c) and are descriptive only · n=60 usable=60
 - seam status distribution (gold=n/a — run diagnostics, not a retrieval metric): vector=114 · mean seeds 10.13 · mean 1-hop connected 48.35 · mean 2-hop entities 82.82 · mean reach chunks 664.50 / docs 83.37 · **reachable-set recall (`graph-reach`, D4) is not computable from these outputs** — the runner recorded the reach set SIZES, not the set, so no recall can be derived without re-running · n=114 usable=114
-- upstream gates · gold=authored: `out/upstream.uap.jsonl` absent — **upstream not run** · n=0 usable=0
-- link precision · gold=link-audit judge: `out/link-precision.uap.json` absent — **link audit not merged** (judge-A verdicts pending) · n=0 usable=0
+- upstream gates (D5) · gold=authored (the suite's `seed_candidates` and `expected_paths`): seed_recall 56/60 = 0.933 vs ≥0.7 · edge_validity 11/62 = 0.177 vs ≥0.8 · projection_recall mean n/a · n=60 usable=60
+- link precision · gold=link-audit judge (a separate mention judgement, not qrels): name 1 (n=93) vs ≥0.6 · nonliteral 0.1115702479338843 (n=484) · weighted 0.465 CI [0.3704,0.5671] · n=577 usable=60 chunk clusters
 
 ## hal
 
@@ -92,8 +92,8 @@ qrels: **absent** (`suite/qrels.hal.jsonl` does not exist — judging pass 1 has
 - pure-vector channel (separate run, real only) recall@10/@30(doc), A+M · gold=authored: purevec=0.67/0.82 · fts=0.67/0.88 · **RRF(purevec,fts)**=0.80/0.92 vs **rrf2**(product base ∪ fts)=0.84/0.92 · n=60 usable=60
 - alternative control families for graph-n1 recall@30(doc), A+M · gold=authored: real 0.572 · type-preserving swap null 0.306 (R=5/5) · same-|E| random null 0.221 (R=1/1) · the pre-registered null for endpoint (4) is the degree-preserving shuffle; these two are the direction/type axis (D6 b/c) and are descriptive only · n=60 usable=60
 - seam status distribution (gold=n/a — run diagnostics, not a retrieval metric): vector=116 · mean seeds 10.00 · mean 1-hop connected 28.20 · mean 2-hop entities 63.14 · mean reach chunks 437.90 / docs 73.90 · **reachable-set recall (`graph-reach`, D4) is not computable from these outputs** — the runner recorded the reach set SIZES, not the set, so no recall can be derived without re-running · n=116 usable=116
-- upstream gates · gold=authored: `out/upstream.hal.jsonl` absent — **upstream not run** · n=0 usable=0
-- link precision · gold=link-audit judge: `out/link-precision.hal.json` absent — **link audit not merged** (judge-A verdicts pending) · n=0 usable=0
+- upstream gates (D5) · gold=authored (the suite's `seed_candidates` and `expected_paths`): seed_recall 56/60 = 0.933 vs ≥0.7 · edge_validity 5/65 = 0.077 vs ≥0.8 · projection_recall mean n/a · n=60 usable=60
+- link precision · gold=link-audit judge (a separate mention judgement, not qrels): name 0.9886363636363636 (n=88) vs ≥0.6 · nonliteral 0.22933884297520662 (n=484) · weighted 0.4751 CI [0.398,0.5495] · n=572 usable=60 chunk clusters
 
 ## Corpus-stratified macro (mean of corpus means — no naive pooling)
 

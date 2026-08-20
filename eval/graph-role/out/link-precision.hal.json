@@ -1,0 +1,39 @@
+{
+  "by_stratum": {
+    "low": {
+      "n": 55,
+      "precision": 0.7090909090909091
+    },
+    "mid": {
+      "n": 217,
+      "precision": 0.3870967741935484
+    },
+    "high": {
+      "n": 300,
+      "precision": 0.25
+    }
+  },
+  "by_provenance": {
+    "name": {
+      "n": 88,
+      "precision": 0.9886363636363636
+    },
+    "nonliteral": {
+      "n": 484,
+      "precision": 0.22933884297520662
+    }
+  },
+  "weighted_precision": 0.4751,
+  "ci95": [
+    0.398,
+    0.5495
+  ],
+  "chunks": 60,
+  "pairs": 572,
+  "reliability": {
+    "n": 114,
+    "agreement": 0.9122807017543859,
+    "kappa": 0.8178331735378715
+  },
+  "reliability_note": null
+}

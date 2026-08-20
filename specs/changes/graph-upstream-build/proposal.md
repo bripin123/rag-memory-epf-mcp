@@ -23,17 +23,16 @@ Stage 1 평가(3 corpus · 질의 180 · 대조군 26 사본/corpus)가 낸 상�
 
 <!-- run-decision:evidence:start -->
 
-> 이 블록은 `eval/graph-role/run-decision.mjs` 가 결정 시점의 실측으로 다시 씁니다. 손으로 고치지 마세요 — 바깥 절은 사람이 씁니다.
+> 이 블록은 `eval/graph-role/run-decision.mjs` 가 결정 시점의 실측으로 다시 씁니다(2026-08-20T08:37:06.749Z). 손으로 고치지 마세요 — 바깥 절은 사람이 씁니다.
 
 | corpus | seed recall (≥0.7) | edge validity (≥0.8) | link precision · name (≥0.6) | link precision · weighted [95% CI] |
 |---|---|---|---|---|
-| hub | 57/60 = **95.0%** | 12/62 = **19.4%** | 측정 전 — 결정 실행이 주입 | 측정 전 — 결정 실행이 주입 |
-| uap | 56/60 = **93.3%** | 11/62 = **17.7%** | 측정 전 — 결정 실행이 주입 | 측정 전 — 결정 실행이 주입 |
-| hal | 56/60 = **93.3%** | 5/65 = **7.7%** | 측정 전 — 결정 실행이 주입 | 측정 전 — 결정 실행이 주입 |
+| hub | 57/60 = **95.0%** | 12/62 = **19.4%** | 1.000 (n=14) | 0.237 [0.185, 0.289] |
+| uap | 56/60 = **93.3%** | 11/62 = **17.7%** | 1.000 (n=93) | 0.465 [0.370, 0.567] |
+| hal | 56/60 = **93.3%** | 5/65 = **7.7%** | 0.989 (n=88) | 0.475 [0.398, 0.549] |
 
 - 정답원 = `authored`(suite 자체 정답) · 등급 `provisional` · 근거 파일 = `eval/graph-role/out/upstream.<c>.jsonl` · `eval/graph-role/out/link-precision.<c>.json` · `eval/graph-role/out/report.md` · 판정 = `eval/graph-role/DECISION.md`
 - required edge 중 KG 부재: hub 50 · uap 51 · hal 60
-- link precision 3열은 **아직 측정되지 않았다**(link-audit 판정 진행 중). 값을 지어내지 않고 비워 둔다 — `run-decision.mjs` 가 `out/link-precision.<c>.json` 을 읽어 이 블록을 다시 쓴다.
 
 <!-- run-decision:evidence:end -->
 
