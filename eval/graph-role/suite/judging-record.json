@@ -1,0 +1,38 @@
+{
+  "_note": "The adjudicated judging facts, transcribed once from the run ledger so run-decision.mjs can quote them instead of inventing them. judge-merge.mjs prints kappa to stdout and exits 8 without writing any artifact, so there is no machine file to read; this is that file. Anything here must be checkable against the ledger entry named in `source`.",
+  "recorded_at": "2026-08-20",
+  "gate_kappa_weighted": 0.67,
+  "grade": "provisional",
+  "grade_reason": "qrels not established (weighted kappa below gate on the only judged corpus) and no human audit — proposal D10 / delta R7. Conclusions ride the AUTHORED gold axis.",
+  "source": ".superpowers/sdd/2026-08-17-graph-role-evaluation-stage1/progress.md — entries `JUDGING hub COMPLETE + KAPPA GATE FAIL (2026-08-20)` and `USER DECISION (2026-08-20)` (worktree-local ledger, git-ignored)",
+  "corpora": {
+    "hub": {
+      "pass": "pass 1 (fixed depth 10)",
+      "judges": { "A": "claude-sonnet-5", "B": "gpt-5 (codex)", "C": "not dispatched (the gate halts before adjudication)" },
+      "items_judged": "pass1 4135 rows per judge · unpooled 100 · deepsample 100",
+      "weighted_kappa": { "all": 0.619, "A": 0.659, "M": 0.571 },
+      "gate_result": "KAPPA_BELOW_GATE (judge-merge.mjs --pass1-only, exit 8)",
+      "qrels_written": false,
+      "adjudication": "not run (no to-adjudicate file is produced when the gate halts)",
+      "disagreement_profile": "agree 2916/4135 (70.5%); of the 1219 disagreements 0↔1 817 (67%) · 1↔2 270 (22%) · 0↔2 head-on 132 (11%); judge B more lenient in 997/1219 (82%) = systematic grade-boundary calibration gap, not noise"
+    },
+    "uap": { "pass": "not judged", "qrels_written": false, "gate_result": "n/a — judging cancelled by the 2026-08-20 user decision before this corpus was pooled for judging" },
+    "hal": { "pass": "not judged", "qrels_written": false, "gate_result": "n/a — judging cancelled by the 2026-08-20 user decision before this corpus was pooled for judging" }
+  },
+  "corpora_not_judged": ["uap", "hal"],
+  "human_audit": {
+    "present": false,
+    "note": "the 50-pair/corpus floor (thresholds.json human_audit.pairs_per_corpus) is user time and was not spent; without it qrels could only ever have been `LLM-judged provisional` (proposal D10)"
+  },
+  "remedy": {
+    "description": "the frozen suite/JUDGING.md remedy for a below-gate kappa = revise the rubric examples, re-run BOTH judges over the whole corpus, and discard the earlier outputs to pool/rejected/",
+    "executed": false,
+    "reason": "user decision 2026-08-20 — the judged axis cannot flip the K-safety FAIL without both a gate pass and a human audit, and the upstream-first evidence needs neither"
+  },
+  "user_decision": {
+    "date": "2026-08-20",
+    "decision": "stop at the kappa gate; do NOT execute the frozen re-judge remedy; conclude Stage 1 on the authored axis. Judged qrels recorded as not established. Pass 2 / uap / hal judging stays cancelled.",
+    "followup_requirement": "the follow-up build-improvement change MUST include a thorough external survey of Graph-RAG construction approaches (Microsoft GraphRAG / LightRAG / HippoRAG lineage at minimum) as design input before building",
+    "quote": "구축개선 할때 graph rag을 확실히 조사해서 구축하자"
+  }
+}

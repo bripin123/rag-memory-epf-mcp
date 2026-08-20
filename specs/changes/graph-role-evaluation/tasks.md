@@ -34,6 +34,8 @@
 - [ ] **T10 holdout 전 조건 실행 → pool → 판정 → qrel 동결** — T5·T6 절차 반복(holdout).
 - [ ] **T11 결정 → DECISION.md + 후속 change 개설** — `run-decision.mjs`(동결 검사 → gatekeeping 다섯 갈래 → semantics 축 → provisional 이면 remove 금지) → `DECISION.md` · 같은 commit 에 `specs/changes/<selected>/proposal.md`(acceptance: `mode` · 방향/type/confidence · latency/quality · 재평가 명령) · 프레임워크 tracker receipt 경로 기록 · §227 재현 쿼리 2개 관찰.
   완료 기준: DECISION.md · 갈래 1개(다섯 중) · 후속 change 디렉터리 존재 · receipt 경로 · `npm test` EXIT 0 · commit.
+  ↳ 코드 완료 2026-08-20(세션40): `run-decision.mjs`(D8 표 그대로 · 해석 고정 I-1~I-4 를 코드 주석과 DECISION 양쪽에 · 통계는 `out/report.md` 에서 **읽기만** 하고 재계산 0 · upstream 정수 합만 재집계하고 report 줄과 교차검증) · `suite/judging-record.json`(κ 0.619 / qrels 미작성 / 사람 audit 부재 / 사용자 결정 = ledger 에서 1회 전사 — `judge-merge.mjs` 는 κ 를 stdout 으로만 낸다) · `specs/changes/graph-upstream-build/proposal.md`(갈래 ① 후속 · **Phase 0 = Graph-RAG 계보 외부 조사 필수 게이트**, 사용자 2026-08-20 원문) · `test/eval-graph-role-t11-decision.test.mjs`(12 케이스 · `verify:engine` 배선) · README exit 18~26.
+  실행 대기 = `out/link-precision.<c>.json` ×3(link-audit 판정 진행 중) → `report.mjs` 재실행(현 report.md 는 upstream/link 줄이 낡아 exit 22) → `run-decision.mjs`. **아직 `DECISION.md` 를 쓰지 않았다** — 부분 입력으로 쓰지 않는 것이 이 러너의 계약이다.
 - [ ] **T12 마감** — README 완성 · `out/` 등 commit · 상태 = `evaluation complete`(root repair 는 후속 change).
 
 ## Test Plan (Phase 3b)

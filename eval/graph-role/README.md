@@ -1,8 +1,8 @@
 # graph-role evaluation harness
 
 Runs ONLY on `.backup` copies (`dbs/`, gitignored). Summaries are forced off. One measuring process at a time.
-Order: snapshot → suite freeze → controls → run-candidates/run-final (all conditions) → pool → judging → qrel freeze → upstream → link-audit (sample → judge-A/judge-B → merge) → report → power.
-Exit codes: 3 FROZEN_MISMATCH · 4 REFUSE_LIVE_DB · 5 SUITE_INVALID · 6 CONTROL_DEGREE_MISMATCH · 7 POOL_INCOMPLETE · 8 KAPPA_BELOW_GATE · 9 MODEL_NOT_READY · 10 SOURCE_MTIME_CHANGED · 11 JUDGE_INCOMPLETE · 12 ADJUDICATION_PENDING · 13 OUTLIERS_PRESENT · 14 MANIFEST_INCOMPLETE · 15 LINK_AUDIT_INPUT_MISSING (link-audit-merge.mjs: a required input file -- the sample, the prevalence file, or the judge-A verdicts -- does not exist yet, or judge-A shares no jids with the sample) · 16 REPORT_LINE_MISSING_DENOMINATOR (report.mjs emitted a metric line without `n=`, `usable=` or `gold=` -- spec R8's denominator rule plus the gold-source rule, enforced in code rather than by habit) · 17 REPORT_INPUT_MISSING (report.mjs/power.mjs: no corpus had both `suite/queries.<c>.jsonl` and `out/candidates.<c>.real.jsonl`).
+Order: snapshot → suite freeze → controls → run-candidates/run-final (all conditions) → pool → judging → qrel freeze → upstream → link-audit (sample → judge-A/judge-B → merge) → report → power → decision.
+Exit codes: 3 FROZEN_MISMATCH · 4 REFUSE_LIVE_DB · 5 SUITE_INVALID · 6 CONTROL_DEGREE_MISMATCH · 7 POOL_INCOMPLETE · 8 KAPPA_BELOW_GATE · 9 MODEL_NOT_READY · 10 SOURCE_MTIME_CHANGED · 11 JUDGE_INCOMPLETE · 12 ADJUDICATION_PENDING · 13 OUTLIERS_PRESENT · 14 MANIFEST_INCOMPLETE · 15 LINK_AUDIT_INPUT_MISSING (link-audit-merge.mjs: a required input file -- the sample, the prevalence file, or the judge-A verdicts -- does not exist yet, or judge-A shares no jids with the sample) · 16 REPORT_LINE_MISSING_DENOMINATOR (report.mjs emitted a metric line without `n=`, `usable=` or `gold=` -- spec R8's denominator rule plus the gold-source rule, enforced in code rather than by habit) · 17 REPORT_INPUT_MISSING (report.mjs/power.mjs: no corpus had both `suite/queries.<c>.jsonl` and `out/candidates.<c>.real.jsonl`) · 18 REPORT_MISSING · 19 REPORT_PARSE_FAILED · 20 UPSTREAM_MISSING · 21 LINK_PRECISION_MISSING · 22 REPORT_STALE · 23 ARTIFACT_MISMATCH · 24 JUDGING_RECORD_MISSING · 25 JUDGING_RECORD_INCONSISTENT · 26 FOLLOWUP_CHANGE_MISSING (18-26 are `run-decision.mjs`; see "Decision" below).
 
 Channel labels: `vector` (in `candidates.*.jsonl`) = product base ranking (no graph) — `hybridSearch(q, K, false)` = vector ∨ FTS-boost, not pure vector (its `rrf2`/`rrf3` therefore fold FTS twice). `purevec` (in `purevec.*.jsonl`, Task 5b) = pure vector — a raw chunk vector scan on the query embedding (k=100), independent of the product ranking path and of the graph seam.
 
@@ -43,3 +43,21 @@ node eval/graph-role/power.mjs     # -> suite/POWER.md  (also printed to stdout)
 Both scripts also run before `run-upstream.mjs`/`link-audit-merge.mjs` have produced anything -- the corresponding lines then say `upstream not run` / `link audit not merged`.
 
 `power.mjs` turns the pilot SD of each paired endpoint into a holdout N at power 0.8, checks it against the frozen judging budget (per-query judging cost re-derived from `out/`, not read from `pool/`), and says `not estimable` instead of extrapolating where an input is missing. **`suite/POWER.md` and `thresholds.json` must be hashed into `suite/FREEZE.md` before the holdout is opened (R9)** -- writing the file is not freezing it.
+
+## Decision (Task 11)
+
+```
+node eval/graph-role/run-decision.mjs    # -> eval/graph-role/DECISION.md
+```
+
+Applies the five-way gatekeeping table (`upstream-first` -> `candidate-generation+RRF` -> `gated-rerank` -> `remove-from-ranking` -> `inconclusive->expand-evaluation`, first true branch wins) exactly as written in `specs/changes/graph-role-evaluation/proposal.md` D8 (lines 63-71) and `delta-specs/graph-role-evaluation.spec.md` R9/R7. The four places where that prose leaves a degree of freedom are resolved in the script's `INTERPRETATIONS` header and reprinted verbatim into DECISION.md.
+
+**It consumes, it does not recompute.** Every statistic is read out of `out/report.md` -- report.mjs owns the bootstrap CIs, sign tests, Holm adjustment and per-endpoint verdicts. The only numbers this script derives are two integer sums from `out/upstream.<c>.jsonl` (seed hits, edge exists/total), and even those are cross-checked against report.md's own upstream line (`exit 23` on disagreement). A report that still says `upstream not run` / `link audit not merged` while those artifacts exist is `exit 22` -- re-run `report.mjs` first.
+
+**Required inputs, all of them, or nothing is written:** `out/report.md` (18) · `out/upstream.<c>.jsonl` for every corpus the report covers (20) · `out/link-precision.<c>.json` for every one of them (21) · `suite/judging-record.json` (24). The last one is the adjudicated judging record (weighted kappa, whether qrels were written, human-audit presence, the user decision) -- `judge-merge.mjs` prints kappa to stdout and exits without writing any artifact, so that file is where the number lives; the script quotes it and refuses to invent it. It is cross-checked against what is on disk (25).
+
+**Freeze:** `suite/queries.<c>.jsonl` and `thresholds.json` must match `suite/FREEZE.md` (exit 3 -- R9's "임계값 변조"). `suite/qrels.<c>.jsonl` is optional and takes the same QRELS_ABSENT stance as `run-upstream.mjs`: absent means not measured, never 0, and the grade can then only be `provisional`.
+
+**Provisional guard (delta R7, MUST):** branch (4) `remove-from-ranking` is refused whenever the qrels grade is not `decision-grade`; the verdict is downgraded to (5) and DECISION.md records the refusal, the branch it refused, and why. Branch (4) additionally needs "검정력 확보" attested by a frozen `suite/POWER.md`, and futility for the semantics endpoint needs a CI that `report.mjs` does not currently emit (`SEMANTICS_CI_ABSENT`).
+
+**Follow-up change (delta R11):** the selected branch's `specs/changes/<slug>/proposal.md` must exist in the same commit. The `upstream-first` branch scaffolds `specs/changes/graph-upstream-build/proposal.md` and, on later runs, refreshes only the marker-delimited evidence block (`<!-- run-decision:evidence:start -->` … `end`) so hand-written design prose survives while the numbers stay the measured ones. Any other branch exits 26 naming the change that has to be opened -- DECISION.md is still written.
