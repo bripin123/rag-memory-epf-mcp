@@ -4,14 +4,14 @@
 // gold doc in the product's graph-off top10). One row per non-K query, joined across
 // queries/observed/candidates(real)/final(real)/qrels.
 //
-// Cannot run end-to-end until suite/qrels.<label>.jsonl exists (Task 6 output; not yet produced/
-// frozen as of Task 7). assertFrozen({ rel: `qrels.${label}.jsonl` }) will throw an uncaught ENOENT
-// from sha256File before it can even report FROZEN_MISMATCH, because that helper hashes the file
-// unconditionally (readFreeze().get() returning undefined does not short-circuit the hash). That is
-// existing lib/freeze.mjs behavior shared by every other assertFrozen caller in this harness, not
-// something this script special-cases -- per the Task 7 dispatch, this script was written and its
-// pure part unit-tested, but deliberately NOT executed (qrels missing).
-import { readFileSync, writeFileSync } from 'node:fs';
+// Runs with or without qrels. Where suite/qrels.<label>.jsonl exists (Task 6 output) it is
+// frozen-checked exactly as before and used as judged gold. Where it does not -- Stage 1's judging
+// ended on the authored axis after the kappa gate failed, so no qrels were written -- the script
+// prints QRELS_ABSENT on stderr and emits every judged-gold-dependent metric as null beside an
+// explicit `skipped`/`skipped_metrics` marker, so a consumer can never read "not measured" as 0.
+// The structural metrics (seed recall, edge validity, encoded-path coverage) need no gold and are
+// computed either way; they are the upstream-first evidence this run exists to produce.
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import { CORPORA, EVAL_DIR } from './lib/paths.mjs';
@@ -42,16 +42,26 @@ export function computeEdgeValidity(expEdges, obs) {
   return ev;
 }
 
+// Judged gold, or the explicit absence of it. Pure (path in, data out) so the qrels-absent
+// decision is unit-testable without a DB. An existing file is still frozen-checked by the caller;
+// `skipped` is non-null only when the file itself is not there.
+export function loadGoldDocs(path) {
+  if (!existsSync(path)) return { goldDocs: new Map(), skipped: 'qrels-absent' };
+  const goldDocs = new Map();
+  for (const q of readJsonl(path)) if (q.grade >= 1) (goldDocs.get(q.qid) || goldDocs.set(q.qid, new Set()).get(q.qid)).add(q.doc_id);
+  return { goldDocs, skipped: null };
+}
+
 export function run(label) {
   assertFrozen({ rel: `queries.${label}.jsonl` });
-  assertFrozen({ rel: `qrels.${label}.jsonl` });
+  const qrelsPath = join(EVAL_DIR, 'suite', `qrels.${label}.jsonl`);
+  if (existsSync(qrelsPath)) assertFrozen({ rel: `qrels.${label}.jsonl` });
+  else console.error(`QRELS_ABSENT ${label} (kappa gate fail — authored-axis run); judged-gold metrics skipped`);
   const queries = readJsonl(join(EVAL_DIR, 'suite', `queries.${label}.jsonl`)).filter(q => q.class !== 'K');
   const observed = new Map(readJsonl(join(EVAL_DIR, 'suite', `observed.${label}.jsonl`)).map(o => [o.id, o.observed_paths]));
   const cand = new Map(readJsonl(join(EVAL_DIR, 'out', `candidates.${label}.real.jsonl`)).map(r => [r.id, r]));
   const fin = new Map(readJsonl(join(EVAL_DIR, 'out', `final.${label}.real.jsonl`)).map(r => [r.id, r]));
-  const qrels = readJsonl(join(EVAL_DIR, 'suite', `qrels.${label}.jsonl`));
-  const goldDocs = new Map();
-  for (const q of qrels) if (q.grade >= 1) (goldDocs.get(q.qid) || goldDocs.set(q.qid, new Set()).get(q.qid)).add(q.doc_id);
+  const { goldDocs, skipped } = loadGoldDocs(qrelsPath);
   const db = new Database(CORPORA[label].copy, { readonly: true });
   const linkCount = db.prepare(`SELECT COUNT(*) c FROM chunk_entities ce JOIN chunk_metadata cm ON cm.rowid = ce.chunk_rowid WHERE cm.chunk_id = ?`);
   const idOf = new Map(db.prepare(`SELECT id, name FROM entities`).all().map(r => [r.name, r.id]));
@@ -69,18 +79,24 @@ export function run(label) {
     const expEdges = (q.expected_paths || []).flat();
     const ev = computeEdgeValidity(expEdges, obs);
     const gold = goldDocs.get(q.id) || new Set();
-    // seeds' own docs, union with the harness's 2-hop reach proxy (graph-n1 doc100) for "the graph
-    // made this doc reachable" -- connected (non-seed) entity names are not carried in candidates
-    // rows, so they cannot be recomputed here without re-running the seam; graph-n1 doc100 stands
-    // in for that reach.
-    const connectedDocs = docsOfEntities([...new Set(c.seeds.map(s => s.name))]);
-    const n1Docs = new Set((c.channels['graph-n1'].doc100 || []).map(id => id.split('_chunk_')[0]));
-    const projection_recall = gold.size ? [...gold].filter(d => n1Docs.has(d) || connectedDocs.has(d)).length / gold.size : null;
-    const f = fin.get(q.id); let hub = null;
-    if (f && gold.size) {
-      const top = f.off.top10;
-      const gi = top.findIndex(x => gold.has(x.doc));
-      hub = { gold_rank_off: gi < 0 ? -1 : gi + 1, above_gold_link_counts: gi > 0 ? top.slice(0, gi).map(x => linkCount.get(x.chunk_id).c) : [] };
+    // Both of these read judged gold, so both are unmeasurable without qrels -- null here means
+    // "no judged gold for this query", and `skipped` below says whether that is because the whole
+    // qrels file is missing (not measured) rather than this one query having no graded document.
+    let projection_recall = null, hub = null;
+    if (!skipped) {
+      // seeds' own docs, union with the harness's 2-hop reach proxy (graph-n1 doc100) for "the graph
+      // made this doc reachable" -- connected (non-seed) entity names are not carried in candidates
+      // rows, so they cannot be recomputed here without re-running the seam; graph-n1 doc100 stands
+      // in for that reach.
+      const connectedDocs = docsOfEntities([...new Set(c.seeds.map(s => s.name))]);
+      const n1Docs = new Set((c.channels['graph-n1'].doc100 || []).map(id => id.split('_chunk_')[0]));
+      projection_recall = gold.size ? [...gold].filter(d => n1Docs.has(d) || connectedDocs.has(d)).length / gold.size : null;
+      const f = fin.get(q.id);
+      if (f && gold.size) {
+        const top = f.off.top10;
+        const gi = top.findIndex(x => gold.has(x.doc));
+        hub = { gold_rank_off: gi < 0 ? -1 : gi + 1, above_gold_link_counts: gi > 0 ? top.slice(0, gi).map(x => linkCount.get(x.chunk_id).c) : [] };
+      }
     }
     out.push({
       id: q.id, class: q.class, author_mode: q.author_mode,
@@ -88,12 +104,13 @@ export function run(label) {
       edge_validity: ev,
       encoded_path_coverage: q.author_mode === 'kg-informed' ? (ev.total ? ev.exists / ev.total : null) : null,
       projection_recall, hubdeg_misrank: hub,
+      ...(skipped ? { skipped, skipped_metrics: ['projection_recall', 'hubdeg_misrank'] } : {}),
     });
   }
   writeFileSync(join(EVAL_DIR, 'out', `upstream.${label}.jsonl`), out.map(r => JSON.stringify(r)).join('\n') + '\n');
   const n = out.length, sr = out.filter(o => o.seed_recall).length;
   const evT = out.reduce((a, o) => a + o.edge_validity.total, 0), evE = out.reduce((a, o) => a + o.edge_validity.exists, 0);
-  console.log(`${label}: n=${n} seed_recall ${sr}/${n} edge_validity ${evE}/${evT} (source-grounded rows only counted where author_mode=source-grounded: ${out.filter(o => o.author_mode === 'source-grounded').length})`);
+  console.log(`${label}: n=${n} seed_recall ${sr}/${n} edge_validity ${evE}/${evT} (source-grounded rows only counted where author_mode=source-grounded: ${out.filter(o => o.author_mode === 'source-grounded').length})${skipped ? ` · projection_recall/hubdeg_misrank null — ${skipped} (not measured, not 0)` : ''}`);
   db.close();
   return out;
 }
