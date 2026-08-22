@@ -23,7 +23,7 @@ Stage 1 평가(3 corpus · 질의 180 · 대조군 26 사본/corpus)가 낸 상�
 
 <!-- run-decision:evidence:start -->
 
-> 이 블록은 `eval/graph-role/run-decision.mjs` 가 결정 시점의 실측으로 다시 씁니다(2026-08-20T08:37:06.749Z). 손으로 고치지 마세요 — 바깥 절은 사람이 씁니다.
+> 이 블록은 `eval/graph-role/run-decision.mjs` 가 결정 시점의 실측으로 다시 씁니다(2026-08-22T04:27:30.722Z). 손으로 고치지 마세요 — 바깥 절은 사람이 씁니다.
 
 | corpus | seed recall (≥0.7) | edge validity (≥0.8) | link precision · name (≥0.6) | link precision · weighted [95% CI] |
 |---|---|---|---|---|

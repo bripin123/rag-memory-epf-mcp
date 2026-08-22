@@ -75,8 +75,15 @@ const linkPrecision = (name, n = 50) => ({
 });
 
 // report.mjs's own line grammar, corpus by corpus.
-function reportMd(sections) {
-  const L = [
+// `stage2: true` emits the header a real holdout report carries. The default stays the Stage 1
+// pilot header because that is what report.mjs writes today — but a test that wants to exercise
+// "decision-grade unlocks branch (4)" must NOT use it: run-decision downgrades any pilot report to
+// `provisional` on purpose, so the pilot header would make that test assert the wrong thing.
+function reportMd(sections, { stage2 = false } = {}) {
+  const L = stage2 ? [
+    '# graph-role evaluation report — Stage 2 (holdout · SUMMARIES=off)', '',
+    'Holdout run. A decision branch may be taken from this report (proposal D3/r4).', '',
+  ] : [
     '# graph-role evaluation report — Stage 1 pilot (dev split · SUMMARIES=off)', '',
     '**PROVISIONAL.** Stage 1 is a pilot for variance, not for conclusions (proposal D3/r4).', '',
     'Generated 2026-08-20T07:00:00.000Z · engine worktree head `deadbee` · node v22.11.0.', '',
@@ -136,7 +143,7 @@ const REAL = {
 };
 
 // Builds the whole input set. `over` patches per-corpus fields; `omit` drops artifacts.
-function fixture(s, { grade = 'provisional', over = {}, omitLinkPrecision = [], powerFrozen = false, base = REAL } = {}) {
+function fixture(s, { grade = 'provisional', over = {}, omitLinkPrecision = [], powerFrozen = false, base = REAL, stage2 = false } = {}) {
   const labels = ['hub', 'uap', 'hal'];
   const sections = labels.map(label => {
     const b = { label, slo: 'PASS', ...base[label], ...(over[label] ?? {}) };
@@ -148,7 +155,7 @@ function fixture(s, { grade = 'provisional', over = {}, omitLinkPrecision = [], 
     writeJsonl(join(s.dir, 'out', `upstream.${label}.jsonl`), upstreamRows(label, sec.up));
     if (!omitLinkPrecision.includes(label)) writeFileSync(join(s.dir, 'out', `link-precision.${label}.json`), JSON.stringify(linkPrecision(sec.lp), null, 2) + '\n');
   }
-  writeFileSync(join(s.dir, 'out', 'report.md'), reportMd(sections));
+  writeFileSync(join(s.dir, 'out', 'report.md'), reportMd(sections, { stage2 }));
   writeFileSync(join(s.dir, 'suite', 'judging-record.json'), JSON.stringify(judgingRecord(grade), null, 2) + '\n');
   const frozen = ['queries.hub.jsonl', 'queries.uap.jsonl', 'queries.hal.jsonl', '../thresholds.json'];
   if (powerFrozen) { writeFileSync(join(s.dir, 'suite', 'POWER.md'), '# POWER (fixture)\n'); frozen.push('POWER.md'); }
@@ -326,16 +333,58 @@ test('(c) futility + provisional grade: branch (4) remove-from-ranking is refuse
 
 // Mutation check for (c): the refusal must come from the grade, not from the branch being
 // unreachable. The same inputs with `decision-grade` have to reach (4).
+// The report must be a Stage 2 holdout run — see (c-stage1) for why a pilot report cannot.
 test('(c-mutation) the identical futility fixture at decision-grade does select remove-from-ranking', () => {
   const s = sandbox();
   try {
-    fixture(s, { grade: 'decision-grade', over: FUTILE, powerFrozen: true });
+    fixture(s, { grade: 'decision-grade', over: FUTILE, powerFrozen: true, stage2: true });
     const r = run(s);
     assert.match(r.stdout, /branch = ④ remove-from-ranking/);
     assert.doesNotMatch(r.stdout, /REMOVE_FORBIDDEN_ON_PROVISIONAL/);
     const md = readFileSync(join(s.dir, 'DECISION.md'), 'utf8');
     assert.match(md, /\*\*갈래 = ④ remove-from-ranking\*\*/);
   } finally { teardown(s); }
+});
+
+// The grade in suite/judging-record.json is a single unfrozen word and it is the only thing
+// gating branch (4). A Stage 1 pilot / dev-split report can never support a decision-grade
+// verdict, so the runner forces the downgrade structurally rather than trusting that word.
+// Measured 2026-08-22: the same fixture as (c-mutation) minus `stage2` must land on (5).
+test('(c-stage1) a Stage 1 pilot report at decision-grade is downgraded and (4) stays refused', () => {
+  const s = sandbox();
+  try {
+    fixture(s, { grade: 'decision-grade', over: FUTILE, powerFrozen: true });
+    const r = run(s);
+    assert.match(r.stderr, /STAGE1_PILOT_DOWNGRADE/);
+    assert.match(r.stdout, /grade = provisional/);
+    assert.match(r.stdout, /REMOVE_FORBIDDEN_ON_PROVISIONAL/);
+    assert.doesNotMatch(r.stdout, /branch = ④ remove-from-ranking/);
+    const md = readFileSync(join(s.dir, 'DECISION.md'), 'utf8');
+    assert.match(md, /Stage 1 pilot\(dev split\) 실측 위에서 선택됐다/);
+    assert.match(md, /holdout 에는 A·M 질의가 존재하지 않는다/);
+  } finally { teardown(s); }
+});
+
+// A level-2 heading closes a corpus section; `###` subheadings inside it must not. Without the
+// first half, endpoint-shaped lines under "## Corpus-stratified macro …" silently overwrote the
+// last corpus; without the second, every corpus lost its endpoints. Both measured 2026-08-22.
+test('(g) a spaced level-2 heading closes the section, but ### subheadings do not', async () => {
+  const { parseReport } = await import('../eval/graph-role/run-decision.mjs');
+  const K = (mean, lower, verdict) =>
+    `- **(1) K-safety** Δhit@5(on−off), oracle chunk · gold=authored (suite oracle; needs no judging): mean ${mean} · one-sided 95% lower ${lower} vs −δ=-0.02 → **${verdict}** · n=53 usable=53`;
+  const base = [
+    '# graph-role evaluation report — Stage 1 pilot (dev split · SUMMARIES=off)', '',
+    'Generated 2026-08-20T07:00:00.000Z · engine worktree head `deadbee` · node v22.11.0.', '',
+    '## hub', '',
+    '### Primary endpoints (gatekeeping order)', '',
+    K('-0.302', '-0.415', 'FAIL'), '',
+  ].join('\n');
+  const hub = parseReport(base, ['hub', 'uap', 'hal']).corpora.get('hub');
+  assert.deepEqual(hub.k?.verdict, 'FAIL', '### subheadings must not close the corpus section');
+
+  const injected = base + ['', '## Corpus-stratified macro (mean of corpus means)', '', K('0.999', '0.500', 'PASS'), ''].join('\n');
+  const after = parseReport(injected, ['hub', 'uap', 'hal']).corpora.get('hub');
+  assert.deepEqual(after.k, hub.k, 'a spaced level-2 heading must not leak into the previous corpus');
 });
 
 // Same futility, but POWER.md is not frozen: "검정력 확보 상태" (I-4) is unmet, so (4) is not

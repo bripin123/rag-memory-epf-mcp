@@ -153,14 +153,34 @@ const ciOf = (s) => {
 
 export function parseReport(text, corpusLabels) {
   const known = new Set(corpusLabels);
-  const out = { generated: null, head: null, node: null, corpora: new Map() };
+  const out = { generated: null, head: null, node: null, title: null, stage: null, split: null, corpora: new Map() };
   let cur = null;
   for (const raw of text.split('\n')) {
     const l = raw.trim();
+    // The report states its own provenance in the H1. Read it: a Stage 1 pilot on the dev split
+    // is explicitly "not for conclusions" (proposal D3/r4), and consuming one silently is how a
+    // pilot becomes a decision without anyone deciding that. Measured 2026-08-22.
+    const t = l.match(/^# graph-role evaluation report — (.+)$/);
+    if (t) {
+      out.title = t[1];
+      out.stage = /Stage\s*1/i.test(t[1]) ? 'stage-1-pilot' : (/Stage\s*2/i.test(t[1]) ? 'stage-2' : null);
+      if (/\bdev split\b/i.test(t[1])) out.split = 'dev';
+      else if (/\bholdout\b/i.test(t[1])) out.split = 'holdout';
+      continue;
+    }
     const gen = l.match(/^Generated (\S+) · engine worktree head `([^`]*)` · node (\S+?)\.?$/);
     if (gen) { out.generated = gen[1]; out.head = gen[2]; out.node = gen[3]; continue; }
-    const h = l.match(/^## (\S+)$/);
-    if (h) { cur = known.has(h[1]) ? h[1] : null; if (cur && !out.corpora.has(cur)) out.corpora.set(cur, { label: cur }); continue; }
+    // A LEVEL-2 heading closes the current corpus section; `###` subheadings do not (the report
+    // nests "### Primary endpoints" inside each corpus). Matching only `^## (\S+)$` left `cur`
+    // pointing at the previous corpus when a level-2 heading had spaces ("## Corpus-stratified
+    // macro …"), so endpoint-shaped lines under it silently overwrote that corpus. Both halves
+    // measured 2026-08-22: resetting on `#{2,}` instead broke every corpus (11/12 tests red).
+    if (/^##(?!#)\s/.test(l)) {
+      const h = l.match(/^## (\S+)$/);
+      cur = (h && known.has(h[1])) ? h[1] : null;
+      if (cur && !out.corpora.has(cur)) out.corpora.set(cur, { label: cur });
+      continue;
+    }
     if (!cur) continue;
     const c = out.corpora.get(cur);
 
@@ -394,6 +414,20 @@ function decisionMarkdown({ sel, corpora, th, rec, rep, grade, powerFrozen, foll
   w(`생성 ${new Date().toISOString()} · 근거 = \`out/report.md\`(생성 ${rep.generated ?? 'n/a'} · engine head \`${rep.head ?? 'n/a'}\`) + \`out/upstream.<c>.jsonl\` + \`out/link-precision.<c>.json\` + \`suite/judging-record.json\`. 이 파일은 \`run-decision.mjs\` 가 씁니다 — 손으로 고치지 말고 러너를 다시 돌리세요.`);
   w('');
   w(`대상 corpus = **${corpora.map(c => c.label).join(' · ')}** (${coverage.covered}/${coverage.total} of \`lib/paths.mjs\` CORPORA).`);
+  w('');
+  w(`## 0. 이 판정이 무엇 위에 서 있나 (측정 기반)`);
+  w('');
+  w(`소비한 리포트 = **${rep.title ?? 'n/a'}** · stage \`${rep.stage ?? 'unknown'}\` · split \`${rep.split ?? 'unknown'}\`.`);
+  if (rep.stage === 'stage-1-pilot' || rep.split === 'dev') {
+    w('');
+    w('🔴 **이 갈래는 holdout 이 아니라 Stage 1 pilot(dev split) 실측 위에서 선택됐다.** 동결 규정(proposal D3/r4)은 결정을 holdout 에서 내리도록 적어 두었으므로, 그 조건은 **충족되지 않았다.** 무엇이 그래도 성립하고 무엇이 성립하지 않는지를 갈라 적는다:');
+    w('');
+    w('- **성립**: 갈래 ①(`upstream-first`)의 진입 게이트는 *검정력이 필요한 효능 비교*가 아니라 **구조 지표**다 — 소스 문서가 진술하는 관계가 KG 에 존재하는가. 그리고 dev/holdout 분리가 막으려는 누출 통로(**작성자가 답을 보고 문제를 냄**)는 이 suite 에서 **다른 방식으로 이미 닫혀 있다**: A·M 질의 전부가 `author_mode: source-grounded`(작성자는 `documents.content` + `entities.name` 만 열람, `relationships`·`chunk_entities` 금지)이고 `kg-informed` 는 **0건**이다.');
+    w('- **성립 안 함**: 그럼에도 이 값의 **두 번째 독립 추정치는 없다.** 그리고 홀드아웃으로 확인할 길이 지금은 막혀 있다 — **holdout 에는 A·M 질의가 존재하지 않는다**(전 corpus `A 30 dev / M 30 dev`, holdout 은 K 뿐: hub 30 · uap 30 · hal 26). `edge_validity` 는 주로 M 브리지 질의에서 나오므로, holdout 판을 만들려면 **T9(A·M holdout 작성·동결)를 먼저 해야 한다.**');
+    w('- **등급 귀결**: 이 사유만으로도 결론은 `provisional` 을 벗어날 수 없다. 러너가 이것을 **구조적으로 강제**한다(판정 기록의 `grade` 가 무엇이든 pilot 리포트면 `provisional` 로 내린다).');
+    w('');
+    w('> 이 절은 *"dev 라 괜찮다"* 도 *"dev 라 틀렸다"* 도 아니다 — **무엇을 쟀고 무엇을 안 쟀는지**를 읽는 사람이 직접 판단할 수 있게 적어 둔 것이다.');
+  };
   if (coverage.covered !== coverage.total) w(`⚠ 미포함 = ${coverage.missing.join(', ')} — 이 갈래는 포함된 ${coverage.covered} corpus 위에서만 판정됐다.`);
   w('');
 
@@ -634,7 +668,14 @@ function main() {
 
   const rec = loadJudgingRecord();
   const corpora = covered.map(label => loadCorpus(label, rep, th, rec));
-  const grade = rec.grade;
+  // A Stage 1 pilot / dev-split report can never carry a decision-grade verdict, whatever
+  // suite/judging-record.json says. The record's `grade` is a single unfrozen word and it is the
+  // only thing gating branch (4); this makes the pilot case structural instead of trusting it.
+  const pilot = rep.stage === 'stage-1-pilot' || rep.split === 'dev';
+  const grade = (pilot && rec.grade === 'decision-grade') ? 'provisional' : rec.grade;
+  if (pilot && rec.grade !== grade) {
+    console.error(`STAGE1_PILOT_DOWNGRADE judging-record says \`${rec.grade}\` but out/report.md declares "${rep.title ?? 'Stage 1 pilot'}" — grade forced to \`provisional\``);
+  }
 
   // --- the table ---------------------------------------------------------------------------
   const sel = selectBranch(corpora, th, { grade, power_attested: powerFrozen });

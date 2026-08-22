@@ -11,7 +11,7 @@
 //
 // Exit codes: 2 usage · 17 REPORT_INPUT_MISSING.
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, renameSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { EVAL_DIR } from './lib/paths.mjs';
 import * as M from './lib/metrics.mjs';
@@ -221,8 +221,20 @@ line('- Where an endpoint is marked **not estimable** above, no N is extrapolate
 line('- Numbers here are Stage 1 **dev pilot** values under `SUMMARIES=off` on `.backup` copies. They size Stage 2; they do not decide anything.');
 if (notEstimable.length) { line(''); line(`Not estimable in this run: ${notEstimable.join(' · ')}.`); }
 
+// Stage to a temp file and only rename once the gate passes - the same shape report.mjs uses
+// (T8 I5). Writing first meant a failed run left a gutted POWER.md behind: measured 2026-08-22,
+// running this with empty suite/ and out/ replaced the committed 9.5 KB table with a 6.6 KB
+// all-`not estimable` shell and *then* exited 17. That matters because out/candidates.<c>.jsonl
+// is git-ignored while suite/POWER.md is committed, so a fresh clone reproduces it on the first
+// run - and run-decision.mjs's I-4 ("검정력 확보") is this file's FREEZE hash.
 const outPath = P('suite', 'POWER.md');
-writeFileSync(outPath, out.join('\n') + '\n');
-if (!corporaSeen) { console.error('REPORT_INPUT_MISSING no corpus had both suite/queries.<c>.jsonl and out/candidates.<c>.real.jsonl'); process.exit(17); }
+const tmpPath = `${outPath}.tmp-${process.pid}`;
+writeFileSync(tmpPath, out.join('\n') + '\n');
+if (!corporaSeen) {
+  console.error('REPORT_INPUT_MISSING no corpus had both suite/queries.<c>.jsonl and out/candidates.<c>.real.jsonl');
+  rmSync(tmpPath, { force: true });
+  process.exit(17);
+}
+renameSync(tmpPath, outPath);
 console.log(out.join('\n'));
 console.error(`\nwrote ${outPath} (${out.length} lines) · corpora with data ${corporaSeen}/3`);

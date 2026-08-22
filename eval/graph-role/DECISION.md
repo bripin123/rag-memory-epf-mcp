@@ -2,9 +2,21 @@
 
 **갈래 = ① upstream-first** · 등급 **`provisional`** · 상태 **`evaluation complete`** (≠ `root repair complete`).
 
-생성 2026-08-20T08:37:06.751Z · 근거 = `out/report.md`(생성 2026-08-20T08:37:04.152Z · engine head `334a409fd85723090f726aab13415276239c27ce`) + `out/upstream.<c>.jsonl` + `out/link-precision.<c>.json` + `suite/judging-record.json`. 이 파일은 `run-decision.mjs` 가 씁니다 — 손으로 고치지 말고 러너를 다시 돌리세요.
+생성 2026-08-22T04:27:30.723Z · 근거 = `out/report.md`(생성 2026-08-20T08:37:04.152Z · engine head `334a409fd85723090f726aab13415276239c27ce`) + `out/upstream.<c>.jsonl` + `out/link-precision.<c>.json` + `suite/judging-record.json`. 이 파일은 `run-decision.mjs` 가 씁니다 — 손으로 고치지 말고 러너를 다시 돌리세요.
 
 대상 corpus = **hub · uap · hal** (3/3 of `lib/paths.mjs` CORPORA).
+
+## 0. 이 판정이 무엇 위에 서 있나 (측정 기반)
+
+소비한 리포트 = **Stage 1 pilot (dev split · SUMMARIES=off)** · stage `stage-1-pilot` · split `dev`.
+
+🔴 **이 갈래는 holdout 이 아니라 Stage 1 pilot(dev split) 실측 위에서 선택됐다.** 동결 규정(proposal D3/r4)은 결정을 holdout 에서 내리도록 적어 두었으므로, 그 조건은 **충족되지 않았다.** 무엇이 그래도 성립하고 무엇이 성립하지 않는지를 갈라 적는다:
+
+- **성립**: 갈래 ①(`upstream-first`)의 진입 게이트는 *검정력이 필요한 효능 비교*가 아니라 **구조 지표**다 — 소스 문서가 진술하는 관계가 KG 에 존재하는가. 그리고 dev/holdout 분리가 막으려는 누출 통로(**작성자가 답을 보고 문제를 냄**)는 이 suite 에서 **다른 방식으로 이미 닫혀 있다**: A·M 질의 전부가 `author_mode: source-grounded`(작성자는 `documents.content` + `entities.name` 만 열람, `relationships`·`chunk_entities` 금지)이고 `kg-informed` 는 **0건**이다.
+- **성립 안 함**: 그럼에도 이 값의 **두 번째 독립 추정치는 없다.** 그리고 홀드아웃으로 확인할 길이 지금은 막혀 있다 — **holdout 에는 A·M 질의가 존재하지 않는다**(전 corpus `A 30 dev / M 30 dev`, holdout 은 K 뿐: hub 30 · uap 30 · hal 26). `edge_validity` 는 주로 M 브리지 질의에서 나오므로, holdout 판을 만들려면 **T9(A·M holdout 작성·동결)를 먼저 해야 한다.**
+- **등급 귀결**: 이 사유만으로도 결론은 `provisional` 을 벗어날 수 없다. 러너가 이것을 **구조적으로 강제**한다(판정 기록의 `grade` 가 무엇이든 pilot 리포트면 `provisional` 로 내린다).
+
+> 이 절은 *"dev 라 괜찮다"* 도 *"dev 라 틀렸다"* 도 아니다 — **무엇을 쟀고 무엇을 안 쟀는지**를 읽는 사람이 직접 판단할 수 있게 적어 둔 것이다.
 
 ## 1. 결정표 적용 (proposal D8 lines 63–71 · delta R9, gatekeeping 순서 = 첫 참인 갈래)
 
