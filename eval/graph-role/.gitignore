@@ -1,3 +1,10 @@
 dbs/
 out/*.jsonl
 out/log.*.txt
+
+# T12 (2026-08-22): 판정 산출물 — out/ 과 같은 R12 재해석.
+# 판정자 A/B 원본은 *.gz 로 commit, bulk(pool 조인본·pass2·batches)는 제외하고 AUDIT-SHA256.txt 로만 남긴다.
+pool/*.jsonl
+pool/batches/
+links/*.jsonl
+links/batches/
