@@ -32,10 +32,10 @@ Single MCP stdio server. One SQLite file per project is the whole persistence la
 external service, no daemon, no second store.
 
 ```
-index.ts                        4,667 lines. The engine class + the MCP server, one file.
+index.ts                        4,695 lines. The engine class + the MCP server, one file.
   class RAGKnowledgeGraphManager   all engine behaviour (writers, readers, search, documents)
-  server.setRequestHandler(ListToolsRequestSchema)   tool listing  (4427)
-  server.setRequestHandler(CallToolRequestSchema)    one switch, one case per tool  (4434)
+  server.setRequestHandler(ListToolsRequestSchema)   tool listing  (4455)
+  server.setRequestHandler(CallToolRequestSchema)    one switch, one case per tool  (4462)
 
 src/observations/               v13 observation lifecycle
   schema.ts       OBSERVATION_SCHEMA_SQL — the DDL string shared by migration and tests
@@ -96,7 +96,7 @@ alias regex also captures decimals as filenames (`0.619`, `1.2gb`) — real, but
 `nonliteral`. That label means *"the name is not in the text"*, **not** *"linked by a non-lexical
 method"* — there is no such method.
 
-**Search does not use the graph to generate candidates.** `hybridSearch` (index.ts:3454) builds the
+**Search does not use the graph to generate candidates.** `hybridSearch` (index.ts:3548) builds the
 pool from vector search over `chunks` plus FTS5, fuses with RRF (k=60), then applies `graphBoost` as
 a re-ranker over that pool. `useGraph` is opt-in, default **false** since v5.3.0; four places must
 agree (method signature, dispatch `=== true`, tool JSON, zod default). Relationship traversal is
@@ -113,7 +113,7 @@ comes from `generateContentSummary`, whose `enhanceSimilarityWithContext` adds q
 bonuses (+0.1 per entity mention, +0.05 for digits, +0.03 for "important"-class words), so it can
 displace `vectorSimilarity` inside that `max`.
 
-**graphology analytics read `relationships` only.** `_buildGraphologyGraph` (index.ts:4076) loads
+**graphology analytics read `relationships` only.** `_buildGraphologyGraph` (index.ts:4104) loads
 entity nodes and `relationships` edges; `chunk_entities` is not in that graph. `getGraphMetrics`
 (pagerank/degree/betweenness/closeness), `detectCommunities` (Louvain) and `analyzeGraphStructure`
 therefore describe the ~900-edge authored graph, not the ~66k-link bipartite one.
