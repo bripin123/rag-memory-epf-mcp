@@ -153,6 +153,25 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### v7.0.0
+
+- **Breaking — an observation alias must also appear in the entity's own name.** 6.0.0 capped how
+  many entities may share a token. That answers "does this token point at one entity?" and says
+  nothing about the other direction, so an entity that mentions a common filename *once* still
+  attached to every chunk containing it — and, being the sole owner, sailed through the cap. The
+  cap stopped the explosion, not the magnet. Measured after the 6.0.0 cleanup on a live corpus:
+  2,014 alias-only links remained and **34 entities held 68.1%** of them; the largest had the
+  entity name in **zero** of its chunks. Requiring the token (or its stem) to appear in the name
+  brings that to 6 entities / 42.1%, and what remains are entities that really are about that file.
+- **A chunk-frequency cap was measured and rejected on the evidence, not on cost.** The full-corpus
+  scan is 585ms (731 tokens x 2,913 chunks). It was rejected because the sweep has no knee and every
+  cut also removed legitimate links — `log_coverage.py` occurs in 64 chunks and belongs to an entity
+  about exactly that file. The name condition is structural: no threshold, same meaning at any corpus
+  size.
+- Expect far fewer alias links after upgrading. Existing rows are not rewritten.
+- Regression: `test/alias-link-gate.test.mjs` gained a magnet case, verified to fail without the
+  condition.
+
 ### v6.1.0
 
 - **Fixed — entity names whose own edge is punctuation never linked.** The Latin matcher used

@@ -92,8 +92,9 @@ lexical paths:
    `test/entity-name-boundary.test.mjs`.
 2. **observation aliases** — every `[\w\-]+\.\w{1,4}` token of length >= 4 found anywhere in that
    entity's observations, matched as a lowercase substring of `chunk.text`. **Gated since 5.4.0**:
-   the token must pass `looksLikeFilename` (extension whitelist; stem >= 3 chars) *and* be held by
-   at most `MAX_ALIAS_OWNERS` = 3 entities. See the measurement below for why.
+   the token must pass `looksLikeFilename` (extension whitelist; stem >= 3 chars), be held by at
+   most `MAX_ALIAS_OWNERS` = 3 entities, **and appear in the entity's own name** (token or stem).
+   See the measurement below for why, and "the magnet" for why owners alone was not enough.
 3. `buildEntityRangeFinder` — occurrences of the primary name in the *whole document*, linked to any
    chunk whose `[start_pos, end_pos)` overlaps (recovers names split across a chunk boundary).
    Carries the same second arm as path 1, deduped against the regex hits — the two must agree or
@@ -116,6 +117,23 @@ Filtering by extension alone still leaves 92.3% of alias links; adding `owners <
 4.0%. Non-filenames the regex used to accept (`v3.3`, `gpt-5.6`, `1.7mb`, `github.com`, `os.path`)
 are now rejected by `looksLikeFilename`, and alias matching now requires token boundaries so
 `foo.py` no longer matches inside `notfoo.pyc`.
+
+**The magnet — why the owner cap alone was not enough (7.0.0).** Owners answers "does this token
+point at one entity?" and says nothing about "does this entity point at one token?". An entity that
+mentions a common filename *once* in its observations therefore attaches to every chunk containing
+that filename — and being the only owner, the cap waves it through. The cap stopped the explosion,
+not the magnet. Measured after the 6.0.0 cleanup: 2,014 alias-only links remained and 34 entities
+held **68.1%** of them; the largest had the entity name in **zero** of its chunks. Requiring the
+token (or its stem) to appear in the entity's name drops that to 6 entities / 42.1%, and the ones
+that remain are entities that genuinely are about that file.
+
+A chunk-frequency cap was the obvious alternative and was measured, not assumed: a full-corpus
+scan is **585ms** on 731 tokens x 2,913 chunks, so cost was never the real objection (an earlier
+note in this repo said it was — that was an estimate, not a measurement). It was rejected because
+its sweep has no knee (`cf<=60` 3,873 pairs, `<=30` 3,006, `<=10` 1,815) and every cut also removed
+legitimate links: `log_coverage.py` occurs in 64 chunks and belongs to an entity that is about
+exactly that file. The name condition is structural — no threshold to tune, same meaning as the
+corpus grows.
 
 **The cap value is a judgement, not a discovered boundary.** The sweep is smooth — share of those
 80,096 surviving: `owners<=1` 1.6% · `<=2` 3.7% · `<=3` 5.2% · `<=4` 7.0% · `<=5` 8.3% · `<=10`

@@ -28,7 +28,8 @@ try {
     observations: [`touches shared_widget.py during setup`],
   });
   // --- 2. sole-owner token (1 owner) must still link (the original, working intent) --
-  const solo = { name: 'SoleOwnerEntity', entityType: 'TEST',
+  // The name carries the token: the mapping holds in both directions.
+  const solo = { name: 'SoleOwner uniquely_named_helper.py work', entityType: 'TEST',
                  observations: ['implemented in uniquely_named_helper.py'] };
   // --- 3. non-filename tokens must never link --------------------------------------
   const verEnt = { name: 'VersionTokenEntity', entityType: 'TEST',
@@ -59,7 +60,7 @@ try {
   // --- 4. the gate is a cap, not a ban: exactly 3 owners still links ---------------
   const three = [];
   for (let i = 1; i <= 3; i++) three.push({
-    name: `TripleOwnerEntity${i}`, entityType: 'TEST',
+    name: `TripleOwner triple_owner_config.toml ${i}`, entityType: 'TEST',
     observations: ['configured by triple_owner_config.toml'],
   });
   await manager.createEntities(three);
@@ -73,7 +74,7 @@ try {
   // Without this, an implementation using `> 4` would pass the 3-allowed / 5-blocked pair.
   const four = [];
   for (let i = 1; i <= 4; i++) four.push({
-    name: `QuadOwnerEntity${i}`, entityType: 'TEST',
+    name: `QuadOwner quad_owner_notes.md ${i}`, entityType: 'TEST',
     observations: ['described in quad_owner_notes.md'],
   });
   await manager.createEntities(four);
@@ -85,7 +86,7 @@ try {
 
   // --- 6. alias match must respect token boundaries --------------------------------
   // Bare substring matching would link "edge_case.py" to a chunk saying "notedge_case.pyc".
-  const edge = { name: 'BoundaryAliasEntity', entityType: 'TEST',
+  const edge = { name: 'Boundary edge_case.py handling', entityType: 'TEST',
                  observations: ['lives in edge_case.py'] };
   await manager.createEntities([edge]);
   await manager.storeDocument('alias-gate-doc4', 'This mentions notedge_case.pyc and nothing else.');
@@ -98,7 +99,22 @@ try {
   await manager.embedChunks('alias-gate-doc5');
   assert.ok(links(edge.name) > 0, 'control: standalone token must link');
 
-  console.log('✅ alias-link-gate: owner cap + filename whitelist hold, sole-owner intent preserved');
+  // --- 7. the magnet: sole owner, but the entity does not name the token -----------
+  // An entity that mentions a filename once in passing must not attach to every chunk that
+  // filename appears in. owners=1 makes the owner cap wave it through, so the second
+  // direction of the mapping is the only thing that can stop it.
+  const magnet = { name: 'Some Unrelated Work Item (2026-08-23)', entityType: 'TEST',
+                   observations: ['we also touched passing_mention_util.py that day'] };
+  await manager.createEntities([magnet]);
+  await manager.storeDocument('alias-gate-doc6',
+    ['A line naming passing_mention_util.py here.',
+     'Another line naming passing_mention_util.py there.'].join('\n\n'));
+  await manager.chunkDocument('alias-gate-doc6', { maxTokens: 200 });
+  await manager.embedChunks('alias-gate-doc6');
+  assert.equal(links(magnet.name), 0,
+    'sole-owner token that the entity name does not carry must not link (magnet)');
+
+  console.log('✅ alias-link-gate: both directions of the mapping hold; magnet blocked, intent preserved');
 } finally {
   await cleanup();
 }

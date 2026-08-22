@@ -2859,6 +2859,27 @@ export class RAGKnowledgeGraphManager {
       // document was last processed. That predates this gate; it is not introduced by it.
       const MAX_ALIAS_OWNERS = 3;
       const aliasOwners = new Map<string, number>();
+      // Owners is only half the mapping. It asks "does this token point at one entity?" and says
+      // nothing about "does this entity point at one token?" — so an entity that mentions a common
+      // filename ONCE in its observations attaches to every chunk containing that filename, and
+      // because it is the only owner, the cap waves it through. The cap stopped the explosion
+      // (tens of thousands of rows) but not the magnet (one entity on dozens of chunks).
+      // Measured 2026-08-23 after the 6.0.0 cleanup: 2,014 alias-only links remained and 34
+      // entities held 68.1% of them; the biggest had the entity name appearing in ZERO of its
+      // chunks — pulled in entirely by a filename someone mentioned in passing.
+      // So require the mapping in both directions: the token must identify the entity (owners)
+      // AND the entity must identify the token (the token, or its stem, appears in the name).
+      // This is a structural condition, not a threshold — there is no knee to tune and it keeps
+      // meaning the same as the corpus grows. Chunk-frequency caps were measured instead
+      // (585ms full scan, so cost was NOT the objection) and rejected because the sweep is smooth
+      // and every cut also removed legitimate links.
+      const aliasNamesTheEntity = (entityName: string, token: string): boolean => {
+        const lower = entityName.toLowerCase();
+        if (lower.includes(token)) return true;
+        const dot = token.lastIndexOf('.');
+        const stem = dot > 0 ? token.slice(0, dot) : token;
+        return stem.length >= 4 && lower.includes(stem);
+      };
       for (const e of entities) {
         if (!e.observations) continue;
         let obs: string[];
@@ -2899,6 +2920,7 @@ export class RAGKnowledgeGraphManager {
                 const tok = p.toLowerCase();
                 if (!this.looksLikeFilename(tok)) continue;                  // "v3.3", "gpt-5.6", "0.465"
                 if ((aliasOwners.get(tok) ?? 0) > MAX_ALIAS_OWNERS) continue; // shared = identifies nothing
+                if (!aliasNamesTheEntity(entity.name, tok)) continue;         // mentioned in passing = magnet
                 // Bare substring matching links "foo.py" to a chunk saying "notfoo.pyc".
                 // Require the token to stand alone: no filename character on either side.
                 const boundary = /[\w\-.]/;
