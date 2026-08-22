@@ -1,0 +1,61 @@
+{"meta":true,"snapshot_sha256":"a497019a52e9d1e045971a331b5539048650865ef3a6b0c46577420d4543f024","snapshot_taken_at":"2026-08-22T09:16:04.168Z","engine_commit":"6bb5aeba6af8be908ce532610cc526e13ba85173","generated_at":"2026-08-22T09:16:06.729Z"}
+{"id":"hub-A-1","observed_paths":[]}
+{"id":"hub-A-2","observed_paths":[]}
+{"id":"hub-A-3","observed_paths":[]}
+{"id":"hub-A-4","observed_paths":[]}
+{"id":"hub-A-5","observed_paths":[]}
+{"id":"hub-A-6","observed_paths":[]}
+{"id":"hub-A-7","observed_paths":[]}
+{"id":"hub-A-8","observed_paths":[]}
+{"id":"hub-A-9","observed_paths":[]}
+{"id":"hub-A-10","observed_paths":[]}
+{"id":"hub-A-11","observed_paths":[]}
+{"id":"hub-A-12","observed_paths":[]}
+{"id":"hub-A-13","observed_paths":[]}
+{"id":"hub-A-14","observed_paths":[{"from":"wiki/deck-authoring-traps.md","to":"wiki/cognition/deck.md","edge_id":"rel_entity_wiki_cognition_deck_md_complements_entity_wiki_deck_authoring_traps_md","relation_type":"COMPLEMENTS","direction":"in","confidence":1},{"from":"wiki/deck-authoring-traps.md","to":"wiki/cognition/deck.md","edge_id":"rel_entity_wiki_cognition_deck_md_related_to_entity_wiki_deck_authoring_traps_md","relation_type":"RELATED_TO","direction":"in","confidence":0.8}]}
+{"id":"hub-A-15","observed_paths":[]}
+{"id":"hub-A-16","observed_paths":[]}
+{"id":"hub-A-17","observed_paths":[]}
+{"id":"hub-A-18","observed_paths":[]}
+{"id":"hub-A-19","observed_paths":[{"from":"Decision 22","to":"Auto-Initialization Feature","edge_id":"rel_entity_auto_initialization_feature_extends_entity_decision_22","relation_type":"EXTENDS","direction":"in","confidence":0.85},{"from":"Decision 22","to":"Auto-Initialization Feature","edge_id":"rel_entity_auto_initialization_feature_implements_entity_decision_22","relation_type":"IMPLEMENTS","direction":"in","confidence":1},{"from":"Decision 22","to":"Auto-Initialization Feature","edge_id":"rel_entity_auto_initialization_feature_related_to_entity_decision_22","relation_type":"RELATED_TO","direction":"in","confidence":0.8},{"from":"Decision 22","to":"Auto-Initialization Feature","edge_id":"rel_entity_decision_22_contains_entity_auto_initialization_feature","relation_type":"CONTAINS","direction":"out","confidence":0.8},{"from":"Decision 22","to":"Auto-Initialization Feature","edge_id":"rel_entity_decision_22_defines_entity_auto_initialization_feature","relation_type":"DEFINES","direction":"out","confidence":0.8},{"from":"Decision 22","to":"Auto-Initialization Feature","edge_id":"rel_entity_decision_22_enhanced_by_entity_auto_initialization_feature","relation_type":"ENHANCED_BY","direction":"out","confidence":1},{"from":"Decision 22","to":"Auto-Initialization Feature","edge_id":"rel_entity_decision_22_introduces_entity_auto_initialization_feature","relation_type":"INTRODUCES","direction":"out","confidence":1}]}
+{"id":"hub-A-20","observed_paths":[]}
+{"id":"hub-A-21","observed_paths":[]}
+{"id":"hub-A-22","observed_paths":[]}
+{"id":"hub-A-23","observed_paths":[]}
+{"id":"hub-A-24","observed_paths":[]}
+{"id":"hub-A-25","observed_paths":[]}
+{"id":"hub-A-26","observed_paths":[]}
+{"id":"hub-A-27","observed_paths":[]}
+{"id":"hub-A-28","observed_paths":[]}
+{"id":"hub-A-29","observed_paths":[]}
+{"id":"hub-A-30","observed_paths":[]}
+{"id":"hub-M-1","observed_paths":[]}
+{"id":"hub-M-2","observed_paths":[]}
+{"id":"hub-M-3","observed_paths":[{"from":"Cross-Session Task Tracking","to":"Task Management Protocol","edge_id":"rel_entity_task_management_protocol_contains_entity_cross_session_task_tracking","relation_type":"CONTAINS","direction":"in","confidence":0.85},{"from":"Cross-Session Task Tracking","to":"Task Management Protocol","edge_id":"rel_entity_task_management_protocol_includes_entity_cross_session_task_tracking","relation_type":"INCLUDES","direction":"in","confidence":1}]}
+{"id":"hub-M-4","observed_paths":[{"from":"Auto-Initialization Feature","to":"Decision 22","edge_id":"rel_entity_auto_initialization_feature_extends_entity_decision_22","relation_type":"EXTENDS","direction":"out","confidence":0.85},{"from":"Auto-Initialization Feature","to":"Decision 22","edge_id":"rel_entity_auto_initialization_feature_implements_entity_decision_22","relation_type":"IMPLEMENTS","direction":"out","confidence":1},{"from":"Auto-Initialization Feature","to":"Decision 22","edge_id":"rel_entity_auto_initialization_feature_related_to_entity_decision_22","relation_type":"RELATED_TO","direction":"out","confidence":0.8},{"from":"Auto-Initialization Feature","to":"Decision 22","edge_id":"rel_entity_decision_22_contains_entity_auto_initialization_feature","relation_type":"CONTAINS","direction":"in","confidence":0.8},{"from":"Auto-Initialization Feature","to":"Decision 22","edge_id":"rel_entity_decision_22_defines_entity_auto_initialization_feature","relation_type":"DEFINES","direction":"in","confidence":0.8},{"from":"Auto-Initialization Feature","to":"Decision 22","edge_id":"rel_entity_decision_22_enhanced_by_entity_auto_initialization_feature","relation_type":"ENHANCED_BY","direction":"in","confidence":1},{"from":"Auto-Initialization Feature","to":"Decision 22","edge_id":"rel_entity_decision_22_introduces_entity_auto_initialization_feature","relation_type":"INTRODUCES","direction":"in","confidence":1}]}
+{"id":"hub-M-5","observed_paths":[{"from":"Project Nous Public Release","to":"2026-04-25-project-nous-public-release.md","edge_id":"rel_entity_2026_04_25_project_nous_public_release_md_part_of_entity_project_nous_public_release","relation_type":"PART_OF","direction":"in","confidence":1}]}
+{"id":"hub-M-6","observed_paths":[]}
+{"id":"hub-M-7","observed_paths":[]}
+{"id":"hub-M-8","observed_paths":[]}
+{"id":"hub-M-9","observed_paths":[]}
+{"id":"hub-M-10","observed_paths":[]}
+{"id":"hub-M-11","observed_paths":[{"from":"wiki/deck-authoring-traps.md","to":"wiki/cognition/deck.md","edge_id":"rel_entity_wiki_cognition_deck_md_complements_entity_wiki_deck_authoring_traps_md","relation_type":"COMPLEMENTS","direction":"in","confidence":1},{"from":"wiki/deck-authoring-traps.md","to":"wiki/cognition/deck.md","edge_id":"rel_entity_wiki_cognition_deck_md_related_to_entity_wiki_deck_authoring_traps_md","relation_type":"RELATED_TO","direction":"in","confidence":0.8}]}
+{"id":"hub-M-12","observed_paths":[]}
+{"id":"hub-M-13","observed_paths":[]}
+{"id":"hub-M-14","observed_paths":[]}
+{"id":"hub-M-15","observed_paths":[]}
+{"id":"hub-M-16","observed_paths":[]}
+{"id":"hub-M-17","observed_paths":[{"from":"AI Project Lifecycle Framework","to":"Hermes Agent","edge_id":"rel_entity_hermes_agent_related_to_entity_ai_project_lifecycle_framework","relation_type":"RELATED_TO","direction":"in","confidence":1}]}
+{"id":"hub-M-18","observed_paths":[]}
+{"id":"hub-M-19","observed_paths":[{"from":"Save-Read Symmetry","to":"Session Context Files","edge_id":"rel_entity_session_context_files_supports_entity_save_read_symmetry","relation_type":"SUPPORTS","direction":"in","confidence":1}]}
+{"id":"hub-M-20","observed_paths":[{"from":"wiki/world-class-roadmap-2026-07.md","to":"ax-line-2026-08-05.md","edge_id":"rel_entity_ax_line_2026_08_05_md_extends_entity_wiki_world_class_roadmap_2026_07_md","relation_type":"EXTENDS","direction":"in","confidence":1}]}
+{"id":"hub-M-21","observed_paths":[]}
+{"id":"hub-M-22","observed_paths":[{"from":"Pattern: Wiki E·F Split Cascade","to":"wiki/gotchas.md","edge_id":"rel_entity_pattern__wiki_e_f_split_cascade_creates_entity_wiki_gotchas_md","relation_type":"CREATES","direction":"out","confidence":1}]}
+{"id":"hub-M-23","observed_paths":[]}
+{"id":"hub-M-24","observed_paths":[]}
+{"id":"hub-M-25","observed_paths":[]}
+{"id":"hub-M-26","observed_paths":[]}
+{"id":"hub-M-27","observed_paths":[]}
+{"id":"hub-M-28","observed_paths":[]}
+{"id":"hub-M-29","observed_paths":[{"from":"wiki/project-context.md","to":"wiki/patterns.md","edge_id":"rel_entity_wiki_patterns_md_derived_from_entity_wiki_project_context_md","relation_type":"DERIVED_FROM","direction":"in","confidence":1}]}
+{"id":"hub-M-30","observed_paths":[{"from":"wiki/slide-frame-archetypes.md","to":"2026-07-26-context-driven-deck-authoring-design.md","edge_id":"rel_entity_2026_07_26_context_driven_deck_authoring_design_md_references_entity_wiki_slide_frame_archetypes_md","relation_type":"REFERENCES","direction":"in","confidence":1}]}

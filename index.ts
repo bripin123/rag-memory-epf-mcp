@@ -3439,6 +3439,100 @@ export class RAGKnowledgeGraphManager {
     return { imported, skipped, observation_order_remap: remapReport };
   }
 
+  /**
+   * Diagnostic seam for the graph re-ranker (evaluation change graph-role-evaluation, R2).
+   * Returns the seed entities (query-vector matched, similarity > 0.4, top-10 per variant) and the
+   * 1-hop connected entities exactly as hybridSearch(useGraph:true) computes them, plus edge detail
+   * that hybridSearch itself does not use (edge id, type, direction, confidence). It never generates
+   * candidates and never changes ranking; hybridSearch consumes only the name sets.
+   * `opts.chunkVectorDegraded` lets a caller hand over a decision it has already made; omit it and
+   * the seam derives eligibility itself.
+   */
+  async explainGraphContext(query: string, queryVariants?: string[],
+                            opts?: { chunkVectorDegraded?: boolean }): Promise<{
+    status: 'vector' | 'entity-text-fallback' | 'chunk-vector-disabled' | 'error';
+    query_variants: string[];
+    seeds: Array<{ entity_id: string; name: string; similarity: number }>;
+    connected: Array<{ entity_id: string; name: string; via_seed_id: string; via_seed_name: string;
+                       edge_id: string; relation_type: string; direction: 'out' | 'in'; confidence: number | null }>;
+  }> {
+    if (!this.db) throw new Error('Database not initialized');
+    const variants = queryVariants ?? this.buildCrossLingualVariants(query);
+    const empty = { query_variants: variants, seeds: [] as any[], connected: [] as any[] };
+    // The caller's latched decision wins (review finding I2). hybridSearch decides chunk-vector
+    // degradation once, before the chunk-embedding awaits, and passes that value down; re-deriving
+    // it here would let an eligibility flip during those awaits give the seam a different answer
+    // than the ranking path already acted on — the pre-extraction code read it once, so this keeps
+    // behaviour identical. A standalone caller passes nothing and gets the live derivation.
+    const chunkVectorDegraded = opts?.chunkVectorDegraded ?? !(this.coordinator?.eligible ?? false);
+    if (chunkVectorDegraded) return { status: 'chunk-vector-disabled', ...empty };
+    try {
+      const searchEntities = (embedding: Float32Array) => this.db!.prepare(`
+            SELECT em.entity_id, e.name, ee.distance
+            FROM entity_embeddings ee
+            JOIN entity_embedding_metadata em ON ee.rowid = em.rowid
+            JOIN entities e ON e.id = em.entity_id
+            WHERE ee.embedding MATCH ? AND k = 10
+            ORDER BY ee.distance
+          `).all(Buffer.from(embedding.buffer)) as Array<{ entity_id: string; name: string; distance: number }>;
+      const entityMap = new Map<string, { entity_id: string; name: string; distance: number }>();
+      for (const variant of variants) {
+        const embedding = await this.generateEmbedding(variant, 1024, true);
+        for (const e of searchEntities(embedding)) {
+          const existing = entityMap.get(e.entity_id);
+          if (!existing || e.distance < existing.distance) entityMap.set(e.entity_id, e);
+        }
+      }
+      const similar = Array.from(entityMap.values()).sort((a, b) => a.distance - b.distance || (a.entity_id < b.entity_id ? -1 : 1));
+      const seeds: Array<{ entity_id: string; name: string; similarity: number }> = [];
+      const connected: any[] = [];
+      const edgeStmt = this.db.prepare(`
+            SELECT r.id AS edge_id, r.relationType AS relation_type, r.confidence,
+                   CASE WHEN r.source_entity = ? THEN e2.id ELSE e1.id END AS entity_id,
+                   CASE WHEN r.source_entity = ? THEN e2.name ELSE e1.name END AS name,
+                   CASE WHEN r.source_entity = ? THEN 'out' ELSE 'in' END AS direction
+            FROM relationships r
+            JOIN entities e1 ON e1.id = r.source_entity
+            JOIN entities e2 ON e2.id = r.target_entity
+            WHERE r.source_entity = ? OR r.target_entity = ?
+            ORDER BY r.id`);
+      for (const entity of similar) {
+        const similarity = Math.max(0, 1 - entity.distance / 2);
+        if (similarity > 0.4) {
+          seeds.push({ entity_id: entity.entity_id, name: entity.name, similarity });
+          for (const row of edgeStmt.all(entity.entity_id, entity.entity_id, entity.entity_id, entity.entity_id, entity.entity_id) as any[]) {
+            connected.push({ entity_id: row.entity_id, name: row.name, via_seed_id: entity.entity_id, via_seed_name: entity.name,
+                             edge_id: row.edge_id, relation_type: row.relation_type, direction: row.direction,
+                             confidence: row.confidence === null || row.confidence === undefined ? null : Number(row.confidence) });
+          }
+        }
+      }
+      return { status: 'vector', query_variants: variants, seeds, connected };
+    } catch (error) {
+      console.error('⚠️ Entity vector search for graph enhancement failed:', error);
+      // Fallback: text-based matching (original behavior) — same SQL as before extraction.
+      const connected: any[] = [];
+      const queryEntities = this.extractTermsFromText(query);
+      for (const entity of queryEntities) {
+        const rows = this.db.prepare(`
+            SELECT DISTINCT
+              CASE WHEN r.source_entity = e1.id THEN e2.name ELSE e1.name END as connected_name,
+              CASE WHEN r.source_entity = e1.id THEN e2.id ELSE e1.id END as connected_id,
+              r.id AS edge_id, r.relationType AS relation_type, r.confidence,
+              CASE WHEN r.source_entity = e1.id THEN 'out' ELSE 'in' END AS direction
+            FROM entities e1
+            JOIN relationships r ON (r.source_entity = e1.id OR r.target_entity = e1.id)
+            JOIN entities e2 ON (e2.id = r.source_entity OR e2.id = r.target_entity)
+            WHERE e1.name = ? AND e2.name != ?
+            ORDER BY r.id`).all(entity, entity) as any[];
+        for (const row of rows) connected.push({ entity_id: row.connected_id, name: row.connected_name, via_seed_id: '', via_seed_name: entity,
+                                                  edge_id: row.edge_id, relation_type: row.relation_type, direction: row.direction,
+                                                  confidence: row.confidence === null || row.confidence === undefined ? null : Number(row.confidence) });
+      }
+      return { status: 'entity-text-fallback', query_variants: variants, seeds: [], connected };
+    }
+  }
+
   // v5.3.0: the graph re-ranker is OPT-IN (harm-reduced default, not a validated improvement).
   // Measured 2026-08-17 on three real corpora (self-retrieval, usable samples 120/117/120,
   // summaries off): with the additive graph boost on, the known-item chunk got WORSE in
@@ -3650,80 +3744,14 @@ export class RAGKnowledgeGraphManager {
       };
     }
 
-    // Get entity information for graph enhancement via vector similarity
+    // Get entity information for graph enhancement — via the diagnostic seam (evaluation change
+    // graph-role-evaluation R2). Same SQL, same threshold, same fallback; hybridSearch consumes only names.
     let connectedEntities = new Set<string>();
     let queryMatchedEntities = new Set<string>();
     if (useGraph && !vectorDegraded) {
-      // Vector search: find entities semantically similar to the query (dual search)
-      try {
-        const searchEntities = (embedding: Float32Array) => {
-          return this.db!.prepare(`
-            SELECT
-              em.entity_id,
-              e.name,
-              ee.distance
-            FROM entity_embeddings ee
-            JOIN entity_embedding_metadata em ON ee.rowid = em.rowid
-            JOIN entities e ON e.id = em.entity_id
-            WHERE ee.embedding MATCH ?
-              AND k = 10
-            ORDER BY ee.distance
-          `).all(Buffer.from(embedding.buffer)) as Array<{ entity_id: string; name: string; distance: number }>;
-        };
-
-        // Merge all query variant entity results
-        const entityMap = new Map<string, { entity_id: string; name: string; distance: number }>();
-        for (const variant of queryVariants) {
-          const embedding = await this.generateEmbedding(variant, 1024, true);
-          for (const e of searchEntities(embedding)) {
-            const existing = entityMap.get(e.entity_id);
-            if (!existing || e.distance < existing.distance) {
-              entityMap.set(e.entity_id, e);
-            }
-          }
-        }
-        const similarEntities = Array.from(entityMap.values()).sort((a, b) => a.distance - b.distance);
-
-        for (const entity of similarEntities) {
-          const similarity = Math.max(0, 1 - entity.distance / 2);
-          if (similarity > 0.4) {
-            queryMatchedEntities.add(entity.name);
-
-            // Get connected entities via relationships
-            const connected = this.db.prepare(`
-              SELECT DISTINCT
-                CASE
-                  WHEN r.source_entity = ? THEN e2.name
-                  ELSE e1.name
-                END as connected_name
-              FROM relationships r
-              JOIN entities e1 ON e1.id = r.source_entity
-              JOIN entities e2 ON e2.id = r.target_entity
-              WHERE r.source_entity = ? OR r.target_entity = ?
-            `).all(entity.entity_id, entity.entity_id, entity.entity_id) as { connected_name: string }[];
-
-            connected.forEach((row) => connectedEntities.add(row.connected_name));
-          }
-        }
-      } catch (error) {
-        console.error('⚠️ Entity vector search for graph enhancement failed:', error);
-        // Fallback: text-based matching (original behavior)
-        const queryEntities = this.extractTermsFromText(query);
-        for (const entity of queryEntities) {
-          const connected = this.db.prepare(`
-            SELECT DISTINCT
-              CASE
-                WHEN r.source_entity = e1.id THEN e2.name
-                ELSE e1.name
-              END as connected_name
-            FROM entities e1
-            JOIN relationships r ON (r.source_entity = e1.id OR r.target_entity = e1.id)
-            JOIN entities e2 ON (e2.id = r.source_entity OR e2.id = r.target_entity)
-            WHERE e1.name = ? AND e2.name != ?
-          `).all(entity, entity) as { connected_name: string }[];
-          connected.forEach((row) => connectedEntities.add(row.connected_name));
-        }
-      }
+      const ctx = await this.explainGraphContext(query, queryVariants, { chunkVectorDegraded: vectorDegraded });
+      for (const s of ctx.seeds) queryMatchedEntities.add(s.name);
+      for (const c of ctx.connected) connectedEntities.add(c.name);
     }
     
     // Process results with semantic summaries

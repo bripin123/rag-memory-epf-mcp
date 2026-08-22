@@ -54,3 +54,27 @@ function assert(cond, msg) {
   console.log(`  OK: ${msg}`); return true;
 }
 export { assert };
+
+// Controlled embedder: exact unit vectors for known texts (fixture design needs cosines at
+// the 0.4-similarity threshold). sim = 1 - L2/2 on unit vectors  =>  sim > 0.4  <=>  cos > 0.28.
+export function axisVec(cos, axis = 1) {
+  const v = new Float32Array(1024);
+  v[0] = cos; v[axis] = Math.sqrt(Math.max(0, 1 - cos * cos));
+  return v;
+}
+export function installControlledEmbedder(manager, table) {
+  const counter = { calls: 0 };
+  const gate = manager.gate;
+  gate.state = 'ready'; gate.shuttingDown = false;
+  gate.embedFn = async (text) => {
+    counter.calls++;
+    const hit = table.get(text);
+    if (hit) return hit;
+    const v = new Float32Array(1024);
+    for (let i = 0; i < text.length; i++) v[i % 1024] += text.charCodeAt(i) / 1000;
+    v[0] += 0.01;
+    return v;
+  };
+  manager.embeddingCache = new Map();
+  return counter;
+}

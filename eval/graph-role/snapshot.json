@@ -1,0 +1,33 @@
+{
+  "taken_at": "2026-08-22T09:16:04.168Z",
+  "engine_commit": "6bb5aeba6af8be908ce532610cc526e13ba85173",
+  "corpora": {
+    "hub": {
+      "source": "/Users/heesongkoh/Library/CloudStorage/GoogleDrive-heesong.koh@gmail.com/My Drive/PARADocumentSystem/--1-PROJECTS/RAGMemory-Claude-memory-management-and-optimised-workflow/.memory/rag-memory.db",
+      "copy": "/Users/heesongkoh/Development/rag-memory-epf-mcp.worktrees/eval-graph-role-evaluation/eval/graph-role/dbs/hub.db",
+      "bytes": 92958720,
+      "sha256": "a497019a52e9d1e045971a331b5539048650865ef3a6b0c46577420d4543f024",
+      "open_mode": "read-only",
+      "side_files_created": [],
+      "ro_error": null
+    },
+    "uap": {
+      "source": "/Users/heesongkoh/Library/CloudStorage/GoogleDrive-heesong.koh@gmail.com/My Drive/PARADocumentSystem/--0-CollectLOG/Ultimate_AI_Personal_Assistant/.memory/rag-memory.db",
+      "copy": "/Users/heesongkoh/Development/rag-memory-epf-mcp.worktrees/eval-graph-role-evaluation/eval/graph-role/dbs/uap.db",
+      "bytes": 30855168,
+      "sha256": "1ea6f502e575298c1e637b0f17001d3677f20d834e03197f6391bf8ed338281b",
+      "open_mode": "read-only",
+      "side_files_created": [],
+      "ro_error": null
+    },
+    "hal": {
+      "source": "/Users/heesongkoh/Development/Halal_Assistant_incubator_active/.memory/rag-memory.db",
+      "copy": "/Users/heesongkoh/Development/rag-memory-epf-mcp.worktrees/eval-graph-role-evaluation/eval/graph-role/dbs/hal.db",
+      "bytes": 21708800,
+      "sha256": "fc414a0a94e4b297ec55b8e88f8add90172949cd4e7882f896ff7a167d39f698",
+      "open_mode": "read-only",
+      "side_files_created": [],
+      "ro_error": null
+    }
+  }
+}

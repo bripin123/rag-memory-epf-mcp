@@ -1,0 +1,175 @@
+{
+  "c1_multi_seed_threshold": {
+    "search_mode": "hybrid",
+    "results": [
+      {
+        "chunk_id": "d-alpha_chunk_0",
+        "vs": 0.3923271894454956,
+        "gb": 0.375,
+        "fin": 0.7673271894454956
+      },
+      {
+        "chunk_id": "d-beta_chunk_0",
+        "vs": 0.3910609483718872,
+        "gb": 0.375,
+        "fin": 0.7660609483718872
+      },
+      {
+        "chunk_id": "d-plain_chunk_0",
+        "vs": 0.39951062202453613,
+        "gb": 0,
+        "fin": 0.39951062202453613
+      }
+    ]
+  },
+  "c2_default_off": {
+    "search_mode": "hybrid",
+    "results": [
+      {
+        "chunk_id": "d-plain_chunk_0",
+        "vs": 0.39951062202453613,
+        "fin": 0.39951062202453613
+      },
+      {
+        "chunk_id": "d-alpha_chunk_0",
+        "vs": 0.3923271894454956,
+        "fin": 0.3923271894454956
+      },
+      {
+        "chunk_id": "d-beta_chunk_0",
+        "vs": 0.3910609483718872,
+        "fin": 0.3910609483718872
+      }
+    ]
+  },
+  "c3_no_candidate": {
+    "search_mode": "hybrid",
+    "results": [
+      {
+        "chunk_id": "d-alpha_chunk_0",
+        "vs": 0.40774476528167725,
+        "gb": 0,
+        "fin": 0.40774476528167725
+      },
+      {
+        "chunk_id": "d-beta_chunk_0",
+        "vs": 0.40771061182022095,
+        "gb": 0,
+        "fin": 0.40771061182022095
+      },
+      {
+        "chunk_id": "d-plain_chunk_0",
+        "vs": 0.3891910910606384,
+        "gb": 0,
+        "fin": 0.3891910910606384
+      }
+    ]
+  },
+  "c4_cross_lingual": {
+    "search_mode": "hybrid",
+    "results": [
+      {
+        "chunk_id": "d-alpha_chunk_0",
+        "vs": 0,
+        "gb": 0,
+        "fin": 0.7579200405935431
+      },
+      {
+        "chunk_id": "d-beta_chunk_0",
+        "vs": 0,
+        "gb": 0,
+        "fin": 0.4652288720175734
+      },
+      {
+        "chunk_id": "d-plain_chunk_0",
+        "vs": 0,
+        "gb": 0,
+        "fin": 0.32375151755519244
+      }
+    ]
+  },
+  "c5_entity_vector_exception": {
+    "search_mode": "hybrid",
+    "results": [
+      {
+        "chunk_id": "d-plain_chunk_0",
+        "vs": 0.39951062202453613,
+        "gb": 0,
+        "fin": 0.39951062202453613
+      },
+      {
+        "chunk_id": "d-alpha_chunk_0",
+        "vs": 0.3923271894454956,
+        "gb": 0,
+        "fin": 0.3923271894454956
+      },
+      {
+        "chunk_id": "d-beta_chunk_0",
+        "vs": 0.3910609483718872,
+        "gb": 0,
+        "fin": 0.3910609483718872
+      }
+    ]
+  },
+  "c6_chunk_vector_degraded": {
+    "search_mode": "fts-only",
+    "results": []
+  },
+  "c7_no_relations": {
+    "search_mode": "hybrid",
+    "results": [
+      {
+        "chunk_id": "d-alpha_chunk_0",
+        "vs": 0.3923271894454956,
+        "gb": 0.3,
+        "fin": 0.6923271894454956
+      },
+      {
+        "chunk_id": "d-beta_chunk_0",
+        "vs": 0.3910609483718872,
+        "gb": 0.3,
+        "fin": 0.6910609483718873
+      },
+      {
+        "chunk_id": "d-plain_chunk_0",
+        "vs": 0.39951062202453613,
+        "gb": 0,
+        "fin": 0.39951062202453613
+      }
+    ]
+  },
+  "c8_limit_1": {
+    "search_mode": "hybrid",
+    "results": [
+      {
+        "chunk_id": "d-alpha_chunk_0",
+        "vs": 0.3923271894454956,
+        "gb": 0.375,
+        "fin": 0.7673271894454956
+      }
+    ]
+  },
+  "c9_limit_50": {
+    "search_mode": "hybrid",
+    "results": [
+      {
+        "chunk_id": "d-alpha_chunk_0",
+        "vs": 0.3923271894454956,
+        "gb": 0.375,
+        "fin": 0.7673271894454956
+      },
+      {
+        "chunk_id": "d-beta_chunk_0",
+        "vs": 0.3910609483718872,
+        "gb": 0.375,
+        "fin": 0.7660609483718872
+      },
+      {
+        "chunk_id": "d-plain_chunk_0",
+        "vs": 0.39951062202453613,
+        "gb": 0,
+        "fin": 0.39951062202453613
+      }
+    ]
+  }
+}
