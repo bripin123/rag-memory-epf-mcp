@@ -7,11 +7,12 @@
 > This repo has no markdown frontmatter and no commit trailers. Do not introduce either.
 >
 > **Before reading any code here, check which checkout you are in.** The main folder
-> `~/Development/rag-memory-epf-mcp` is **not** always `main`: as of 2026-08-22 it holds
-> `probe/ranking-ablation` (forked at v5.2.0, plus uncommitted PROBE-ONLY ablation edits that shift
-> line numbers by ~14), while `main` lives in the worktree `.worktrees/fix-graph-default-off`.
-> On 2026-08-22 that tree was read for a whole session as if it were the shipped engine; the
-> `useGraph` default alone differs between the two, which is the exact thing being evaluated.
+> `~/Development/rag-memory-epf-mcp` is **not** guaranteed to be `main`. As of 2026-08-22 (end of
+> session 44) the repo was cleaned up to a single branch `main` and a single worktree at v5.3.1 —
+> but that is a snapshot, not an invariant, so run the check below rather than trusting this line.
+> Earlier that same day this tree held `probe/ranking-ablation` (forked at v5.2.0, with uncommitted
+> PROBE-ONLY edits shifting line numbers by ~14) and was read for a whole session as if it were the
+> shipped engine; the `useGraph` default alone differed, which was the exact thing being evaluated.
 >
 > **The check that catches this regardless of layout** — compare the tree against the engine that is
 > actually running, before trusting anything you read:
