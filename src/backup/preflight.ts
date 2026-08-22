@@ -1,4 +1,4 @@
-import { existsSync, statSync, openSync, readSync, closeSync, linkSync, unlinkSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, copyFileSync, unlinkSync, constants } from 'node:fs';
 import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 
@@ -103,19 +103,45 @@ function verifyRecoveryPoint(path: string): void {
   }
 }
 
-// 슬롯 게시. `link()` 는 목적지가 있으면 EEXIST 로 실패하므로 **원자적 no-clobber** 다
-// (rename 은 조용히 덮어쓴다). 그래서 경쟁하는 프로세스가 있어도 복구점을 잃지 않는다.
+// 슬롯 게시. **`COPYFILE_EXCL` 복사**로 발행한다 — 목적지가 있으면 EEXIST 로 실패하므로
+// no-clobber 의미는 `link()` 와 같고(rename 은 조용히 덮어쓴다), 경쟁 프로세스가 있어도
+// 복구점을 잃지 않는다.
+//
+// **왜 `link()` 가 아닌가** (2026-08-22, 필드 보고): Google Drive File Stream(Windows `G:\`)은
+// 하드링크를 지원하지 않는다. 실측 = 그 FS 에서 `ln` 이 "Invalid request code" 로 실패하고
+// node 의 `linkSync` 는 같은 조건에서 `EISDIR`(errno -4068)로 표면화한다. `EEXIST` 가 아니므로
+// 위 루프가 그대로 throw 했고, 이 함수는 `server.connect()` **전에** 도는 fail-closed 경로라
+// 사용자에게는 원인 없는 "MCP 연결 실패"로만 보였다. 대기 마이그레이션이 없는 동안에는
+// 이 코드가 아예 안 돌기 때문에 **배포 시점이 아니라 스키마 범프 시점에** 터진다.
+// 🔴 이 파일 위쪽 주석이 *"이 프로젝트군은 non-git 환경(Google Drive 폴더)에 배포된다"* 고
+// 적어 놓고 그 FS 가 없는 syscall 로 발행하고 있었다.
+//
+// **FS 별 분기를 두지 않는다.** 하드링크가 되는 곳에서만 link 를 쓰는 폴백 구조는 드문 경로가
+// 영영 안 밟혀서, 정작 필요한 날 처음 실행된다. 모든 FS 가 같은 경로를 타게 한다.
+// 비용은 복사 한 번 추가인데 백업 자체가 이미 `db.backup()` 전체 복사다.
+//
+// ⚠ **복사는 원자적이지 않다** — link 는 O(1) 이라 사실상 원자적이었지만 복사는 바이트를 다시
+// 쓴다. 중간에 죽으면 잘린 파일이 슬롯을 차지하고, `pickRecoverySlot` 은 기존 파일을 **의도적으로**
+// 검증하지 않으므로(아래 주석) 그 파일은 영영 복구점 행세를 한다. 그래서 **목적지 기준으로
+// 다시 검증**하고, 실패하면 슬롯을 비운다. tmp 는 이미 검증했지만 그 뒤에 바이트가 다시 쓰였다.
 function publishNoClobber(tmp: string, base: string): string {
   for (let attempt = 0; attempt < MAX_RECOVERY_POINTS; attempt++) {
     const slot = pickRecoverySlot(base);
     try {
-      linkSync(tmp, slot);
-      unlinkSync(tmp);
-      return slot;
+      copyFileSync(tmp, slot, constants.COPYFILE_EXCL);
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
-      // 그 슬롯을 누가 먼저 가져갔다 — 다음 빈 슬롯으로.
+      if ((e as NodeJS.ErrnoException).code === 'EEXIST') continue;  // 슬롯 경쟁 — 다음 빈 슬롯으로
+      throw e;
     }
+    try {
+      verifyRecoveryPoint(slot);
+    } catch (e) {
+      // 잘린/손상된 사본이 슬롯을 점유한 채 복구점 행세를 하지 못하게 한다.
+      try { unlinkSync(slot); } catch { /* 정리 실패는 원인을 가리지 않는다 */ }
+      throw e;
+    }
+    unlinkSync(tmp);
+    return slot;
   }
   throw slotsFullError(base);
 }
