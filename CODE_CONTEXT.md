@@ -5,6 +5,24 @@
 > pattern changes, and say what you measured.
 >
 > This repo has no markdown frontmatter and no commit trailers. Do not introduce either.
+>
+> **Before reading any code here, check which checkout you are in.** The main folder
+> `~/Development/rag-memory-epf-mcp` is **not** always `main`: as of 2026-08-22 it holds
+> `probe/ranking-ablation` (forked at v5.2.0, plus uncommitted PROBE-ONLY ablation edits that shift
+> line numbers by ~14), while `main` lives in the worktree `.worktrees/fix-graph-default-off`.
+> On 2026-08-22 that tree was read for a whole session as if it were the shipped engine; the
+> `useGraph` default alone differs between the two, which is the exact thing being evaluated.
+>
+> **The check that catches this regardless of layout** — compare the tree against the engine that is
+> actually running, before trusting anything you read:
+>
+> ```bash
+> node -p "require('./package.json').version"   # the tree you are about to read
+> git worktree list                             # every checkout and its branch
+> # compare with server.version from the MCP getKnowledgeGraphStats() response
+> ```
+>
+> Line numbers cited in this file are on **origin/main**.
 
 ---
 
@@ -14,10 +32,10 @@ Single MCP stdio server. One SQLite file per project is the whole persistence la
 external service, no daemon, no second store.
 
 ```
-index.ts                        ~4,200 lines. The engine class + the MCP server, one file.
+index.ts                        4,667 lines. The engine class + the MCP server, one file.
   class RAGKnowledgeGraphManager   all engine behaviour (writers, readers, search, documents)
-  server.setRequestHandler(ListToolsRequestSchema)   tool listing  (~4063)
-  server.setRequestHandler(CallToolRequestSchema)    one switch, one case per tool  (~4070)
+  server.setRequestHandler(ListToolsRequestSchema)   tool listing  (4427)
+  server.setRequestHandler(CallToolRequestSchema)    one switch, one case per tool  (4434)
 
 src/observations/               v13 observation lifecycle
   schema.ts       OBSERVATION_SCHEMA_SQL — the DDL string shared by migration and tests
@@ -39,7 +57,7 @@ src/backup/preflight.ts   pre-migration backup (Online Backup API) into the next
 src/embeddingGate.ts      embedding admission control
 src/backfillCoordinator.ts  background embedding backfill
 src/modelCache.ts         version-independent model cache (v3.6)
-src/chunkText.ts          document chunking
+src/chunkerC.ts           document chunking — structure-anchored chunker "c1" (there is no src/chunkText.ts)
 
 test/*.test.mjs           plain node scripts. No framework. They import ../dist/index.js.
 ```
@@ -53,6 +71,57 @@ test/*.test.mjs           plain node scripts. No framework. They import ../dist/
 
 Vectors live in sqlite-vec `vec0` virtual tables (`entity_embeddings`, chunk embeddings), fixed
 at **1024 dimensions** (`index.ts` fails fast on a mismatch). FTS5 provides BM25.
+
+### The retrieval path (measured 2026-08-22 against a live 2,874-chunk / 600-entity corpus)
+
+**Graph edges are built by string matching only. No embedding is involved in link creation.**
+`autoLinkEntities` (index.ts:2743, run after every embed/sync) fills `chunk_entities` by three
+lexical paths:
+
+1. `buildEntityMatcher(name)` — CJK substring / Latin word-boundary against `chunk.text`
+2. **observation aliases** — every `[\w\-]+\.\w{1,4}` token of length >= 4 found anywhere in that
+   entity's observations, matched as a lowercase substring of `chunk.text`
+3. `buildEntityRangeFinder` — occurrences of the primary name in the *whole document*, linked to any
+   chunk whose `[start_pos, end_pos)` overlaps (recovers names split across a chunk boundary)
+
+`linkEntitiesToDocument` (the MCP tool) uses path 1 only.
+
+Measured share of 65,935 links: **name present in the chunk 1,434 (2.2%)** · **alias-only 60,427
+(91.6%)** · neither 3,563 (5.4%). Path 2 dominates because entity names in this corpus are
+sentence-length records (median 41 chars) that never appear verbatim in prose. One alias carries
+most of it: `agents.md` is held by 81 entities and occurs in 440 chunks (~54% of all links). The
+alias regex also captures decimals as filenames (`0.619`, `1.2gb`) — real, but only 348 links (0.5%).
+
+`provenanceOf` in the evaluation harness labels path-1 links `name` and everything else
+`nonliteral`. That label means *"the name is not in the text"*, **not** *"linked by a non-lexical
+method"* — there is no such method.
+
+**Search does not use the graph to generate candidates.** `hybridSearch` (index.ts:3454) builds the
+pool from vector search over `chunks` plus FTS5, fuses with RRF (k=60), then applies `graphBoost` as
+a re-ranker over that pool. `useGraph` is opt-in, default **false** since v5.3.0; four places must
+agree (method signature, dispatch `=== true`, tool JSON, zod default). Relationship traversal is
+`openNodes` -> `getNeighbors`, never `useGraph`.
+
+`graphBoost` scores each entity linked to the candidate chunk: query-vector-matched or exact term
+match 0.3, substring 0.2, **any whitespace token of the entity name >= 3 chars occurring in the
+query 0.15**, plus 0.15 when connected to a vector-matched entity; geometric decay `0.5^i`, hard cap
+0.4. Given the alias-heavy link table above, a chunk can be boosted purely for mentioning a common
+filename.
+
+Final score is `max(vectorSimilarity, relevanceScore) + graphBoost + ftsBoost`. `relevanceScore`
+comes from `generateContentSummary`, whose `enhanceSimilarityWithContext` adds query-independent
+bonuses (+0.1 per entity mention, +0.05 for digits, +0.03 for "important"-class words), so it can
+displace `vectorSimilarity` inside that `max`.
+
+**graphology analytics read `relationships` only.** `_buildGraphologyGraph` (index.ts:4076) loads
+entity nodes and `relationships` edges; `chunk_entities` is not in that graph. `getGraphMetrics`
+(pagerank/degree/betweenness/closeness), `detectCommunities` (Louvain) and `analyzeGraphStructure`
+therefore describe the ~900-edge authored graph, not the ~66k-link bipartite one.
+
+**FTS5 keeps Korean particles attached.** `unicode61 remove_diacritics` (migration 8) splits on
+whitespace, so `그래프가` and `그래프` are different tokens (measured: 6 vs 53 chunk hits; English
+control `graph` 227). `compileFtsLiteralQuery` quotes each whitespace term verbatim and ORs them, so
+a Korean query only matches chunks carrying the same inflected form.
 
 ### Adding a tool — all four edits are required
 
