@@ -40,8 +40,11 @@ caller wrote against the old one stops working. Say "linking got more precise" i
 and ship a minor.
 
 This is written down because it went the other way once: 6.0.0 was released as a major for
-tightening alias linking, and the follow-up was briefly staged as 7.0.0 for tightening it further.
-Neither touched a signature. Both belonged under one minor, which is where they ended up.
+tightening alias linking, and the follow-up was staged first as 7.0.0 and then as 6.1.0 for
+tightening it further. Neither touched a signature, and both were undoing links that should not
+have existed — a fix, not a feature. They shipped as 6.0.1. When in doubt about minor vs patch,
+ask whether a caller gains anything they can call; if the answer is "the same calls just return
+better data", it is a patch.
 
 Bump major when a caller has to change something: a tool renamed or removed, an argument's meaning
 changed, a return field dropped, a migration a caller must run.

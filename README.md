@@ -153,12 +153,12 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
-### v6.1.0
+### v6.0.1
 
-**Versioning note.** Both changes below alter how many rows land in `chunk_entities`. They do not
-change any tool signature, return shape or schema, so they are a minor: **derived-link density is
-not part of the compatibility contract**. Read the two entries as "linking got more precise", not
-as an API break.
+**Versioning note.** Both changes below stop links from being created that should never have been
+created, and restore links that should have been. No tool signature, return shape or schema
+changes, so this is a patch: **derived-link density is not part of the compatibility contract**.
+Read the entries as "linking got more precise", not as an API break.
 
 - **An observation alias must now also appear in the entity's own name.** 6.0.0 capped how many
   entities may share a token. That answers "does this token point at one entity?" and says nothing
