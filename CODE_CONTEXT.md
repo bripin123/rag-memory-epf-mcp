@@ -27,6 +27,27 @@
 
 ---
 
+## 0. Versioning — what counts as a break
+
+The compatibility contract is the **public surface**: tool names and signatures, argument and
+return shapes, the MCP schema, and the database schema. A change that leaves all of those intact
+is at most a minor, however much it changes the *numbers* inside.
+
+**Derived-link density is explicitly not part of the contract.** `chunk_entities` is a derived
+index — the engine decides what to put there and revises that judgement as it gets better. Two
+releases that link the same corpus differently are not incompatible with each other; nothing a
+caller wrote against the old one stops working. Say "linking got more precise" in the changelog
+and ship a minor.
+
+This is written down because it went the other way once: 6.0.0 was released as a major for
+tightening alias linking, and the follow-up was briefly staged as 7.0.0 for tightening it further.
+Neither touched a signature. Both belonged under one minor, which is where they ended up.
+
+Bump major when a caller has to change something: a tool renamed or removed, an argument's meaning
+changed, a return field dropped, a migration a caller must run.
+
+---
+
 ## 1. Architecture
 
 Single MCP stdio server. One SQLite file per project is the whole persistence layer — there is no

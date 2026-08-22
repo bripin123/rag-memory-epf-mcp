@@ -1,6 +1,6 @@
 {
   "name": "rag-memory-epf-mcp",
-  "version": "7.0.0",
+  "version": "6.1.0",
   "engines": {
     "node": ">=24"
   },

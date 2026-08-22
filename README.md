@@ -153,42 +153,39 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
-### v7.0.0
+### v6.1.0
 
-- **Breaking — an observation alias must also appear in the entity's own name.** 6.0.0 capped how
-  many entities may share a token. That answers "does this token point at one entity?" and says
-  nothing about the other direction, so an entity that mentions a common filename *once* still
-  attached to every chunk containing it — and, being the sole owner, sailed through the cap. The
-  cap stopped the explosion, not the magnet. Measured after the 6.0.0 cleanup on a live corpus:
-  2,014 alias-only links remained and **34 entities held 68.1%** of them; the largest had the
-  entity name in **zero** of its chunks. Requiring the token (or its stem) to appear in the name
-  brings that to 6 entities / 42.1%, and what remains are entities that really are about that file.
+**Versioning note.** Both changes below alter how many rows land in `chunk_entities`. They do not
+change any tool signature, return shape or schema, so they are a minor: **derived-link density is
+not part of the compatibility contract**. Read the two entries as "linking got more precise", not
+as an API break.
+
+- **An observation alias must now also appear in the entity's own name.** 6.0.0 capped how many
+  entities may share a token. That answers "does this token point at one entity?" and says nothing
+  about the other direction, so an entity that mentions a common filename *once* still attached to
+  every chunk containing it — and, being the sole owner, sailed through the cap. The cap stopped
+  the explosion, not the magnet. Measured after the 6.0.0 cleanup on a live corpus: 2,014
+  alias-only links remained and **34 entities held 68.1%** of them; the largest had the entity name
+  in **zero** of its chunks. Requiring the token (or its stem) to appear in the name brings that to
+  6 entities / 42.1%, and what remains are entities that really are about that file. Expect far
+  fewer alias links on new ingests; existing rows are not rewritten.
 - **A chunk-frequency cap was measured and rejected on the evidence, not on cost.** The full-corpus
   scan is 585ms (731 tokens x 2,913 chunks). It was rejected because the sweep has no knee and every
   cut also removed legitimate links — `log_coverage.py` occurs in 64 chunks and belongs to an entity
-  about exactly that file. The name condition is structural: no threshold, same meaning at any corpus
-  size.
-- Expect far fewer alias links after upgrading. Existing rows are not rewritten.
-- Regression: `test/alias-link-gate.test.mjs` gained a magnet case, verified to fail without the
-  condition.
-
-### v6.1.0
-
+  about exactly that file. The name condition is structural: no threshold, same meaning at any
+  corpus size.
 - **Fixed — entity names whose own edge is punctuation never linked.** The Latin matcher used
-  `\b<name>\b`. `\b` asserts a transition between a word character and a non-word character, so
-  when the name itself starts or ends with punctuation — `Widget Review (2026-05-27)`,
-  `--build-flag` — there is no transition to assert and the pattern cannot match no matter how the
-  text reads. Measured on a live 2,913-chunk / 312-name corpus: **23 standalone occurrences across
-  13 names** were invisible to linking. Both the chunk-level matcher and the document-level range
-  finder now accept an occurrence whose neighbours on both sides are non-word characters.
-- **This is not a widening.** Both neighbours must still be non-word, so `Data` continues not to
-  match inside `Database`; the second arm only reaches occurrences `\b` was already trying to
-  describe. The scan runs on the original text rather than a lowercased copy, because folding can
-  change length (`İ` becomes two units) and the range finder converts these indices to codepoints.
-- Existing databases are not rewritten. Documents re-ingested after upgrading will pick up the
-  previously missed links; older rows stay as they are.
-- Regression: `test/entity-name-boundary.test.mjs` (registered in `verify:engine`), verified to
-  fail without the fix.
+  `\b<name>\b`. `\b` asserts a transition between a word character and a non-word character, so when
+  the name itself starts or ends with punctuation — `Widget Review (2026-05-27)`, `--build-flag` —
+  there is no transition to assert and the pattern cannot match however the text reads. Measured on
+  a live 2,913-chunk / 312-name corpus: **23 standalone occurrences across 13 names** were invisible.
+  Both the chunk matcher and the document range finder now accept an occurrence whose neighbours on
+  both sides are non-word. **Not a widening**: both sides must still be non-word, so `Data` continues
+  not to match inside `Database`. The scan runs on the original text rather than a lowercased copy,
+  because folding can change length (`İ` becomes two units) and the range finder converts these
+  indices to codepoints.
+- Regressions: `test/alias-link-gate.test.mjs` (magnet case) and `test/entity-name-boundary.test.mjs`,
+  both registered in `verify:engine` and both verified to fail without their fix.
 
 ### v6.0.0
 
