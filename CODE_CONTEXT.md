@@ -79,13 +79,25 @@ at **1024 dimensions** (`index.ts` fails fast on a mismatch). FTS5 provides BM25
 `autoLinkEntities` (index.ts:2765, run after every embed/sync) fills `chunk_entities` by three
 lexical paths:
 
-1. `buildEntityMatcher(name)` — CJK substring / Latin word-boundary against `chunk.text`
+1. `buildEntityMatcher(name)` — CJK substring / Latin word-boundary against `chunk.text`.
+   **Since 6.1.0 the word-boundary test has a second arm.** `\b` asserts a transition between a
+   word char and a non-word char, so when the *name's own edge* is punctuation — and ours
+   routinely are, e.g. `Widget Review (2026-05-27)` — there is no transition to assert and
+   `\bname\b` can never match, however the text reads. Measured 2026-08-23 on a live
+   2,913-chunk corpus: **23 standalone occurrences across 13 names** were invisible. The second
+   arm (`standaloneIndex`) accepts an occurrence whose both neighbours are non-word, which is
+   what `\b` was reaching for; `Data` still does not match inside `Database`. It runs on the
+   **original** text, not a lowercased copy — folding can change length (`İ` → two units) and
+   path 3 hands these indices to the codepoint table. Regression:
+   `test/entity-name-boundary.test.mjs`.
 2. **observation aliases** — every `[\w\-]+\.\w{1,4}` token of length >= 4 found anywhere in that
    entity's observations, matched as a lowercase substring of `chunk.text`. **Gated since 5.4.0**:
    the token must pass `looksLikeFilename` (extension whitelist; stem >= 3 chars) *and* be held by
    at most `MAX_ALIAS_OWNERS` = 3 entities. See the measurement below for why.
 3. `buildEntityRangeFinder` — occurrences of the primary name in the *whole document*, linked to any
-   chunk whose `[start_pos, end_pos)` overlaps (recovers names split across a chunk boundary)
+   chunk whose `[start_pos, end_pos)` overlaps (recovers names split across a chunk boundary).
+   Carries the same second arm as path 1, deduped against the regex hits — the two must agree or
+   a name links at chunk level but not at range level.
 
 `linkEntitiesToDocument` (the MCP tool) uses path 1 only.
 

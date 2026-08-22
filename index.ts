@@ -2666,6 +2666,41 @@ export class RAGKnowledgeGraphManager {
     return /[\u3000-\u9fff\uac00-\ud7af\uff00-\uffef]/.test(text);
   }
 
+  // `\b` asserts a transition between a word char and a non-word char. When the name itself
+  // *ends* (or starts) with a non-word char — and ours routinely do, e.g. "… Review (2026-05-27)"
+  // — there is no transition to assert, so `\bname\b` can never match however the text reads.
+  // Measured 2026-08-23 on a live 2,913-chunk corpus: 23 standalone occurrences across 13 names
+  // were invisible to the regex. This is not a widening: we still require both neighbours to be
+  // non-word, so "Data" continues not to match inside "Database". It is what `\b` was reaching
+  // for, stated in a way that survives a name whose own edges are punctuation.
+  private static readonly WORD_CH = /[A-Za-z0-9_]/;
+
+  /**
+   * Index of an occurrence of `name` in `text` with non-word neighbours, or -1.
+   *
+   * Runs on the ORIGINAL text, not a lowercased copy. Lowercasing can change length —
+   * 'İ' folds to two units — so an index taken from the folded string does not address the
+   * same character in the original, and buildEntityRangeFinder hands these indices straight
+   * to the codepoint table. (r9-1 made the same call for the regex path; a first cut of this
+   * helper folded first and the İ coordinate test caught it.)
+   */
+  private standaloneIndex(text: string, name: string, from = 0): number {
+    let re: RegExp;
+    try {
+      re = new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    } catch { return -1; }
+    re.lastIndex = from;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const before = m.index === 0 ? '' : text[m.index - 1];
+      const after = text[m.index + m[0].length] ?? '';
+      if (!RAGKnowledgeGraphManager.WORD_CH.test(before)
+          && !RAGKnowledgeGraphManager.WORD_CH.test(after)) return m.index;
+      if (re.lastIndex === m.index) re.lastIndex++;
+    }
+    return -1;
+  }
+
   // The alias regex in autoLinkEntities matches anything shaped like "stem.ext", which
   // includes version strings ("v3.3", "gpt-5.6"), measurements ("1.7mb", "0.465") and
   // domains/module paths ("github.com", "os.path"). Those are not filenames and linking
@@ -2742,6 +2777,16 @@ export class RAGKnowledgeGraphManager {
           out.push({ s: origCpAt(m.index), e: origCpAt(m.index + m[0].length) });
           if (re.lastIndex === m.index) re.lastIndex++;
         }
+        // Same correction as buildEntityMatcher — the two must agree or a name links at chunk
+        // level but not at range level. Union, deduped: a hit found by both must not be pushed
+        // twice or a chunk gets counted once per path.
+        const seen = new Set(out.map(r => `${r.s}:${r.e}`));
+        for (let at = this.standaloneIndex(content, name); at >= 0;
+             at = this.standaloneIndex(content, name, at + 1)) {
+          const s2 = origCpAt(at), e2 = origCpAt(at + name.length);   // 대소문자 차이는 길이를 바꾸지 않는다
+          const key = `${s2}:${e2}`;
+          if (!seen.has(key)) { seen.add(key); out.push({ s: s2, e: e2 }); }
+        }
       } catch { pushAllSubstr(); }                              // matcher 의 fallback 과 동일
       return out;
     };
@@ -2758,7 +2803,8 @@ export class RAGKnowledgeGraphManager {
     try {
       const escaped = lower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const re = new RegExp(`\\b${escaped}\\b`, 'i');
-      return (text: string) => re.test(text);
+      // See standaloneIndex: `\b` cannot fire when the name's own edge is punctuation.
+      return (text: string) => re.test(text) || this.standaloneIndex(text, name) >= 0;
     } catch {
       return (text: string) => text.toLowerCase().includes(lower);
     }
