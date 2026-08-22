@@ -66,7 +66,17 @@ function fixture(dir) {
     { id: 'hub-K-1', class: 'K', split: 'dev', family: 'kdoc', text: 'known item', oracle_chunk_id: 'doc2_chunk_0', document_id: 'doc2' },
   ]);
   const hop = { from: 'E1', to: 'E2', edge_id: 'rel_1', relation_type: 'R', direction: 'out', confidence: 1 };
+  // The observation file now carries the snapshot identity it was derived from, and run-upstream
+  // refuses one that does not match snapshot.json (2026-08-22 staleness gate — see
+  // test/eval-graph-role-prereq-fix.test.mjs, which pins the refusal itself). These fixtures are
+  // "freshly extracted", so they stamp the same sha the sandbox's snapshot.json records.
+  const SNAP_SHA = 'f'.repeat(64);
+  writeFileSync(join(dir, 'snapshot.json'), JSON.stringify({
+    taken_at: '2026-01-01T00:00:00.000Z', engine_commit: 'fixture',
+    corpora: { hub: { source: '/live/hub.db', copy: join(dir, 'dbs', 'hub.db'), bytes: 1, sha256: SNAP_SHA, open_mode: 'read-only', side_files_created: [] } },
+  }, null, 2) + '\n');
   writeJsonl(join(dir, 'suite', 'observed.hub.jsonl'), [
+    { meta: true, snapshot_sha256: SNAP_SHA, snapshot_taken_at: '2026-01-01T00:00:00.000Z', engine_commit: 'fixture', generated_at: '2026-01-01T00:00:01.000Z' },
     { id: 'hub-A-1', observed_paths: [hop] },
     { id: 'hub-M-1', observed_paths: [hop, { from: 'E2', to: 'E7', missing_entity: 'E7' }] },
     { id: 'hub-K-1', observed_paths: [] },

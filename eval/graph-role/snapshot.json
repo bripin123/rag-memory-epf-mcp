@@ -1,24 +1,24 @@
 {
-  "taken_at": "2026-08-17T17:09:45.717Z",
-  "engine_commit": "a0720e7e95231fd5e934f5fac0282a5a8df66d1c",
+  "taken_at": "2026-08-22T08:08:41.845Z",
+  "engine_commit": "082e37fde0296a3228cc6a2b08c028f98a2bfe1a",
   "corpora": {
     "hub": {
       "source": "/Users/heesongkoh/Library/CloudStorage/GoogleDrive-heesong.koh@gmail.com/My Drive/PARADocumentSystem/--1-PROJECTS/RAGMemory-Claude-memory-management-and-optimised-workflow/.memory/rag-memory.db",
       "copy": "/Users/heesongkoh/Development/rag-memory-epf-mcp.worktrees/eval-graph-role-evaluation/eval/graph-role/dbs/hub.db",
-      "bytes": 85524480,
-      "sha256": "d4e64fb57dcfe170bc5a301be2116051ca10e595251557441c761a4922ae5a7b"
+      "bytes": 92958720,
+      "sha256": "73bc2a630eecde49260701e1cd07430b491ea2e0f8e51baaf44599ff5d6a4f63"
     },
     "uap": {
       "source": "/Users/heesongkoh/Library/CloudStorage/GoogleDrive-heesong.koh@gmail.com/My Drive/PARADocumentSystem/--0-CollectLOG/Ultimate_AI_Personal_Assistant/.memory/rag-memory.db",
       "copy": "/Users/heesongkoh/Development/rag-memory-epf-mcp.worktrees/eval-graph-role-evaluation/eval/graph-role/dbs/uap.db",
-      "bytes": 29712384,
-      "sha256": "4f21bce09b27472ba354045c47e6ad58415e841e2344e6f96885c4b632077ca4"
+      "bytes": 30855168,
+      "sha256": "6539216e7a366165179a2181e5ecb8d1e008023fa30eb78b6c3804b12167dbc2"
     },
     "hal": {
       "source": "/Users/heesongkoh/Development/Halal_Assistant_incubator_active/.memory/rag-memory.db",
       "copy": "/Users/heesongkoh/Development/rag-memory-epf-mcp.worktrees/eval-graph-role-evaluation/eval/graph-role/dbs/hal.db",
       "bytes": 21708800,
-      "sha256": "2aba1c2687c250f63e954e982fe6db0a58ec9fd220fc5895bfa23e2ba312fc66"
+      "sha256": "4a43c9a95840390c17f2859034d1349c9c7d3ee8f4ad07f3e8e0f6b960cdbb06"
     }
   }
 }

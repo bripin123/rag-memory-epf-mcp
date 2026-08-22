@@ -26,6 +26,13 @@
 // (second_judge:true) subsample via lib/reliability.mjs's reliabilityOf. judge-B not existing yet,
 // or sharing no tagged jids with judge-A, is not an error -- reliability is null with a
 // reliability_note explaining why, same "never crash on a missing later-stage file" policy as (3).
+//
+// Fix round 2 (review finding, 2026-08-22 — judge blinding): `provenance` no longer travels in the
+// judge file (it told the judge the lexical half of the answer it was being asked for). It is read
+// from links/<c>.links.key.jsonl and joined back on jid here. A sample produced before that split
+// still carries the label in-row; that is accepted so old runs remain reproducible, but the result
+// records blinding:'broken-legacy' so a by_provenance split from such a run is never mistaken for a
+// blinded one. Neither source present is a setup error, not a reason to emit a silent null.
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { CORPORA, EVAL_DIR } from './lib/paths.mjs';
@@ -35,6 +42,19 @@ import { reliabilityOf } from './lib/reliability.mjs';
 const readJsonl = (p) => readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)).filter(r => !r.meta);
 
 export const precisionOf = (rows) => rows.length ? rows.filter(r => r.ok).length / rows.length : null;
+
+// Attaches provenance to the sampled rows from the key file the (blinded) sampler writes. Returns
+// blinding:'blinded' when the key supplied it, 'broken-legacy' when the rows already carried it
+// (a sample taken before the split), and null when neither is available -- the caller treats that
+// last case as a missing input rather than silently reporting a by_provenance split of nothing.
+export function joinProvenance(rows, keyPath) {
+  if (existsSync(keyPath)) {
+    const K = new Map(readFileSync(keyPath, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)).map(r => [r.jid, r.provenance]));
+    return { items: rows.map(r => ({ ...r, provenance: K.get(r.jid) ?? null })), blinding: 'blinded' };
+  }
+  if (rows.some(r => 'provenance' in r)) return { items: rows, blinding: 'broken-legacy' };
+  return { items: rows, blinding: null };
+}
 
 // items: link-audit-sample.mjs output rows. judgeMap: Map(jid -> mention 1|0). Groups judged pairs
 // by chunk_id (unjudged jids are dropped) so each chunk becomes one bootstrap resampling unit.
@@ -99,10 +119,19 @@ export function run(label) {
     judgeA: join(dir, `${label}.links.judge-A.jsonl`),     // judge output (LLM step, run by the controller later)
     prev: join(dir, `${label}.links.prevalence.json`),     // link-audit-sample.mjs output (per-stratum chunk counts)
   };
+  // Checked separately below: a pre-blinding sample has no key file but does carry in-row labels.
+  paths.key = join(dir, `${label}.links.key.jsonl`);
   for (const [k, p] of Object.entries(paths)) {
+    if (k === 'key') continue;
     if (!existsSync(p)) { console.error(`LINK_AUDIT_INPUT_MISSING ${k} ${p}`); process.exit(15); }
   }
-  const items = readJsonl(paths.items);
+  const rawItems = readJsonl(paths.items);
+  const { items, blinding } = joinProvenance(rawItems, paths.key);
+  if (!blinding) {
+    console.error(`LINK_AUDIT_INPUT_MISSING key ${paths.key} (and the sample rows carry no in-row provenance either)`);
+    process.exit(15);
+  }
+  if (blinding === 'broken-legacy') console.error(`BLINDING_BROKEN_LEGACY ${label}: no key file; using the provenance labels embedded in ${paths.items}, which the judge could see`);
   const J = new Map(readJsonl(paths.judgeA).map(r => [r.jid, r.mention]));
   const prev = JSON.parse(readFileSync(paths.prev, 'utf8'));
   const clusters = clusterByChunk(items, J);
@@ -141,6 +170,7 @@ export function run(label) {
     pairs: clusters.flat().length,
     reliability,
     reliability_note,
+    blinding,
   };
   writeFileSync(join(EVAL_DIR, 'out', `link-precision.${label}.json`), JSON.stringify(res, null, 2) + '\n');
   const relSummary = reliability ? `n=${reliability.n} agreement=${reliability.agreement.toFixed(3)} kappa=${reliability.kappa.toFixed(3)}` : `null (${reliability_note})`;

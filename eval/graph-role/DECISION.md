@@ -125,6 +125,7 @@ bash eval/graph-role/run-all.sh > eval/graph-role/out/run-all.log 2>&1          
 for c in hub uap hal; do node eval/graph-role/run-purevec.mjs --corpus $c; done
 node eval/graph-role/scan-outliers.mjs                # exit 13 이면 해당 쌍만 재실행
 node eval/graph-role/make-manifest.mjs --gzip
+for c in hub uap hal; do node eval/graph-role/extract-observed.mjs $c; done   # 새 그래프에서 expected edge 실존을 다시 조회 (아래 주 1)
 for c in hub uap hal; do node eval/graph-role/run-upstream.mjs $c; done
 for c in hub uap hal; do node eval/graph-role/link-audit-sample.mjs $c; done        # 판정 A/B 후
 for c in hub uap hal; do node eval/graph-role/link-audit-merge.mjs $c; done
@@ -132,6 +133,12 @@ node eval/graph-role/report.mjs                       # -> out/report.md
 node eval/graph-role/power.mjs                        # -> suite/POWER.md
 node eval/graph-role/run-decision.mjs                 # -> eval/graph-role/DECISION.md
 ```
+
+**주 1 (2026-08-22 리뷰 수리)**: 이 목록에는 원래 `extract-observed.mjs` 가 없었다. `run-upstream.mjs` 는 `suite/observed.<c>.jsonl` 을 읽고 그 파일은 `extract-observed.mjs` 만 쓰므로, 그래프를 고치고 §9 를 그대로 돌리면 **Stage 1 당시의 관측을 다시 재게 되고** edge validity 가 안 움직인다 — 그것을 *"개선이 효과가 없다"* 로 읽게 된다. 런북 줄은 아무도 읽지 않으므로 기계 게이트를 함께 넣었다: `extract-observed` 는 산출 파일 첫 줄에 자기가 근거한 스냅샷 신원(`snapshot.json` 의 `sha256`)을 찍고, `run-upstream` 은 그 신원이 현재 스냅샷과 다르거나 없으면 **exit 16 (`OBSERVED_STALE` / `OBSERVED_UNSTAMPED`)** 로 거절하며 고치는 명령을 출력한다.
+
+**주 2 (2026-08-22)**: `snapshot.mjs` 는 이제 라이브 DB 에 `-shm` 이 있으면 `-readonly` 로 연다. 없으면 read-only 오픈 자체가 불가능(SQLite 가 WAL 공유메모리 파일을 못 만든다)해서 read-write 로 떨어지고, 그 사실과 그때 생긴 side file 을 `snapshot.json` 에 `open_mode`·`side_files_created` 로 남긴다. read-only 경로에서 side file 이 생기면 **exit 11**.
+
+⚠ **`dbs/` 의 Stage 1 corpus 사본은 2026-08-22 에 소실됐다**(이 수리를 쓰던 중 `snapshot.mjs` 의 CLI 가드 부재로 import 만으로 재스냅샷이 돌았다 — 그 가드도 같이 넣었다). `dbs/` 는 gitignore 라 복구 불가. 옛 신원(`d4e64fb…` / `4f21bce…` / `2aba1c2…`, 2026-08-17T17:09:45Z, engine `a0720e7`)은 이 커밋의 부모 `snapshot.json` 에 남아 있다. **§9 는 0번 스텝이 재스냅샷이라 재평가 자체에는 영향이 없고**, 판정 산출물(`out/`·`links/`·`AUDIT-SHA256.txt`)은 무사하다.
 
 판정(qrels) 축까지 되살리려면 그 앞에 `pool.mjs` → `judge-batches.mjs split/merge` → 조정자 C → `judge-merge.mjs <c>` 가 들어가고, **κ ≥ 0.67 를 통과해야** 등급이 `provisional` 을 벗어난다. 사람 audit 50쌍/corpus 까지 있어야 `decision-grade` 다.
 

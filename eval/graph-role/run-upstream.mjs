@@ -19,6 +19,28 @@ import { assertFrozen } from './lib/freeze.mjs';
 
 const readJsonl = (p) => readFileSync(p, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l));
 
+// Staleness gate (review finding, 2026-08-22). §9's re-evaluation command list did not re-run
+// extract-observed.mjs, so a shipped graph change would have been measured against Stage 1's
+// observation file -- edge validity would have come back unchanged for a mechanical reason and
+// read as "the change did nothing". A line in the runbook cannot enforce that because nothing
+// reads the runbook, so the observation file carries the snapshot identity it was derived from
+// and this refuses to run on a mismatch. Compares snapshot.json's recorded sha256 rather than
+// re-hashing dbs/<label>.db, which later stages mutate; see extract-observed.mjs's header.
+export function checkObservedStamp(rows, snapshotSha) {
+  const meta = rows.find(r => r.meta);
+  if (!meta || !meta.snapshot_sha256) return { ok: false, code: 'OBSERVED_UNSTAMPED', meta: null };
+  if (meta.snapshot_sha256 !== snapshotSha) return { ok: false, code: 'OBSERVED_STALE', meta };
+  return { ok: true, code: null, meta };
+}
+
+function currentSnapshotSha(label) {
+  const p = join(EVAL_DIR, 'snapshot.json');
+  if (!existsSync(p)) { console.error(`SNAPSHOT_MISSING ${p} -- run: node eval/graph-role/snapshot.mjs`); process.exit(12); }
+  const sha = JSON.parse(readFileSync(p, 'utf8')).corpora?.[label]?.sha256;
+  if (!sha) { console.error(`SNAPSHOT_MISSING corpus ${label} in ${p}`); process.exit(12); }
+  return sha;
+}
+
 // Pure part (TDD'd in test/eval-graph-role-libs.test.mjs, no DB/file access): does the KG actually
 // carry the edges a query's expected_paths encode? `hits` matches observed_paths rows by (from,to)
 // that resolved to a real edge_id -- extract-observed.mjs leaves a bare {from,to,missing_entity}
@@ -58,7 +80,14 @@ export function run(label) {
   if (existsSync(qrelsPath)) assertFrozen({ rel: `qrels.${label}.jsonl` });
   else console.error(`QRELS_ABSENT ${label} (kappa gate fail — authored-axis run); judged-gold metrics skipped`);
   const queries = readJsonl(join(EVAL_DIR, 'suite', `queries.${label}.jsonl`)).filter(q => q.class !== 'K');
-  const observed = new Map(readJsonl(join(EVAL_DIR, 'suite', `observed.${label}.jsonl`)).map(o => [o.id, o.observed_paths]));
+  const observedRows = readJsonl(join(EVAL_DIR, 'suite', `observed.${label}.jsonl`));
+  const stamp = checkObservedStamp(observedRows, currentSnapshotSha(label));
+  if (!stamp.ok) {
+    console.error(`${stamp.code} ${label}: suite/observed.${label}.jsonl was ${stamp.code === 'OBSERVED_STALE' ? `derived from snapshot ${stamp.meta.snapshot_sha256.slice(0, 12)}, but the current snapshot is ${currentSnapshotSha(label).slice(0, 12)}` : 'written before this gate existed and carries no snapshot stamp'}.`);
+    console.error(`  re-derive it first: node eval/graph-role/extract-observed.mjs ${label}`);
+    process.exit(16);
+  }
+  const observed = new Map(observedRows.filter(o => !o.meta).map(o => [o.id, o.observed_paths]));
   const cand = new Map(readJsonl(join(EVAL_DIR, 'out', `candidates.${label}.real.jsonl`)).map(r => [r.id, r]));
   const fin = new Map(readJsonl(join(EVAL_DIR, 'out', `final.${label}.real.jsonl`)).map(r => [r.id, r]));
   const { goldDocs, skipped } = loadGoldDocs(qrelsPath);

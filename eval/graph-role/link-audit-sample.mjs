@@ -1,8 +1,14 @@
 // Task 7 Step 3a — link-audit sample: a stratified-by-link-count sample of chunk<->entity pairs
-// from the frozen corpus copy, each labeled with provenanceOf so judges can be told whether a pair
-// is a plain string match ('name') or a nonliteral (semantic/inferred) link -- entity linking in
-// this engine is not purely lexical (autoLinkEntities also matches on observations), so a chunk can
-// be linked to an entity whose name never appears in the chunk text at all.
+// from the frozen corpus copy. Each pair is classified by provenanceOf as a plain string match
+// ('name') or a nonliteral (semantic/inferred) link -- entity linking in this engine is not purely
+// lexical (autoLinkEntities also matches on observations), so a chunk can be linked to an entity
+// whose name never appears in the chunk text at all.
+//
+// Blinding (review finding, 2026-08-22): that label used to be written into the judge file itself.
+// The judge is asked whether the chunk mentions the entity, and `provenance` answers the lexical
+// half of exactly that question -- and link-audit-merge.mjs then reported precision split by the
+// same field, so the split was partly measuring the cue rather than the linker. The label now goes
+// to <label>.links.key.jsonl, which only the merge reads; the judge file carries the pair alone.
 //
 // Read-only against dbs/<label>.db (new Database(path, { readonly: true })): never writes to dbs/,
 // never boots the engine (openCorpus), never opens a live DB.
@@ -64,7 +70,12 @@ export function run(label) {
 
   const outDir = join(EVAL_DIR, 'links');
   mkdirSync(outDir, { recursive: true });
-  writeFileSync(join(outDir, `${label}.links.judge.jsonl`), shuffle(rows, rng).map(r => JSON.stringify(r)).join('\n') + '\n');
+  // One shuffle, two projections: the judge file and the key must stay row-aligned by jid, and
+  // re-shuffling for the key would not change that but would make the two files needlessly hard to
+  // diff by eye during an audit.
+  const shuffled = shuffle(rows, rng);
+  writeFileSync(join(outDir, `${label}.links.judge.jsonl`), shuffled.map(({ provenance, ...blinded }) => JSON.stringify(blinded)).join('\n') + '\n');
+  writeFileSync(join(outDir, `${label}.links.key.jsonl`), shuffled.map(r => JSON.stringify({ jid: r.jid, provenance: r.provenance })).join('\n') + '\n');
   writeFileSync(join(outDir, `${label}.links.prevalence.json`), JSON.stringify(prevalence) + '\n');
   console.log(`${label}: link pairs ${rows.length} (name ${rows.filter(r => r.provenance === 'name').length} / nonliteral ${rows.filter(r => r.provenance === 'nonliteral').length}) prevalence ${JSON.stringify(prevalence)} second_judge ${secondJudgeJids.size}/${rows.length} (${JSON.stringify(bySecond)})`);
   db.close();
