@@ -2,10 +2,12 @@
 // Observation-derived alias links are gated: the token must look like a filename AND
 // identify at most MAX_ALIAS_OWNERS(3) entities.
 //
-// Why this exists (measured 2026-08-22, 2,891-chunk corpus): ungated, 97.8% of all
-// chunk_entities rows came from alias hits and two tokens — "agents.md" (88 owners) and
-// "gotchas.md" (64) — produced 50.5% of them. A filename dozens of entities mention is a
-// stopword. The extension whitelist alone leaves 92.3%; the owner cap is what does the work.
+// Why this exists (measured 2026-08-22, 2,891-chunk / 604-entity corpus). Two denominators,
+// kept apart on purpose: 65,388 of 66,841 chunk_entities rows (97.8%) existed only because of
+// an alias hit; counting distinct (chunk, entity) pairs any alias can reach gives 80,096, and
+// against THAT "agents.md" alone is 39,248 (49.0%). It is held by 88 entities. A filename that
+// dozens of entities mention is a stopword. The extension whitelist alone leaves 92.3% of
+// alias links, so the owner cap is what does the work.
 import assert from 'node:assert/strict';
 import { makeManager, installFakeEmbedder } from './helpers/engine-test-db.mjs';
 
@@ -66,6 +68,35 @@ try {
   await manager.embedChunks('alias-gate-doc2');
   for (const e of three)
     assert.ok(links(e.name) > 0, `${e.name}: 3 owners is at the cap and must still link`);
+
+  // --- 5. the FIRST blocked value is 4, not 5 -------------------------------------
+  // Without this, an implementation using `> 4` would pass the 3-allowed / 5-blocked pair.
+  const four = [];
+  for (let i = 1; i <= 4; i++) four.push({
+    name: `QuadOwnerEntity${i}`, entityType: 'TEST',
+    observations: ['described in quad_owner_notes.md'],
+  });
+  await manager.createEntities(four);
+  await manager.storeDocument('alias-gate-doc3', 'A line naming quad_owner_notes.md only.');
+  await manager.chunkDocument('alias-gate-doc3', { maxTokens: 200 });
+  await manager.embedChunks('alias-gate-doc3');
+  for (const e of four)
+    assert.equal(links(e.name), 0, `${e.name}: 4 owners is one past the cap and must not link`);
+
+  // --- 6. alias match must respect token boundaries --------------------------------
+  // Bare substring matching would link "edge_case.py" to a chunk saying "notedge_case.pyc".
+  const edge = { name: 'BoundaryAliasEntity', entityType: 'TEST',
+                 observations: ['lives in edge_case.py'] };
+  await manager.createEntities([edge]);
+  await manager.storeDocument('alias-gate-doc4', 'This mentions notedge_case.pyc and nothing else.');
+  await manager.chunkDocument('alias-gate-doc4', { maxTokens: 200 });
+  await manager.embedChunks('alias-gate-doc4');
+  assert.equal(links(edge.name), 0, 'alias must not match inside a longer filename');
+  // control: the same token standing alone DOES link (proves the check is not vacuous)
+  await manager.storeDocument('alias-gate-doc5', 'This mentions edge_case.py on its own.');
+  await manager.chunkDocument('alias-gate-doc5', { maxTokens: 200 });
+  await manager.embedChunks('alias-gate-doc5');
+  assert.ok(links(edge.name) > 0, 'control: standalone token must link');
 
   console.log('✅ alias-link-gate: owner cap + filename whitelist hold, sole-owner intent preserved');
 } finally {

@@ -76,7 +76,7 @@ at **1024 dimensions** (`index.ts` fails fast on a mismatch). FTS5 provides BM25
 ### The retrieval path (measured 2026-08-22 against a live 2,874-chunk / 600-entity corpus)
 
 **Graph edges are built by string matching only. No embedding is involved in link creation.**
-`autoLinkEntities` (index.ts:2743, run after every embed/sync) fills `chunk_entities` by three
+`autoLinkEntities` (index.ts:2765, run after every embed/sync) fills `chunk_entities` by three
 lexical paths:
 
 1. `buildEntityMatcher(name)` — CJK substring / Latin word-boundary against `chunk.text`
@@ -96,11 +96,28 @@ names in this corpus are sentence-length records (median 41 chars) that never ap
 prose, so the only thing left to match on was a filename someone happened to mention.
 
 Why the gate is an *owner cap* and not an extension filter: `agents.md` is a real filename, held by
-88 entities and occurring in 446 chunks — 39,248 links, **58.7% of the table, from one token**.
+88 entities and occurring in 446 chunks. Two denominators, kept apart: of the **80,096 distinct
+(chunk, entity) pairs any alias can reach**, that one token accounts for **39,248 (49.0%)**, and
+35,099 (43.8%) have no other alias reason. (An earlier note said 58.7% — that used a token x chunk
+product, 92,342, which double-counts pairs reachable by several tokens. Do not reuse that figure.)
 Filtering by extension alone still leaves 92.3% of alias links; adding `owners <= 3` drops it to
-4.0%. A chunk-frequency cap was measured too (+1.4pp) and rejected: it costs a full-corpus scan per
-ingest and makes the result depend on ingest order. Non-filenames the regex used to accept
-(`v3.3`, `gpt-5.6`, `1.7mb`, `github.com`, `os.path`) are now rejected by `looksLikeFilename`.
+4.0%. Non-filenames the regex used to accept (`v3.3`, `gpt-5.6`, `1.7mb`, `github.com`, `os.path`)
+are now rejected by `looksLikeFilename`, and alias matching now requires token boundaries so
+`foo.py` no longer matches inside `notfoo.pyc`.
+
+**The cap value is a judgement, not a discovered boundary.** The sweep is smooth — share of those
+80,096 surviving: `owners<=1` 1.6% · `<=2` 3.7% · `<=3` 5.2% · `<=4` 7.0% · `<=5` 8.3% · `<=10`
+19.9%. There is no knee to point at. 3 keeps the intended case (a file named by one or two records,
+plus slack) and cuts the stopword tail; raising it is cheap and reversible.
+
+**Links are a function of when a document was last processed, not of the corpus.** `autoLinkEntities`
+only sees the entities that exist at ingest time, and nothing re-links older documents when entities
+are added — neither `createEntities` nor `addObservations` calls it, and the writer is
+`INSERT OR IGNORE`. So an owner count that crosses the cap later does not retract links already
+made. This predates the gate rather than being introduced by it, but it does mean a chunk-frequency
+cap cannot be dismissed *for that reason* — the honest reason to skip it is cost (a full-corpus scan
+per ingest for a further 1.4pp). Reconciling links on entity change is unbuilt; `chunk_entities` has
+no provenance column, so name/range/alias rows cannot be told apart after the fact.
 
 The cap is a cap, not a ban — a filename held by 1-3 entities still links, which is the behaviour
 path 2 was written for (`log_coverage.py` -> "기억 커버리지 검출", `slide_kit.py` -> "Deck Authoring

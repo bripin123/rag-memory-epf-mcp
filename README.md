@@ -153,6 +153,30 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### v6.0.0
+
+- **Breaking — observation-derived alias links are now gated.** `autoLinkEntities` used to take every
+  `stem.ext` token appearing anywhere in an entity's observations and link that entity to every chunk
+  containing the token as a substring. Measured on a live 2,891-chunk / 604-entity corpus: 65,388 of
+  66,841 `chunk_entities` rows (97.8%) existed only because of such a hit, and one token — `agents.md`,
+  held by 88 entities — accounted for 39,248 of the 80,096 distinct (chunk, entity) pairs any alias
+  could reach (49.0%). The regex also accepted things that are not filenames at all (`v3.3`,
+  `gpt-5.6`, `1.7mb`, `github.com`, `os.path`).
+  A token now has to (a) look like a filename — extension whitelist, stem ≥ 3 chars, non-numeric
+  stem — and (b) be held by at most 3 entities, and it must match on token boundaries so `foo.py` no
+  longer matches inside `notfoo.pyc`. Effect on the same corpus: alias links 100% → 4.0%. Filtering by
+  extension alone leaves 92.3%, so the owner cap is what does the work. The cap is a judgement, not a
+  discovered boundary — the sweep is smooth (`owners<=1` 1.6% … `<=10` 19.9%) — and it is a cap, not a
+  ban: a filename named by one to three records still links, which is what the alias path was for.
+- **What this means for existing databases.** Nothing is rewritten on upgrade: rows already in
+  `chunk_entities` stay, and new ingests simply link far less. Links have always been a function of
+  when a document was last processed (nothing re-links older documents when entities are added), and
+  `chunk_entities` has no provenance column, so old alias rows cannot be told apart from name matches
+  after the fact. If you want the old noise gone you have to clean it offline, before or after
+  upgrading. Callers that assumed dense `chunk_entities` coverage will see sparser graphs.
+- Regression: `test/alias-link-gate.test.mjs` (registered in `verify:engine`), verified to fail
+  without the gate.
+
 ### v5.3.0
 - (Published first as `5.3.0-rc.1` on the `next` dist-tag; promoted to `latest` after a canary run of the published artifact against a real project database: default call carries no `graph_boost` and equals explicit `useGraph:false`, the known-item probe from the 2026-08-17 measurement returns the correct gotcha at rank 1, opt-in `true` still exposes `graph_boost`, schema/MCP defaults read `false`.)
 - **Behavior change — `hybridSearch` graph re-ranking is now opt-in** (`useGraph` default `true` → `false`; tool schema, MCP exposure and the manager signature agree). Omitting the argument now means "no graph re-ranking" — a behavior change for callers that relied on the old default, hence a release-candidate first (`next` dist-tag, fleet canary) before stable. Measured 2026-08-17 on three real corpora (self-retrieval, usable samples 120/117/120, summaries off): with the additive graph boost on, the known-item chunk got worse in 46/49/52 samples and better in 3/2/0 (sign test p < 7e-11 per corpus), 106 targets left the top-10 entirely; reproduced on the summaries-on product path (HAL, 20 paired samples: hit@1 10→7, hit@5 18→13). Mechanism: only query-matched/connected entities score, but the per-entity boost saturates the cap quickly, so heavily-linked chunks can outrank the exact chunk even at `vector_similarity` 0. This is a harm-reduced default, not a validated graph improvement: the boost path is unchanged for `useGraph: true` (legacy/experimental re-ranker for back-compat and evaluation; the graph does not generate candidates — for relationship exploration use `openNodes` → `getNeighbors`). Regression lock: `test/search-graph-default.test.mjs`.

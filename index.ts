@@ -2671,12 +2671,15 @@ export class RAGKnowledgeGraphManager {
   // domains/module paths ("github.com", "os.path"). Those are not filenames and linking
   // on them is pure noise. Whitelist the extensions we actually ship and store.
   private static readonly ALIAS_FILE_EXT = new Set([
-    'md', 'py', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'json', 'jsonl',
+    'md', 'py', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'json',
     'sh', 'bash', 'zsh', 'toml', 'yaml', 'yml', 'ini', 'cfg', 'conf',
     'txt', 'log', 'csv', 'tsv', 'sql', 'db', 'zip', 'gz', 'tar',
     'css', 'scss', 'html', 'htm', 'svg', 'png', 'jpg', 'jpeg', 'gif',
     'pdf', 'docx', 'pptx', 'xlsx', 'hwp', 'hwpx', 'lock', 'bak',
   ]);
+  // Deliberately absent: any 5+ character extension (jsonl, ipynb, scss is 4 so it stays).
+  // The extractor regex is `\w{1,4}`, so a longer extension never reaches this set — listing
+  // one would be a dead entry that reads as support. Extend the regex first if that changes.
 
   private looksLikeFilename(token: string): boolean {
     const i = token.lastIndexOf('.');
@@ -2786,14 +2789,28 @@ export class RAGKnowledgeGraphManager {
       const MIN_LEN_CJK = 2;
       const MIN_LEN_LATIN = 4;
 
-      // Observation-derived aliases are only useful when the token identifies ONE entity.
-      // Measured on a 2,891-chunk corpus (2026-08-22): without this gate 97.8% of all
-      // chunk_entities rows came from alias hits, and two tokens alone — "agents.md"
-      // (88 owners) and "gotchas.md" (64) — produced 50.5% of them. A filename that
-      // dozens of entities mention is a stopword, not an identifier.
-      // Extension whitelist alone is NOT enough (it leaves 92.3%); the owner cap is what
-      // does the work (down to 4.0%). Chunk-frequency caps were rejected: +1.4pp for a
-      // full-corpus scan per ingest, and the outcome would depend on ingest order.
+      // Observation-derived aliases are only useful when the token identifies few entities.
+      // Measured on a 2,891-chunk / 604-entity corpus (2026-08-22). Denominators matter here,
+      // so both are stated: 66,841 rows in chunk_entities, of which 65,388 (97.8%) exist only
+      // because of an alias hit; counting distinct (chunk, entity) pairs reachable by any alias
+      // gives 80,096. Against that 80,096, "agents.md" alone accounts for 39,248 (49.0%), and
+      // 35,099 (43.8%) have no other alias reason at all. It is held by 88 entities. A filename
+      // that dozens of entities mention is a stopword, not an identifier.
+      //
+      // The owner cap is what does the work: the extension whitelist alone still leaves 92.3%
+      // of alias links. But the cap value is a judgement call, not a discovered boundary — the
+      // sweep is smooth, with no natural knee (share of the 80,096 that survives):
+      //   owners<=1 1.6% · <=2 3.7% · <=3 5.2% · <=4 7.0% · <=5 8.3% · <=8 14.7% · <=10 19.9%
+      // 3 was chosen to keep the intended behaviour (a file named by one or two records, plus
+      // some slack) while cutting the stopword tail. Raising it is cheap and reversible.
+      //
+      // A chunk-frequency cap was measured (a further 1.4pp) and rejected on COST: it needs a
+      // full-corpus scan on every ingest. Note the honest caveat — it was first rejected for
+      // depending on ingest order, but this owner cap has that same property, and so does the
+      // engine as a whole: autoLinkEntities only ever sees the entities that exist at ingest
+      // time, and nothing re-links older documents when entities are added (see
+      // createEntities / addObservations — neither calls this). Links are a function of when a
+      // document was last processed. That predates this gate; it is not introduced by it.
       const MAX_ALIAS_OWNERS = 3;
       const aliasOwners = new Map<string, number>();
       for (const e of entities) {
@@ -2836,7 +2853,21 @@ export class RAGKnowledgeGraphManager {
                 const tok = p.toLowerCase();
                 if (!this.looksLikeFilename(tok)) continue;                  // "v3.3", "gpt-5.6", "0.465"
                 if ((aliasOwners.get(tok) ?? 0) > MAX_ALIAS_OWNERS) continue; // shared = identifies nothing
-                aliases.push((text: string) => text.toLowerCase().includes(tok));
+                // Bare substring matching links "foo.py" to a chunk saying "notfoo.pyc".
+                // Require the token to stand alone: no filename character on either side.
+                const boundary = /[\w\-.]/;
+                aliases.push((text: string) => {
+                  const hay = text.toLowerCase();
+                  let from = 0;
+                  for (;;) {
+                    const i = hay.indexOf(tok, from);
+                    if (i < 0) return false;
+                    const before = i === 0 ? '' : hay[i - 1];
+                    const after = hay[i + tok.length] ?? '';
+                    if (!boundary.test(before) && !boundary.test(after)) return true;
+                    from = i + 1;
+                  }
+                });
               }
             }
           }
