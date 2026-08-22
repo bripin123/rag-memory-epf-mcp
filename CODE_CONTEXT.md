@@ -81,17 +81,30 @@ lexical paths:
 
 1. `buildEntityMatcher(name)` — CJK substring / Latin word-boundary against `chunk.text`
 2. **observation aliases** — every `[\w\-]+\.\w{1,4}` token of length >= 4 found anywhere in that
-   entity's observations, matched as a lowercase substring of `chunk.text`
+   entity's observations, matched as a lowercase substring of `chunk.text`. **Gated since 5.4.0**:
+   the token must pass `looksLikeFilename` (extension whitelist; stem >= 3 chars) *and* be held by
+   at most `MAX_ALIAS_OWNERS` = 3 entities. See the measurement below for why.
 3. `buildEntityRangeFinder` — occurrences of the primary name in the *whole document*, linked to any
    chunk whose `[start_pos, end_pos)` overlaps (recovers names split across a chunk boundary)
 
 `linkEntitiesToDocument` (the MCP tool) uses path 1 only.
 
-Measured share of 65,935 links: **name present in the chunk 1,434 (2.2%)** · **alias-only 60,427
-(91.6%)** · neither 3,563 (5.4%). Path 2 dominates because entity names in this corpus are
-sentence-length records (median 41 chars) that never appear verbatim in prose. One alias carries
-most of it: `agents.md` is held by 81 entities and occurs in 440 chunks (~54% of all links). The
-alias regex also captures decimals as filenames (`0.619`, `1.2gb`) — real, but only 348 links (0.5%).
+Measured share of 65,935 links **before the 5.4.0 gate**: name present in the chunk 1,434 (2.2%) ·
+alias-only 60,427 (91.6%) · neither 3,563 (5.4%). A re-run on 66,841 links that also credits path 3
+puts it at **1,453 legitimate (2.2%) vs 65,388 alias-only (97.8%)**. Path 2 dominated because entity
+names in this corpus are sentence-length records (median 41 chars) that never appear verbatim in
+prose, so the only thing left to match on was a filename someone happened to mention.
+
+Why the gate is an *owner cap* and not an extension filter: `agents.md` is a real filename, held by
+88 entities and occurring in 446 chunks — 39,248 links, **58.7% of the table, from one token**.
+Filtering by extension alone still leaves 92.3% of alias links; adding `owners <= 3` drops it to
+4.0%. A chunk-frequency cap was measured too (+1.4pp) and rejected: it costs a full-corpus scan per
+ingest and makes the result depend on ingest order. Non-filenames the regex used to accept
+(`v3.3`, `gpt-5.6`, `1.7mb`, `github.com`, `os.path`) are now rejected by `looksLikeFilename`.
+
+The cap is a cap, not a ban — a filename held by 1-3 entities still links, which is the behaviour
+path 2 was written for (`log_coverage.py` -> "기억 커버리지 검출", `slide_kit.py` -> "Deck Authoring
+Engine"). Regression: `test/alias-link-gate.test.mjs`.
 
 `provenanceOf` in the evaluation harness labels path-1 links `name` and everything else
 `nonliteral`. That label means *"the name is not in the text"*, **not** *"linked by a non-lexical

@@ -2666,6 +2666,28 @@ export class RAGKnowledgeGraphManager {
     return /[\u3000-\u9fff\uac00-\ud7af\uff00-\uffef]/.test(text);
   }
 
+  // The alias regex in autoLinkEntities matches anything shaped like "stem.ext", which
+  // includes version strings ("v3.3", "gpt-5.6"), measurements ("1.7mb", "0.465") and
+  // domains/module paths ("github.com", "os.path"). Those are not filenames and linking
+  // on them is pure noise. Whitelist the extensions we actually ship and store.
+  private static readonly ALIAS_FILE_EXT = new Set([
+    'md', 'py', 'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'json', 'jsonl',
+    'sh', 'bash', 'zsh', 'toml', 'yaml', 'yml', 'ini', 'cfg', 'conf',
+    'txt', 'log', 'csv', 'tsv', 'sql', 'db', 'zip', 'gz', 'tar',
+    'css', 'scss', 'html', 'htm', 'svg', 'png', 'jpg', 'jpeg', 'gif',
+    'pdf', 'docx', 'pptx', 'xlsx', 'hwp', 'hwpx', 'lock', 'bak',
+  ]);
+
+  private looksLikeFilename(token: string): boolean {
+    const i = token.lastIndexOf('.');
+    if (i < 1) return false;
+    const stem = token.slice(0, i);
+    const ext = token.slice(i + 1);
+    if (stem.length < 3) return false;          // "d.ts" is a fragment, not a file
+    if (/^\d+$/.test(stem)) return false;       // "2026.md" style numeric stems
+    return RAGKnowledgeGraphManager.ALIAS_FILE_EXT.has(ext);
+  }
+
   // spec §5.4 (r7-2·r8-1·r9): primary name 의 본문 occurrence range [sCp, eCp).
   // 의미 = buildEntityMatcher 와 동일 (CJK substring / Latin word-boundary) — 여기서
   // 어긋나면 'Data' 가 'Database' 에 새로 링크되는 식으로 의미가 확장된다.
@@ -2764,6 +2786,28 @@ export class RAGKnowledgeGraphManager {
       const MIN_LEN_CJK = 2;
       const MIN_LEN_LATIN = 4;
 
+      // Observation-derived aliases are only useful when the token identifies ONE entity.
+      // Measured on a 2,891-chunk corpus (2026-08-22): without this gate 97.8% of all
+      // chunk_entities rows came from alias hits, and two tokens alone — "agents.md"
+      // (88 owners) and "gotchas.md" (64) — produced 50.5% of them. A filename that
+      // dozens of entities mention is a stopword, not an identifier.
+      // Extension whitelist alone is NOT enough (it leaves 92.3%); the owner cap is what
+      // does the work (down to 4.0%). Chunk-frequency caps were rejected: +1.4pp for a
+      // full-corpus scan per ingest, and the outcome would depend on ingest order.
+      const MAX_ALIAS_OWNERS = 3;
+      const aliasOwners = new Map<string, number>();
+      for (const e of entities) {
+        if (!e.observations) continue;
+        let obs: string[];
+        try { obs = JSON.parse(e.observations); } catch { continue; }
+        const seen = new Set<string>();
+        for (const ob of obs) {
+          const pm = String(ob).match(/[\w\-]+\.\w{1,4}\b/g);
+          if (pm) for (const p of pm) if (p.length >= 4) seen.add(p.toLowerCase());
+        }
+        for (const t of seen) aliasOwners.set(t, (aliasOwners.get(t) ?? 0) + 1);
+      }
+
       const insertStmt = this.db.prepare(`
         INSERT OR IGNORE INTO chunk_entities (chunk_rowid, entity_id) VALUES (?, ?)
       `);
@@ -2776,7 +2820,9 @@ export class RAGKnowledgeGraphManager {
 
         const nameMatcher = this.buildEntityMatcher(entity.name);
 
-        // Also collect observation-derived aliases (short keywords from observations)
+        // Also collect observation-derived aliases (short keywords from observations).
+        // Gated: the token must look like a filename AND identify at most MAX_ALIAS_OWNERS
+        // entities. Ungated, "agents.md" linked 88 entities to every chunk that mentioned it.
         const aliases: ((text: string) => boolean)[] = [];
         if (entity.observations) {
           let obs: string[];
@@ -2786,9 +2832,11 @@ export class RAGKnowledgeGraphManager {
             const pathMatch = ob.match(/[\w\-]+\.\w{1,4}\b/g);
             if (pathMatch) {
               for (const p of pathMatch) {
-                if (p.length >= 4) {
-                  aliases.push((text: string) => text.toLowerCase().includes(p.toLowerCase()));
-                }
+                if (p.length < 4) continue;
+                const tok = p.toLowerCase();
+                if (!this.looksLikeFilename(tok)) continue;                  // "v3.3", "gpt-5.6", "0.465"
+                if ((aliasOwners.get(tok) ?? 0) > MAX_ALIAS_OWNERS) continue; // shared = identifies nothing
+                aliases.push((text: string) => text.toLowerCase().includes(tok));
               }
             }
           }
