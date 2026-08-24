@@ -36,3 +36,22 @@ export function deleteStaleKgChunks(db: Database.Database, entityId: string): nu
   }
   return n;
 }
+
+// relationship 청크는 relationship_id 키라 엔티티 삭제만으로는 잡을 수 없다 —
+// 호출자가 relationships 행을 지우기 전에 id 를 캡처해서 넘겨야 한다(deleteEntities 계약).
+// 넘어온 id 중 이미 없는 것은 무시한다(멱등). 벡터 행을 먼저 지우는 것은 deleteStaleKgChunks 와 같다.
+export function deleteKgRelationshipChunks(db: Database.Database, relationshipIds: string[]): number {
+  if (relationshipIds.length === 0) return 0;
+  let n = 0;
+  for (const rid of relationshipIds) {
+    const chunks = db.prepare(
+      `SELECT rowid FROM chunk_metadata WHERE chunk_type = 'relationship' AND relationship_id = ?`
+    ).all(rid) as Array<{ rowid: number }>;
+    for (const c of chunks) {
+      db.exec(`DELETE FROM chunks WHERE rowid = ${Number(c.rowid)}`);
+      db.prepare(`DELETE FROM chunk_metadata WHERE rowid = ?`).run(c.rowid);
+      n++;
+    }
+  }
+  return n;
+}

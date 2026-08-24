@@ -29,7 +29,7 @@ import { getAllMCPTools, validateToolArgs, getSystemInfo } from './src/tools/too
 // Import migration system
 import { MigrationManager } from './src/migrations/migration-manager.js';
 import { backupBeforeMigration } from './src/backup/preflight.js';
-import { rebuildProjection, deleteStaleKgChunks } from './src/observations/projection.js';
+import { rebuildProjection, deleteStaleKgChunks, deleteKgRelationshipChunks } from './src/observations/projection.js';
 import { addRevision, correctRevision, transitionStatus, linkSources,
          nextProjectionOrder, type SourceInput } from './src/observations/lifecycle.js';
 import { getObservationHistory } from './src/observations/history.js';
@@ -998,75 +998,96 @@ export class RAGKnowledgeGraphManager {
 
   async deleteEntities(entityNames: string[]): Promise<void> {
     if (!this.db) throw new Error('Database not initialized');
-    
+
     console.error(`🗑️ Deleting entities: ${entityNames.join(', ')}`);
-    
+
     for (const name of entityNames) {
       const entityId = `entity_${name.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
-      
+
+      // One entity = one transaction. The four deletion steps are a single unit:
+      // a mid-sequence failure must roll back, not leave embeddings/links purged while
+      // the entity itself survives (2026-08-24 audit finding; regression =
+      // test/delete-entities-kg-hygiene.test.mjs ⓒ). Batch semantics are preserved —
+      // other entities still proceed when one fails.
       try {
-        // Check if entity exists first
-        const entityExists = this.db.prepare(`
-          SELECT id FROM entities WHERE id = ?
-        `).get(entityId);
-        
-        if (!entityExists) {
-          console.warn(`⚠️ Entity '${name}' not found, skipping`);
-          continue;
-        }
-        
-        // Step 0: Delete entity embeddings
-        const embeddingMetadata = this.db.prepare(`
-          SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?
-        `).get(entityId) as { rowid: number } | undefined;
-        
-        if (embeddingMetadata) {
-          const embeddings = this.db.prepare(`
-            DELETE FROM entity_embeddings WHERE rowid = ?
-          `).run(embeddingMetadata.rowid);
-          
-          const metadata = this.db.prepare(`
-            DELETE FROM entity_embedding_metadata WHERE entity_id = ?
-          `).run(entityId);
-          
-          if (embeddings.changes > 0 || metadata.changes > 0) {
-            console.error(`  ├─ Removed entity embeddings for '${name}'`);
+        const deleted = this.db.transaction((eid: string): boolean => {
+          // Check if entity exists first
+          const entityExists = this.db!.prepare(`
+            SELECT id FROM entities WHERE id = ?
+          `).get(eid);
+
+          if (!entityExists) return false;
+
+          // Step 0: Delete entity embeddings
+          const embeddingMetadata = this.db!.prepare(`
+            SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?
+          `).get(eid) as { rowid: number } | undefined;
+
+          if (embeddingMetadata) {
+            const embeddings = this.db!.prepare(`
+              DELETE FROM entity_embeddings WHERE rowid = ?
+            `).run(embeddingMetadata.rowid);
+
+            const metadata = this.db!.prepare(`
+              DELETE FROM entity_embedding_metadata WHERE entity_id = ?
+            `).run(eid);
+
+            if (embeddings.changes > 0 || metadata.changes > 0) {
+              console.error(`  ├─ Removed entity embeddings for '${name}'`);
+            }
           }
-        }
-        
-        // Step 1: Delete chunk-entity associations
-        const chunkAssociations = this.db.prepare(`
-          DELETE FROM chunk_entities WHERE entity_id = ?
-        `).run(entityId);
-        if (chunkAssociations.changes > 0) {
-          console.error(`  ├─ Removed ${chunkAssociations.changes} chunk associations for '${name}'`);
-        }
-        
-        // Step 2: Delete relationships where this entity is involved
-        const relationships = this.db.prepare(`
-          DELETE FROM relationships 
-          WHERE source_entity = ? OR target_entity = ?
-        `).run(entityId, entityId);
-        if (relationships.changes > 0) {
-          console.error(`  ├─ Removed ${relationships.changes} relationships for '${name}'`);
-        }
-        
-        // Step 3: Finally delete the entity itself
-        const entity = this.db.prepare(`
-          DELETE FROM entities WHERE id = ?
-        `).run(entityId);
-        if (entity.changes > 0) {
+
+          // Step 1: Delete chunk-entity associations
+          const chunkAssociations = this.db!.prepare(`
+            DELETE FROM chunk_entities WHERE entity_id = ?
+          `).run(eid);
+          if (chunkAssociations.changes > 0) {
+            console.error(`  ├─ Removed ${chunkAssociations.changes} chunk associations for '${name}'`);
+          }
+
+          // Step 2: Capture relationship ids BEFORE deleting the rows — KG relationship
+          // chunks are keyed by relationship_id, so after the DELETE they could no
+          // longer be found and would dangle forever.
+          const relIds = this.db!.prepare(`
+            SELECT id FROM relationships
+            WHERE source_entity = ? OR target_entity = ?
+          `).all(eid, eid) as Array<{ id: string }>;
+
+          const relationships = this.db!.prepare(`
+            DELETE FROM relationships
+            WHERE source_entity = ? OR target_entity = ?
+          `).run(eid, eid);
+          if (relationships.changes > 0) {
+            console.error(`  ├─ Removed ${relationships.changes} relationships for '${name}'`);
+          }
+
+          // Step 2b: KG hygiene — sweep stale entity chunks and chunks of the captured
+          // relationships. The generation path is dormant today (generateKnowledgeGraphChunks
+          // is not tool-exposed), but once seeded these chunks stay vector-searchable after
+          // deletion unless swept here (same fail-closed rationale as deleteStaleKgChunks).
+          deleteStaleKgChunks(this.db!, eid);
+          deleteKgRelationshipChunks(this.db!, relIds.map(r => r.id));
+
+          // Step 3: Finally delete the entity itself (FK CASCADE takes observation lifecycle rows)
+          const entity = this.db!.prepare(`
+            DELETE FROM entities WHERE id = ?
+          `).run(eid);
+
+          return entity.changes > 0;
+        })(entityId);
+
+        if (deleted) {
           console.error(`  └─ Deleted entity '${name}' successfully`);
         } else {
-          console.warn(`  └─ Entity '${name}' was not deleted (possibly already removed)`);
+          console.warn(`⚠️ Entity '${name}' not found, skipping`);
         }
-        
+
       } catch (error) {
-        console.error(`❌ Failed to delete entity '${name}':`, error);
+        console.error(`❌ Failed to delete entity '${name}' (transaction rolled back, continuing):`, error);
         // Continue with other entities instead of failing completely
       }
     }
-    
+
     console.error(`✅ Entity deletion process completed`);
   }
 
