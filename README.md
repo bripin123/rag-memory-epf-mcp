@@ -153,6 +153,32 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### v6.1.0
+
+**Versioning note.** This content was tagged `v6.0.2` locally before release, but npm never received
+a 6.0.2 — it published as **6.1.0**. Coming from any 6.0.x, upgrading to 6.1.0 brings exactly this
+fix.
+
+- **Fixed — a failure mid-deletion could leave partial state.** Deleting an entity ran its cleanup
+  steps (embeddings → chunk associations → relationships → the entity row) with no wrapping
+  transaction, so a failure in the middle committed the earlier steps: embeddings and links purged
+  while the entity itself survived. Each entity's deletion is now one transaction — any step fails,
+  that entity's whole sequence rolls back. Batch semantics are unchanged: other entities still
+  proceed when one fails.
+- **Fixed — deleting an entity left its knowledge-graph chunks behind.** Two gaps compounded: the
+  delete path never invoked the entity-chunk sweeper, and KG relationship chunks are keyed by
+  `relationship_id`, so once the relationship rows were deleted their ids could no longer be found
+  and those chunks dangled forever — still vector-searchable after both of their endpoints were
+  gone. Deletion now captures relationship ids *before* removing the rows and sweeps both: stale
+  entity chunks via the existing `deleteStaleKgChunks`, captured relationship chunks via the new
+  `deleteKgRelationshipChunks` projection helper. Practical exposure today is bounded — the chunk
+  generation path is dormant (not tool-exposed) — but once seeded these chunks stay retrievable
+  unless swept here.
+- Regression: `test/delete-entities-kg-hygiene.test.mjs` (registered in `verify:engine`) covers both,
+  verified RED before the fix; a mutation check confirms that removing the transaction reproduces the
+  partial state (`entities_alive=1` with `relationships_left=0`). Full suite green (`npm test`,
+  46-call chain).
+
 ### v6.0.1
 
 **Versioning note.** Both changes below stop links from being created that should never have been
