@@ -145,13 +145,25 @@ storeDocument(id, content, metadata)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DB_FILE_PATH` | `rag-memory.db` (server dir) | Path to project-local SQLite database |
+| `DB_FILE_PATH` | `rag-memory.db` (server dir) | Path to project-local SQLite database. A **relative** path resolves against the server's working directory (since 6.2; before that it resolved against the package install directory, which under `npx` is the npm cache) |
+| `RAG_MEMORY_MMAP_SIZE` | `0` | SQLite `mmap_size` in bytes. **Off by default since 6.2** — with mmap on, one writer + two readers on a Google Drive folder (Windows) produced `database disk image is malformed` reads; set e.g. `268435456` to restore the pre-6.2 behaviour. The applied value is printed in the boot banner (`| mmap <n>`) |
 | `EMBEDDING_MODEL` | `Xenova/bge-m3` | HuggingFace model ID for embeddings |
 | `RAG_MEMORY_EMBEDDINGS` | `lazy` | Boot mode: `lazy` (connect instantly, model loads in background), `eager` (wait for model + reconciliation, pre-3.6 behavior), `off` (never load the model — FTS5-only, zero download) |
 | `RAG_MEMORY_MODEL_CACHE_DIR` | OS user cache | Version-independent model cache location (see `docs/UPDATING.md`) |
 | `RAG_MEMORY_TRUST_LEGACY_VECTORS` | unset | Set `1` to grandfather pre-existing vectors under a **custom** `EMBEDDING_MODEL` (default model configs grandfather automatically) |
 
 ## Changelog
+
+### Unreleased
+
+- **Changed — a relative `DB_FILE_PATH` now resolves against the server's working directory.** It used
+  to resolve against the package install directory, which under `npx` is the npm cache: a relative
+  value opened a database in a place nobody looks, with no error. Absolute paths and the unset default
+  are unchanged. (Framework spec 2026-09-14 §11-1.)
+- **Changed — SQLite `mmap_size` is opt-in, default 0.** Measured 2026-09-15 on a Google Drive folder
+  (Windows, WAL): with mmap 256 MB, one writer + two readers produced 373,684 `database disk image is
+  malformed` reads in 20 s; with mmap 0, none. `RAG_MEMORY_MMAP_SIZE=<bytes>` restores it; the boot
+  banner reports the applied value. (Spec §11-2.)
 
 ### v6.1.0
 

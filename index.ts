@@ -72,8 +72,8 @@ function sanitizeErrorMessage(msg: string): string {
 }
 
 // v3.6: startup self-report banner (version reliability — spec §8).
-function printBanner(opts: { model: string; revision: string; dtype: string; cachePath: string; dbPath: string }): void {
-  console.error(`🚀 rag-memory-epf-mcp v${PKG_VERSION} | node v${process.versions.node} | model ${opts.model}@${opts.revision} (${opts.dtype}) | cache ${opts.cachePath} | db ${opts.dbPath}`);
+function printBanner(opts: { model: string; revision: string; dtype: string; cachePath: string; dbPath: string; mmap: number }): void {
+  console.error(`🚀 rag-memory-epf-mcp v${PKG_VERSION} | node v${process.versions.node} | model ${opts.model}@${opts.revision} (${opts.dtype}) | cache ${opts.cachePath} | db ${opts.dbPath} | mmap ${opts.mmap}`);
 }
 
 // v3.6 (spec §5): ONE FTS5 literal-query compiler shared by chunk and entity
@@ -94,13 +94,34 @@ if (env.backends?.onnx?.wasm) {
   env.backends.onnx.wasm.wasmPaths = './node_modules/@huggingface/transformers/dist/';
 }
 
-// Define database file path using environment variable with fallback
-const defaultDbPath = path.join(path.dirname(fileURLToPath(import.meta.url)), 'rag-memory.db');
-const DB_FILE_PATH = process.env.DB_FILE_PATH
-  ? path.isAbsolute(process.env.DB_FILE_PATH)
-    ? process.env.DB_FILE_PATH
-    : path.join(path.dirname(fileURLToPath(import.meta.url)), process.env.DB_FILE_PATH)
-  : defaultDbPath;
+// Define database file path using environment variable with fallback.
+// v6.2 (framework spec 2026-09-14-universal-mcp-config-design §11-1): a RELATIVE DB_FILE_PATH
+// resolves against the server's working directory (process.cwd()), the way every other CLI tool
+// reads a relative path. Before this it resolved against the package's own install directory —
+// under npx that is the npm cache, so a relative value silently opened a database nobody could
+// find (measured 2026-09-14 on 6.1.0 dist/index.js:83-88) and every framework config had to carry
+// a machine-specific absolute path. The UNSET default is deliberately unchanged (README contract:
+// `rag-memory.db` next to the server); the framework always sets DB_FILE_PATH explicitly instead.
+// Exported so the contract is unit-testable without writing a database into dist/.
+export function resolveDbFilePath(envValue: string | undefined, cwd: string, serverDir: string): string {
+  if (!envValue) return path.join(serverDir, 'rag-memory.db');
+  return path.isAbsolute(envValue) ? envValue : path.resolve(cwd, envValue);
+}
+const DB_FILE_PATH = resolveDbFilePath(process.env.DB_FILE_PATH, process.cwd(), path.dirname(fileURLToPath(import.meta.url)));
+
+// v6.2 (spec §11-2): SQLite mmap is opt-in, default 0 (off). Measured 2026-09-15 (Windows, Google
+// Drive G:, WAL, mmap 256 MB): one writer + two readers -> 373,684 `database disk image is
+// malformed` reads in 20 s; mmap 0 -> 0 errors; local disk -> 0 either way. On macOS Drive the same
+// probe read clean but the WAL grew to ~4 GB in 20 s with mmap on (n=1). The framework opens one
+// DB from several CLIs on synced folders, so correctness wins over an unmeasured read-speed gain.
+// RAG_MEMORY_MMAP_SIZE=<bytes> turns it back on; garbage or negative values count as 0. The value
+// SQLite actually applied is read back and printed in the boot banner (`| mmap <n>`).
+export function parseMmapSize(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return 0;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+}
+const MMAP_SIZE = parseMmapSize(process.env.RAG_MEMORY_MMAP_SIZE);
 
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'Xenova/bge-m3';
 // v3.5 default model config — grandfathering legacy vectors is only automatic
@@ -299,6 +320,8 @@ export class RAGKnowledgeGraphManager {
   // The calendar that date-only human labels are written in. Resolved once, here, so an invalid
   // zone fails at construction instead of quietly writing wrong days for weeks.
   readonly calendarTimeZone: string = resolveCalendarTimeZone(process.env.RAG_MEMORY_CALENDAR_TZ);
+  // v6.2: the mmap_size SQLite actually applied at initialize() (-1 until then). Banner-only.
+  mmapApplied: number = -1;
   private embeddingCache: Map<string, Float32Array> = new Map();
   private readonly EMBEDDING_CACHE_MAX = 500;
   private dictionaryCache: { nativeToEn: Record<string, string>; enToNative: Record<string, string> } | null = null;
@@ -319,7 +342,10 @@ export class RAGKnowledgeGraphManager {
     this.db.pragma('busy_timeout = 5000');
     this.db.pragma('cache_size = -32000');
     this.db.pragma('temp_store = MEMORY');
-    this.db.pragma('mmap_size = 268435456');
+    // v6.2: opt-in mmap (see MMAP_SIZE above). Read the applied value back so the banner reports
+    // what SQLite did, not what we asked for (a compile-time cap can lower it silently).
+    this.db.pragma(`mmap_size = ${MMAP_SIZE}`);
+    this.mmapApplied = Number(this.db.pragma('mmap_size', { simple: true }));
     this.db.pragma('foreign_keys = ON');
     // spec §5.2: 관찰 lifecycle 의 무결성은 전부 FK CASCADE 를 전제한다 — root 를 지우면
     // revision 이, revision 을 지우면 source 가 따라가야 history 가 고아로 남지 않는다.
@@ -4799,6 +4825,7 @@ async function main() {
       model: EMBEDDING_MODEL, revision: MODEL_REVISION, dtype: MODEL_DTYPE,
       cachePath: resolveModelCacheDir(process.env, process.platform, os.homedir()),
       dbPath: DB_FILE_PATH,
+      mmap: ragKgManager.mmapApplied,
     });
 
     if (ragKgManager.embeddingsMode === 'eager') {
