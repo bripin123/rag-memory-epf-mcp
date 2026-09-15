@@ -16,7 +16,7 @@ A **project-local RAG memory** MCP server — knowledge graph + multilingual vec
 - **38 MCP tools** — knowledge graph CRUD, observation lifecycle (correct / retract / history), document pipeline, hybrid search, multi-hop traversal, graph analytics (centrality / community detection / structure), export/import, temporal queries
 - **Observations that hold their history** — corrections supersede instead of overwrite, search returns only current facts, and every revision keeps its provenance
 - **Structure-anchored chunking (c1, v5)** — boundaries anchor to markdown structure (fence-aware, H1–H4 first, block-greedy, exact-token fallback), so editing the top of a file no longer re-embeds the whole document: unchanged text reuses its stored vectors at sync time. Chunk offsets are Unicode codepoints, language-neutral across SQL `substr`, Python slicing, and JS `[...str]` iteration; a publish-time invariant gate locks the gap-free partition. `overlap` is retired (omit or 0).
-- **SQLite optimized** — WAL mode, 32MB cache, 256MB mmap, FTS5 triggers, 7 indexes
+- **SQLite optimized** — WAL mode, 32MB cache, FTS5 triggers, 7 indexes; mmap is opt-in (`RAG_MEMORY_MMAP_SIZE`, default 0 from the next release — see Environment Variables)
 - **MCP SDK 1.27.1** — Tool Annotations (readOnly/destructive/idempotent), latest protocol 2025-11-25
 
 ## Quick Start
@@ -354,7 +354,7 @@ the `active` revisions.
 - **SIGTERM graceful shutdown** — clean exit without ONNX mutex crash
 
 ### v1.7.0
-- **SQLite optimization** — WAL mode, 32MB cache, 256MB mmap, busy_timeout
+- **SQLite optimization** — WAL mode, 32MB cache, busy_timeout; mmap opt-in via `RAG_MEMORY_MMAP_SIZE` (default 0 from the next release)
 - **FTS5 full-text search** — BM25 keyword matching + Reciprocal Rank Fusion with vector search
 - **updateRelations** — update confidence scores and metadata without delete+recreate
 - **exportGraph / importGraph** — JSON backup and restore (merge or replace)
