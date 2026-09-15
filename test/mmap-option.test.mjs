@@ -1,4 +1,4 @@
-// SQLite mmap is opt-in from 6.2 (framework spec 2026-09-14-universal-mcp-config-design §11-2).
+// SQLite mmap is opt-in from the next release (framework spec 2026-09-14-universal-mcp-config-design §11-2).
 // Measured 2026-09-15 (Windows, Google Drive G:, WAL, mmap 256 MB): one writer + two readers ->
 // 373,684 `database disk image is malformed` reads in 20 s; mmap 0 -> 0 errors; local disk -> 0
 // either way. The framework opens one DB from several CLIs on synced folders, so the default is 0.

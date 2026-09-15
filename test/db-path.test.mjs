@@ -1,6 +1,6 @@
 // DB path resolution contract (framework spec 2026-09-14-universal-mcp-config-design §11-1):
 //   (1) a RELATIVE DB_FILE_PATH resolves against the server's working directory (process.cwd()),
-//       NOT against the package install directory (pre-6.2 behaviour: under npx that was the npm
+//       NOT against the package install directory (previous behaviour: under npx that was the npm
 //       cache, so a relative value silently opened a database nobody could find — measured
 //       2026-09-14 on 6.1.0 dist/index.js:83-88).
 //   (2) an ABSOLUTE DB_FILE_PATH is used as-is (unchanged).
