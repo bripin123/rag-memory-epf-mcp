@@ -16,7 +16,7 @@ A **project-local RAG memory** MCP server — knowledge graph + multilingual vec
 - **38 MCP tools** — knowledge graph CRUD, observation lifecycle (correct / retract / history), document pipeline, hybrid search, multi-hop traversal, graph analytics (centrality / community detection / structure), export/import, temporal queries
 - **Observations that hold their history** — corrections supersede instead of overwrite, search returns only current facts, and every revision keeps its provenance
 - **Structure-anchored chunking (c1, v5)** — boundaries anchor to markdown structure (fence-aware, H1–H4 first, block-greedy, exact-token fallback), so editing the top of a file no longer re-embeds the whole document: unchanged text reuses its stored vectors at sync time. Chunk offsets are Unicode codepoints, language-neutral across SQL `substr`, Python slicing, and JS `[...str]` iteration; a publish-time invariant gate locks the gap-free partition. `overlap` is retired (omit or 0).
-- **SQLite optimized** — WAL mode, 32MB cache, FTS5 triggers, 7 indexes; mmap is opt-in (`RAG_MEMORY_MMAP_SIZE`, default 0 from the next release — see Environment Variables)
+- **SQLite optimized** — WAL mode, 32MB cache, FTS5 triggers, 7 indexes; mmap is opt-in (`RAG_MEMORY_MMAP_SIZE`, default 0 since 6.3.0 — see Environment Variables)
 - **MCP SDK 1.27.1** — Tool Annotations (readOnly/destructive/idempotent), latest protocol 2025-11-25
 
 ## Quick Start
@@ -145,8 +145,8 @@ storeDocument(id, content, metadata)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DB_FILE_PATH` | `rag-memory.db` (server dir) | Path to project-local SQLite database. A **relative** path resolves against the server's working directory (next release; before that it resolved against the package install directory, which under `npx` is the npm cache) |
-| `RAG_MEMORY_MMAP_SIZE` | `0` | SQLite `mmap_size` in bytes. **Off by default from the next release** — with mmap on, one writer + two readers on a Google Drive folder (Windows) produced `database disk image is malformed` reads; set e.g. `268435456` to restore the previous behaviour. The applied value is printed in the boot banner (`| mmap <n>`) |
+| `DB_FILE_PATH` | `rag-memory.db` (server dir) | Path to project-local SQLite database. A **relative** path resolves against the server's working directory (since 6.3.0; before that it resolved against the package install directory, which under `npx` is the npm cache) |
+| `RAG_MEMORY_MMAP_SIZE` | `0` | SQLite `mmap_size` in bytes. **Off by default since 6.3.0** — with mmap on, one writer + two readers on a Google Drive folder (Windows) produced `database disk image is malformed` reads; set e.g. `268435456` to restore the previous behaviour. The applied value is printed in the boot banner (`| mmap <n>`) |
 | `EMBEDDING_MODEL` | `Xenova/bge-m3` | HuggingFace model ID for embeddings |
 | `RAG_MEMORY_EMBEDDINGS` | `lazy` | Boot mode: `lazy` (connect instantly, model loads in background), `eager` (wait for model + reconciliation, pre-3.6 behavior), `off` (never load the model — FTS5-only, zero download) |
 | `RAG_MEMORY_MODEL_CACHE_DIR` | OS user cache | Version-independent model cache location (see `docs/UPDATING.md`) |
@@ -154,12 +154,13 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
-### Unreleased
+### v6.3.0 (2026-09-16)
 
 - **Changed — a relative `DB_FILE_PATH` now resolves against the server's working directory.** It used
   to resolve against the package install directory, which under `npx` is the npm cache: a relative
   value opened a database in a place nobody looks, with no error. Absolute paths and the unset default
-  are unchanged. (Framework spec 2026-09-14 §11-1.)
+  are unchanged. (Framework spec 2026-09-14 §11-1.) If you relied on the old install-directory
+  resolution of a relative path, set an absolute path.
 - **Changed — SQLite `mmap_size` is opt-in, default 0.** Measured 2026-09-15 on a Google Drive folder
   (Windows, WAL): with mmap 256 MB, one writer + two readers produced 373,684 `database disk image is
   malformed` reads in 20 s; with mmap 0, none. `RAG_MEMORY_MMAP_SIZE=<bytes>` restores it; the boot
@@ -354,7 +355,7 @@ the `active` revisions.
 - **SIGTERM graceful shutdown** — clean exit without ONNX mutex crash
 
 ### v1.7.0
-- **SQLite optimization** — WAL mode, 32MB cache, busy_timeout; mmap opt-in via `RAG_MEMORY_MMAP_SIZE` (default 0 from the next release)
+- **SQLite optimization** — WAL mode, 32MB cache, 256MB mmap, busy_timeout
 - **FTS5 full-text search** — BM25 keyword matching + Reciprocal Rank Fusion with vector search
 - **updateRelations** — update confidence scores and metadata without delete+recreate
 - **exportGraph / importGraph** — JSON backup and restore (merge or replace)
