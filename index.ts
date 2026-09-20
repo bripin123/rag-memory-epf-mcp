@@ -704,13 +704,70 @@ export class RAGKnowledgeGraphManager {
     };
   }
 
+  // Fold the WAL into the main file and empty it. Returns true when the WAL holds no
+  // frames afterwards.
+  //
+  // Why the engine does this itself instead of leaving it to SQLite: SQLite folds the WAL
+  // only when the LAST connection closes, and only if that close gets to run. Neither holds
+  // here — several engines keep the same file open (one per CLI), and some hosts end the
+  // engine without letting it finish (codex-cli 0.155.1, measured: SIGTERM, then SIGKILL
+  // ~185 ms later; on Windows a child is simply terminated). A WAL with frames that outlives
+  // its process is replayed at the next open against whatever main file is there by then, and
+  // in a cloud-synced folder that can be a main file written by another machine. SQLite does
+  // not check that a WAL belongs to the main file next to it. That corrupted a live database
+  // twice. So the invariant is kept continuously: while idle, the WAL is empty.
+  //
+  // TRUNCATE, not PASSIVE: PASSIVE copies the frames into the main file but leaves them in
+  // the WAL, still valid, still replayable onto a foreign main file.
+  // busy_timeout is dropped to 0 around the call: TRUNCATE runs the busy handler, and a 5 s
+  // stall inside a signal handler or a timer tick is worse than retrying on the next tick.
+  checkpointWal(): boolean {
+    if (!this.db) return true;
+    try {
+      const st = fsSync.statSync(DB_FILE_PATH + '-wal', { throwIfNoEntry: false });
+      if (!st || st.size === 0) return true;
+      this.db.pragma('busy_timeout = 0');
+      try {
+        const r = this.db.pragma('wal_checkpoint(TRUNCATE)') as Array<{ busy: number }>;
+        return r?.[0]?.busy === 0;
+      } finally {
+        this.db.pragma('busy_timeout = 5000');
+      }
+    } catch {
+      return false; // inside a transaction, or the file is locked — the next tick retries
+    }
+  }
+
+  private walTimer: NodeJS.Timeout | null = null;
+  private walSoon: NodeJS.Timeout | null = null;
+
+  // Every write path ends up here without having to be listed: the periodic tick looks at
+  // the size of the -wal file, not at which tool ran, so background writers (reconciliation,
+  // backfill) are covered as well. noteActivity() only shortens the wait after a tool call.
+  startWalKeeper(tickMs = 1000) {
+    if (this.walTimer) return;
+    this.walTimer = setInterval(() => { this.checkpointWal(); }, tickMs);
+    this.walTimer.unref();
+  }
+
+  noteActivity(delayMs = 200) {
+    if (this.walSoon) return;
+    this.walSoon = setTimeout(() => { this.walSoon = null; this.checkpointWal(); }, delayMs);
+    this.walSoon.unref();
+  }
+
   cleanup() {
+    if (this.walTimer) { clearInterval(this.walTimer); this.walTimer = null; }
+    if (this.walSoon) { clearTimeout(this.walSoon); this.walSoon = null; }
     if (this.encoding) {
       this.encoding.free();
       this.encoding = null;
     }
     this.embeddingCache.clear();
     if (this.db) {
+      // close() folds the WAL only for the last connection; with other engines attached it
+      // would leave every frame behind.
+      this.checkpointWal();
       this.db.close();
       this.db = null;
     }
@@ -4664,6 +4721,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
   try {
     // Validate arguments using our structured schema
     const validatedArgs = validateToolArgs(name, args);
+    ragKgManager.noteActivity(); // fold the WAL shortly after this call, whatever it wrote
     
     switch (name) {
       // Original MCP tools
@@ -4860,6 +4918,9 @@ async function main() {
     const shutdown = () => {
       if (shuttingDown) return;
       shuttingDown = true;
+      // Synchronously, before anything is awaited: a host may SIGKILL before the settle
+      // sequence below completes (codex: ~185 ms after SIGTERM).
+      ragKgManager.checkpointWal();
       void (async () => {
         try { await server.close(); } catch { /* transport already gone */ }
         try { process.stdin.pause(); process.stdin.unref?.(); } catch { /* best-effort */ }
@@ -4868,6 +4929,13 @@ async function main() {
     };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
+    // SIGHUP = the terminal or multiplexer pane was closed. Without a handler the default
+    // action kills the process before 'exit' listeners run, so the database is never closed.
+    // On Windows, Node raises SIGHUP when the console window is closed and SIGBREAK on
+    // Ctrl+Break; registering them is harmless where they never fire.
+    process.on('SIGHUP', shutdown);
+    process.on('SIGBREAK', shutdown);
+    ragKgManager.startWalKeeper();
     process.on('exit', () => { try { ragKgManager.cleanup(); } catch { /* idempotent */ } });
     console.error('🛡️ shutdown handlers registered'); // deterministic handler-ready marker (5R test residual)
   } catch (error) {

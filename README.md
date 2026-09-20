@@ -154,6 +154,22 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### v6.3.1
+
+- **Changed — the engine empties the WAL while it is idle.** It runs `wal_checkpoint(TRUNCATE)` itself:
+  on a 1 s tick whenever the `-wal` file has bytes in it, ~200 ms after a tool call, first thing in the
+  signal handler, and before closing. SQLite folds the WAL only when the *last* connection closes and
+  only if that close gets to run; with several engines on one file, or a host that kills the engine
+  (measured: codex-cli 0.155.1 sends SIGTERM and SIGKILLs ~185 ms later; Windows terminates children
+  outright), frames stayed in the WAL — on 6.3.0 a fresh database sat at 4 KB main + 663 KB WAL for as
+  long as the engine ran. In a cloud-synced folder such a WAL can be replayed onto a main file written
+  by another machine. A write made in the last ~1 s before a hard kill can still be in the WAL; a 0-byte
+  `-wal` and a `-shm` left behind by a hard kill are harmless. Running engines on two machines against
+  the same synced file at the same time is still unsafe.
+- **Changed — SIGHUP and SIGBREAK shut the engine down cleanly.** Closing the terminal or multiplexer
+  pane used to kill the process by default signal action, before the database was closed.
+- No tool, argument, return shape or schema changed.
+
 ### v6.3.0 (2026-09-16)
 
 - **Changed — a relative `DB_FILE_PATH` now resolves against the server's working directory.** It used

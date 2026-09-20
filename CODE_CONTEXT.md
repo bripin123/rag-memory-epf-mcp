@@ -261,6 +261,26 @@ not try to strip the `[YYYY-MM-DD]` prefix in SQL.
 assert on the message text. Reordering `SELECT RAISE(...)` statements changes which error a given
 bad row produces.
 
+**The WAL is empty whenever the engine is idle, and the engine keeps it that way itself.**
+`checkpointWal()` runs `wal_checkpoint(TRUNCATE)` when the `-wal` file has bytes in it; it is called
+from a 1 s unref'd tick (`startWalKeeper`), ~200 ms after every tool call (`noteActivity`),
+synchronously at the top of the signal handler, and in `cleanup()` before `close()`. Signals
+handled: `SIGINT` `SIGTERM` `SIGHUP` `SIGBREAK`.
+
+> Do not replace this with "SQLite checkpoints on close". It does so only for the *last*
+> connection, and only if close runs. Measured 2026-09-20: several engines share one file (one per
+> CLI); codex-cli 0.155.1 ends its MCP servers with SIGTERM + stdin EOF and SIGKILLs ~185 ms
+> later; Windows terminates children outright; SIGHUP had no handler. Before this, a fresh database
+> sat at **4 KB main + 663 KB WAL for as long as the engine ran** — the whole database existed only
+> in the WAL, in a folder a sync client uploads file by file. A WAL with frames that outlives its
+> process is replayed on the next open against whatever main file is there, and SQLite does not
+> check that the two belong together. `test/wal-exit.test.mjs` holds the contract per exit path
+> (`WAL_EXIT_ONLY=<path>` runs one); the unfixed engine fails `sighup`, `hardkill` and `not-last`.
+>
+> The tick decides by the size of the `-wal` file, not by which tool ran, so a new writer needs no
+> registration. TRUNCATE rather than PASSIVE because PASSIVE leaves the frames in the file, still
+> replayable. A 0-byte `-wal` and a `-shm` left by a hard kill are harmless.
+
 **Tool declarations carry no logic.** `src/tools/*` is descriptions and zod schemas; behaviour is a
 manager method. Keep it that way — `validateToolArgs` is the only bridge.
 
