@@ -17,6 +17,16 @@
 
 import type Database from 'better-sqlite3';
 
+
+// A handle closed by the engine's reopen (wal-sidecar-guard), or an I/O error from a sidecar the
+// sync client swapped out: the run was cut, not broken.
+const CONN_LOSS_RERUN_MAX = 3;
+function isConnectionLoss(e: unknown): boolean {
+  const code = (e as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && code.startsWith('SQLITE_IOERR')) return true;
+  return e instanceof Error && /database connection is not open/i.test(e.message);
+}
+
 export type ReconState = 'pending' | 'running' | 'complete' | 'failed' | 'deferred' | 'n/a';
 
 export interface CoverageSnapshot {
@@ -57,6 +67,7 @@ export class BackfillCoordinator {
   private kickTimer: ReturnType<typeof setTimeout> | null = null;
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
   private shuttingDown = false;
+  private connLossReruns = 0;
   private scanning = false;
   private scanPromise: Promise<void> | null = null;
   private rerunRequested = false;
@@ -209,6 +220,7 @@ export class BackfillCoordinator {
       const remaining = this.countNullWithVector(db);
       if (remaining !== 0) throw new Error(`complete invariant violated: ${remaining} unreconciled vectors remain`);
       this.recon = 'complete';
+      this.connLossReruns = 0;
       this.snapshot = null;
       console.error('✅ provenance reconciliation complete');
       this.kick();
@@ -218,6 +230,17 @@ export class BackfillCoordinator {
         // NULL rows (per-row transactions make this crash-safe).
         this.recon = 'pending';
         this.reconPromise = null;
+        return;
+      }
+      if (isConnectionLoss(e) && this.connLossReruns < CONN_LOSS_RERUN_MAX) {
+        // The engine reopened the connection under us (wal-sidecar-guard). Not broken: run
+        // again on the new handle. If there is no handle right now (reopen failed), the engine
+        // starts reconciliation itself once it reopens.
+        this.connLossReruns++;
+        this.recon = 'pending';
+        this.reconPromise = null;
+        if (this.deps.db()) setTimeout(() => { void this.runReconciliation(); }, 0).unref?.();
+        console.error(`↻ reconciliation interrupted by a reconnect — rerun ${this.connLossReruns}/${CONN_LOSS_RERUN_MAX}`);
         return;
       }
       this.recon = 'failed';

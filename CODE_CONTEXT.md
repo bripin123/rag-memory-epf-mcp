@@ -280,6 +280,27 @@ handled: `SIGINT` `SIGTERM` `SIGHUP` `SIGBREAK`.
 > The tick decides by the size of the `-wal` file, not by which tool ran, so a new writer needs no
 > registration. TRUNCATE rather than PASSIVE because PASSIVE leaves the frames in the file, still
 > replayable. A 0-byte `-wal` and a `-shm` left by a hard kill are harmless.
+> RESTART (± `journal_size_limit`) is not a substitute: after SIGKILL its WAL replayed onto a
+> foreign main file 3/3 times (2026-09-25, `specs/changes/wal-sidecar-guard`).
+
+**A sync client must not own the sidecars, and a swapped `-wal` is detected, not suffered.**
+Measured 2026-09-25 (macOS + Google Drive for desktop): the client treated `-wal` as a synced item
+and put a new file at the path while the engine held the old one open (`lsof -p` showed the
+descriptor inside `FileProvider/…/wharf/delete/`); every write then failed with `SQLITE_IOERR` until
+restart. `lsof <path>` cannot see this — it matches the inode now at the path.
+`guardSidecars()` sets `com.apple.fileprovider.ignore#P = 1` on `-wal` and `-shm` (darwin only,
+fail-open) after `initialize()` and after every reopen, and records the `-wal` inode. The attribute
+lives on the inode and SQLite deletes both files when the last connection closes, so it cannot be
+set once. The keeper tick calls `walTick()` first: `-wal` inode changed or missing → `reopenDb()`
+(same configuration via `openConnection()`, migrations not rerun). An `SQLITE_IOERR*` from a
+checkpoint or a tool call also reopens; `runWithIoRecovery` retries a tool once only when it is in
+`IDEMPOTENT_TOOLS`, and not after 3 reopens in 10 s (an I/O error still reopens; the inode watch
+pauses 60 s instead). Calls hit by one swap share one reopen. A reopen that fails leaves `dbDown`
+and retries with backoff; the 10th failure calls `onFatal` (main()'s shutdown). A reconciliation cut
+by a reopen reruns itself (≤3). A reopen waits
+for running tool calls, and never runs while shutting down. Known limit: writes acknowledged ≤1 s
+before a swap can be lost if the old file is unreadable (one TRUNCATE on the old handle is tried
+first). `test/wal-sidecar-guard.test.mjs`.
 
 **Tool declarations carry no logic.** `src/tools/*` is descriptions and zod schemas; behaviour is a
 manager method. Keep it that way — `validateToolArgs` is the only bridge.

@@ -154,6 +154,30 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### v6.3.2 (2026-09-25)
+
+- **Changed — on macOS the engine takes `-wal` and `-shm` out of cloud sync.** It sets
+  `com.apple.fileprovider.ignore#P = 1` on both files after every open (SQLite recreates them after the
+  last connection closes, so once is not enough). Measured with Google Drive for desktop: the client
+  treated `-wal` as a synced item and put a new file at the path while the engine held the old one open
+  (`lsof -p` showed the descriptor inside `FileProvider/…/wharf/delete/`); from then on every write
+  failed with `SQLITE_IOERR` ("disk I/O error") until the engine restarted — 10 s to 3 min after start,
+  with one engine attached. With the attribute set, the same live database kept the same `-wal` for
+  25 min of use. The main database file still syncs. Other platforms: no-op.
+- **Changed — a swapped sidecar is detected and the connection reopened.** The idle tick compares the
+  `-wal`/`-shm` inodes with the ones recorded at open (two consecutive mismatches) and reopens with the
+  same configuration; an `SQLITE_IOERR*` from a checkpoint or a tool call reopens too. A tool that hit
+  the I/O error is retried once only if repeating it changes nothing (reads, `createEntities`,
+  `createRelations`, `addObservations`, `deleteEntities`, `deleteRelations`); other tools get the
+  error back after the reopen. A reopen waits for running tool calls, is not done while shutting
+  down, and is braked after 3 in 10 s. A failed reopen retries with backoff and, after 10 failures,
+  shuts the server down so the host shows it as failed. A reconciliation cut by a reopen reruns.
+- Known limit: writes acknowledged in the last ~1 s before a swap can be lost if the old file is no
+  longer readable (the engine tries one checkpoint on the old handle first and logs `walsz-before=`).
+- The 6.3.1 `wal_checkpoint(TRUNCATE)` is unchanged. `RESTART` (± `journal_size_limit`) was measured and
+  rejected: after SIGKILL its WAL replayed onto a foreign main file 3/3 times.
+- No tool, argument, return shape or schema changed. Spec: `specs/changes/wal-sidecar-guard/`.
+
 ### v6.3.1
 
 - **Changed — the engine empties the WAL while it is idle.** It runs `wal_checkpoint(TRUNCATE)` itself:

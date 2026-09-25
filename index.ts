@@ -10,6 +10,7 @@ import Database from 'better-sqlite3';
 import * as sqliteVec from 'sqlite-vec';
 import { get_encoding } from 'tiktoken';
 import fsSync from 'fs';
+import { execFileSync } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { pipeline, env } from '@huggingface/transformers';
@@ -248,6 +249,31 @@ export class SyncCasConflictError extends Error {
   constructor(documentId: string) { super(`sync CAS conflict on ${documentId}`); this.name = 'SyncCasConflictError'; }
 }
 
+// Sidecar guard (specs/changes/wal-sidecar-guard). macOS File Provider attribute that takes an
+// item out of sync; Google Drive for desktop honours it (measured: isExcludedFromSync = 1).
+const SYNC_EXCLUDE_ATTR = 'com.apple.fileprovider.ignore#P';
+const REOPEN_STORM_WINDOW_MS = 10_000;
+const REOPEN_STORM_MAX = 3;
+const REOPEN_MAX_TRIES = 10;
+const WAL_WATCH_PAUSE_MS = 60_000;
+// Tools that may be retried once after an I/O error reopened the connection: reads, and writes
+// whose repetition changes nothing (INSERT OR IGNORE / content dedup / deletes). Everything else
+// gets the error back so the caller decides — e.g. syncDocumentFromFile spans several
+// transactions and its repeat-safety is not proven.
+const IDEMPOTENT_TOOLS = new Set([
+  'readGraph', 'searchNodes', 'openNodes', 'getNeighbors', 'hybridSearch', 'getDetailedContext',
+  'getKnowledgeGraphStats', 'listDocuments', 'exportGraph', 'getMigrationStatus', 'getGraphMetrics',
+  'detectCommunities', 'analyzeGraphStructure', 'getObservationHistory',
+  'createEntities', 'createRelations', 'addObservations',
+  // deleteObservations / deleteDocuments are left out on purpose: a retry after a committed
+  // delete reports 0 deleted, which a caller reads as "nothing was deleted".
+  'deleteEntities', 'deleteRelations',
+]);
+export function isIoError(e: unknown): boolean {
+  const code = (e as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && code.startsWith('SQLITE_IOERR');
+}
+
 // Test-only fault hook (v13 setMigrationFaultPoint 선례 — 환경변수 금지: 상시 스위치는
 // 오설정 한 줄로 sync 를 깬다).
 let __syncFaultHook: ((point: string) => void) | null = null;
@@ -336,47 +362,18 @@ export class RAGKnowledgeGraphManager {
   async initialize(opts: { skipModel?: boolean; gate?: EmbeddingGate; __testForceFkOff?: boolean } = {}) {
     console.error('🚀 Initializing RAG Knowledge Graph MCP Server...');
 
-    this.db = new Database(DB_FILE_PATH);
-    sqliteVec.load(this.db);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('synchronous = NORMAL');
-    this.db.pragma('busy_timeout = 5000');
-    this.db.pragma('cache_size = -32000');
-    this.db.pragma('temp_store = MEMORY');
-    // Opt-in mmap (see MMAP_SIZE above). Read the applied value back so the banner reports
-    // what SQLite did, not what we asked for (a compile-time cap can lower it silently).
-    this.db.pragma(`mmap_size = ${MMAP_SIZE}`);
-    this.mmapApplied = Number(this.db.pragma('mmap_size', { simple: true }));
-    this.db.pragma('foreign_keys = ON');
-    // spec §5.2: 관찰 lifecycle 의 무결성은 전부 FK CASCADE 를 전제한다 — root 를 지우면
-    // revision 이, revision 을 지우면 source 가 따라가야 history 가 고아로 남지 않는다.
-    // FK 가 꺼진 채 돌면 그 계약이 조용히 무효가 되고, 그게 최악이다. 스키마를 건드리기
-    // 전에(= runMigrations 앞에서) 멈춘다.
-    // 트랜잭션 내부에서는 이 pragma 가 no-op 이므로(실측 before=1·during=1·after=1)
-    // 부팅 시점 확인이 유일한 방어 지점이다.
-    //
-    // 음성 대조군 주입은 **인자로만** 받는다. 환경변수로 두면 프로덕션 경로에
-    // "부팅을 막는 스위치"가 상시 존재하게 되고, 오설정 한 줄로 서버가 안 뜬다
-    // (advisor beta 자기의심 2 = "더 나쁘다"). 테스트는 manager 를 직접 만들므로
-    // 인자 주입으로 충분하다.
-    if (opts.__testForceFkOff) this.db.pragma('foreign_keys = OFF');
-    {
-      const fk = this.db.pragma('foreign_keys', { simple: true });
-      if (Number(fk) !== 1) {
-        throw new Error(
-          `foreign_keys is ${fk}, expected 1. The observation lifecycle relies on FK CASCADE ` +
-          `for history integrity; refusing to run migrations without it.`);
-      }
-    }
+    this.openConnection(opts.__testForceFkOff === true);
     this.encoding = get_encoding("cl100k_base");
 
     await this.runMigrations();
     this.currentProfileId = this.ensureCurrentProfile();
     // v14 (spec §7.2): 런타임이 기본 chunker 의 SSOT — 마이그레이션의 리터럴은 동결된
     // 역사이고, 기본값이 진화하면(c2 등) 이 upsert 가 부팅마다 현재값을 기록한다.
-    this.db.prepare(`INSERT INTO server_meta (key, value) VALUES ('current_default_chunker', ?)
+    this.db!.prepare(`INSERT INTO server_meta (key, value) VALUES ('current_default_chunker', ?)
                      ON CONFLICT(key) DO UPDATE SET value = excluded.value`)
       .run(effectiveSignature(DEFAULT_MAX_TOKENS));
+    // The writes above created the sidecars; mark them before a sync client can take them.
+    this.guardSidecars();
 
     this.embeddingsMode = opts.skipModel
       ? 'off'
@@ -407,6 +404,43 @@ export class RAGKnowledgeGraphManager {
     console.error('✅ RAG-enabled knowledge graph initialized (embedding model deferred)');
     const systemInfo = getSystemInfo();
     console.error(`📊 System Info: ${systemInfo.toolCounts.total} tools available (${systemInfo.toolCounts.knowledgeGraph} knowledge graph, ${systemInfo.toolCounts.rag} RAG, ${systemInfo.toolCounts.graphQuery} query)`);
+  }
+
+  // Opens the connection and applies everything the engine attaches to it. Shared by
+  // initialize() and reopenDb() so a reopened connection is configured exactly like the first.
+  private openConnection(forceFkOff = false) {
+    this.db = new Database(DB_FILE_PATH);
+    sqliteVec.load(this.db);
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('synchronous = NORMAL');
+    this.db.pragma('busy_timeout = 5000');
+    this.db.pragma('cache_size = -32000');
+    this.db.pragma('temp_store = MEMORY');
+    // Opt-in mmap (see MMAP_SIZE above). Read the applied value back so the banner reports
+    // what SQLite did, not what we asked for (a compile-time cap can lower it silently).
+    this.db.pragma(`mmap_size = ${MMAP_SIZE}`);
+    this.mmapApplied = Number(this.db.pragma('mmap_size', { simple: true }));
+    this.db.pragma('foreign_keys = ON');
+    // spec §5.2: 관찰 lifecycle 의 무결성은 전부 FK CASCADE 를 전제한다 — root 를 지우면
+    // revision 이, revision 을 지우면 source 가 따라가야 history 가 고아로 남지 않는다.
+    // FK 가 꺼진 채 돌면 그 계약이 조용히 무효가 되고, 그게 최악이다. 스키마를 건드리기
+    // 전에(= runMigrations 앞에서) 멈춘다.
+    // 트랜잭션 내부에서는 이 pragma 가 no-op 이므로(실측 before=1·during=1·after=1)
+    // 부팅 시점 확인이 유일한 방어 지점이다.
+    //
+    // 음성 대조군 주입은 **인자로만** 받는다. 환경변수로 두면 프로덕션 경로에
+    // "부팅을 막는 스위치"가 상시 존재하게 되고, 오설정 한 줄로 서버가 안 뜬다
+    // (advisor beta 자기의심 2 = "더 나쁘다"). 테스트는 manager 를 직접 만들므로
+    // 인자 주입으로 충분하다.
+    if (forceFkOff) this.db.pragma('foreign_keys = OFF');
+    {
+      const fk = this.db.pragma('foreign_keys', { simple: true });
+      if (Number(fk) !== 1) {
+        throw new Error(
+          `foreign_keys is ${fk}, expected 1. The observation lifecycle relies on FK CASCADE ` +
+          `for history integrity; refusing to run migrations without it.`);
+      }
+    }
   }
 
   // Upsert the stored-vector compatibility profile (spec §6c layer 2) and record
@@ -654,6 +688,7 @@ export class RAGKnowledgeGraphManager {
   // session construction at exit — risks an ugly abort message, never data
   // loss. Hanging forever is the alternative and is worse.
   async shutdownAll(): Promise<void> {
+    this.shuttingDown = true;
     console.error('\n🧹 Cleaning up...');
     try { await this.coordinator?.shutdown(5000); } catch { /* settle best-effort */ }
     try { await this.gate?.shutdown(5000); } catch { /* settle best-effort */ }
@@ -733,8 +768,173 @@ export class RAGKnowledgeGraphManager {
       } finally {
         this.db.pragma('busy_timeout = 5000');
       }
-    } catch {
+    } catch (e) {
+      // An I/O error here means the connection is pointing at a file that is no longer the one
+      // at the path (see guardSidecars). Retrying on the same connection cannot succeed.
+      if (isIoError(e)) this.reopenDb(`checkpoint-${(e as { code?: string }).code}`, true);
       return false; // inside a transaction, or the file is locked — the next tick retries
+    }
+  }
+
+  // --- Sidecar guard (specs/changes/wal-sidecar-guard) -------------------------------------
+  // Measured 2026-09-25 (macOS + Google Drive): the sync client treated `-wal` as a synced item
+  // and swapped a new file in at the path while the engine held the old one open; every write
+  // then failed with SQLITE_IOERR until restart. Excluding the sidecars from sync takes them out
+  // of the client's hands, and it matches the WAL-exit contract: a WAL that never leaves this
+  // machine cannot be replayed onto another machine's main file. The attribute lives on the
+  // inode and SQLite recreates both files after the last connection closes, so it is set after
+  // every open and whenever a sidecar at the path is not the one recorded here.
+  walIno: bigint | null = null;
+  shmIno: bigint | null = null;
+  reopenCount = 0;
+  private reopenTimes: number[] = [];
+  private inFlight = 0;                       // tool calls running (reopen waits for them)
+  private pendingReopen: string | null = null;
+  private walMismatchTicks = 0;              // a swap must be seen on 2 consecutive ticks
+  private walWatchPausedUntil = 0;           // storm brake for the inode watch
+  private walWatchOff = false;               // file system gives no inode (ino 0)
+  private lastWalSize = 0;
+  private dbDown: { reason: string; tries: number; nextAt: number } | null = null;
+  shuttingDown = false;
+  // Set by main(): the full shutdown (closes the MCP transport first, then the engine). Without it
+  // the process would stay alive on stdin with no database.
+  onFatal: (() => void) | null = null;
+
+  guardSidecars() {
+    const wal = DB_FILE_PATH + '-wal', shm = DB_FILE_PATH + '-shm';
+    if (process.platform === 'darwin') {
+      for (const p of [wal, shm]) {
+        if (!fsSync.existsSync(p)) continue;
+        try {
+          execFileSync('/usr/bin/xattr', ['-w', SYNC_EXCLUDE_ATTR, '1', p], { stdio: 'ignore' });
+        } catch (e) {
+          // Fail open: the attribute is protection, not a correctness condition.
+          console.error(`⚠️ sidecar sync-exclude failed: ${p}: ${(e as Error).message}`);
+        }
+      }
+    }
+    const w = fsSync.statSync(wal, { throwIfNoEntry: false, bigint: true });
+    const h = fsSync.statSync(shm, { throwIfNoEntry: false, bigint: true });
+    this.walIno = w ? w.ino : null;
+    this.shmIno = h ? h.ino : null;
+    if (w && w.ino === 0n && !this.walWatchOff) {
+      this.walWatchOff = true;
+      console.error('⚠️ file system reports inode 0 — sidecar swap watch disabled');
+    }
+    this.walMismatchTicks = 0;
+  }
+
+  // Runs on the WAL keeper tick. Returns true when it reopened.
+  walTick(): boolean {
+    if (this.shuttingDown) return false;
+    if (!this.db) return this.dbDown ? this.retryOpen() : false;
+    if (this.walWatchOff || Date.now() < this.walWatchPausedUntil) return false;
+    const w = fsSync.statSync(DB_FILE_PATH + '-wal', { throwIfNoEntry: false, bigint: true });
+    const h = fsSync.statSync(DB_FILE_PATH + '-shm', { throwIfNoEntry: false, bigint: true });
+    if (this.walIno === null) {
+      // Nothing recorded yet (no write had created the file): record and mark it now.
+      if (w) this.guardSidecars();
+      return false;
+    }
+    const walOk = !!w && w.ino === this.walIno;
+    const shmOk = this.shmIno === null || (!!h && h.ino === this.shmIno);
+    if (walOk && shmOk) { this.walMismatchTicks = 0; if (w) this.lastWalSize = Number(w.size); return false; }
+    // Two consecutive ticks, so a value that flickers back within a second is not a swap.
+    if (++this.walMismatchTicks < 2) return false;
+    const reason = !w ? 'wal-missing' : !walOk ? 'wal-inode-changed' : 'shm-inode-changed';
+    if (this.inFlight > 0) { this.pendingReopen = reason; return false; }
+    return this.reopenDb(reason);
+  }
+
+  private stormCount(): number {
+    const now = Date.now();
+    return this.reopenTimes.filter(t => now - t < REOPEN_STORM_WINDOW_MS).length;
+  }
+
+  // Close and reopen the connection with the same configuration. Migrations are not rerun.
+  // Returns false when there was nothing to reopen or the reopen failed (the engine then
+  // retries with backoff from the keeper tick and, after REOPEN_MAX_TRIES, exits so the host
+  // sees a failed server instead of a live one that answers every call with an error).
+  // force = an I/O error was seen on this handle: reopen even inside the storm window (holding a
+  // dead handle helps nobody). The storm brake is for the inode watch.
+  reopenDb(reason: string, force = false): boolean {
+    if (this.shuttingDown || !this.db) return false;
+    if (!force && this.stormCount() >= REOPEN_STORM_MAX) {
+      // Keep the connection; pause the inode watch so a flickering file system cannot make
+      // this a once-a-second close/open loop. An IOERR path still gets its error.
+      this.walWatchPausedUntil = Date.now() + WAL_WATCH_PAUSE_MS;
+      console.error(`⚠️ reopen storm (${REOPEN_STORM_MAX} in ${REOPEN_STORM_WINDOW_MS / 1000}s) — watch paused, reason=${reason}`);
+      return false;
+    }
+    const old = this.db;
+    // Salvage: frames committed to the old WAL after the last checkpoint (≤1 s) go to the main
+    // file if the old descriptor is still readable. An I/O error here just means they are gone.
+    // busy_timeout 0: another engine's read snapshot must not stall this for 5 s.
+    try { old.pragma('busy_timeout = 0'); old.pragma('wal_checkpoint(TRUNCATE)'); } catch { /* old file unreadable */ }
+    try { old.close(); } catch { /* the handle may already be unusable */ }
+    this.db = null;
+    this.reopenTimes.push(Date.now());
+    return this.openAfterClose(reason);
+  }
+
+  private openAfterClose(reason: string): boolean {
+    try {
+      this.openConnection();
+      this.guardSidecars();
+    } catch (e) {
+      try { this.db?.close(); } catch { /* half-open */ }
+      this.db = null;
+      const tries = (this.dbDown?.tries ?? 0) + 1;
+      const delay = Math.min(1000 * 2 ** (tries - 1), 60_000);
+      this.dbDown = { reason, tries, nextAt: Date.now() + delay };
+      console.error(`❌ db reopen failed (reason=${reason}, try=${tries}): ${(e as Error).message}`);
+      if (tries >= REOPEN_MAX_TRIES) {
+        console.error('❌ database cannot be reopened — exiting so the host shows a failed server');
+        process.exitCode = 1;
+        if (this.onFatal) this.onFatal();
+        else void this.shutdownAll().finally(() => process.exit(process.exitCode ?? 1));
+      }
+      return false;
+    }
+    this.dbDown = null;
+    this.pendingReopen = null;
+    this.reopenCount++;
+    console.error(`🔁 db reopened (reason=${reason}, n=${this.reopenCount}, walsz-before=${this.lastWalSize})`);
+    // A reconciliation cut short by the old handle is 'pending', not failed — run it again.
+    if (this.coordinator?.reconState === 'pending') void this.startReconciliation().catch(() => { /* logged inside */ });
+    return true;
+  }
+
+  private retryOpen(): boolean {
+    if (this.shuttingDown) return false;
+    if (!this.dbDown || Date.now() < this.dbDown.nextAt) return false;
+    return this.openAfterClose(`retry-${this.dbDown.reason}`);
+  }
+
+  // Tool-call wrapper: an SQLITE_IOERR* reopens the connection. The call is retried once only
+  // when the tool is idempotent — a failed transaction is rolled back whole, but a tool can
+  // span several transactions, so a non-idempotent one gets the error back (after the reopen)
+  // and the caller decides. Too many reopens in a short window → no retry, surface the error.
+  async runWithIoRecovery<T>(tool: string, fn: () => Promise<T>): Promise<T> {
+    if (!this.db && this.dbDown) this.retryOpen();
+    const handle = this.db;
+    this.inFlight++;
+    try {
+      try {
+        return await fn();
+      } catch (e) {
+        if (!isIoError(e)) throw e;
+        const storm = this.stormCount() >= REOPEN_STORM_MAX;
+        // Several calls hit by one swap reopen once: if another call already replaced the
+        // handle, just use the new one.
+        const reopened = (this.db !== null && this.db !== handle)
+          || this.reopenDb(`tool-${tool}-${(e as { code?: string }).code}`, true);
+        if (storm || !reopened || !IDEMPOTENT_TOOLS.has(tool)) throw e;
+        return await fn();
+      }
+    } finally {
+      this.inFlight--;
+      if (this.inFlight === 0 && this.pendingReopen) this.reopenDb(this.pendingReopen);
     }
   }
 
@@ -746,7 +946,10 @@ export class RAGKnowledgeGraphManager {
   // backfill) are covered as well. noteActivity() only shortens the wait after a tool call.
   startWalKeeper(tickMs = 1000) {
     if (this.walTimer) return;
-    this.walTimer = setInterval(() => { this.checkpointWal(); }, tickMs);
+    this.walTimer = setInterval(() => {
+      try { this.walTick(); } catch (e) { console.error(`⚠️ wal tick: ${(e as Error).message}`); }
+      this.checkpointWal();
+    }, tickMs);
     this.walTimer.unref();
   }
 
@@ -757,6 +960,7 @@ export class RAGKnowledgeGraphManager {
   }
 
   cleanup() {
+    this.shuttingDown = true;
     if (this.walTimer) { clearInterval(this.walTimer); this.walTimer = null; }
     if (this.walSoon) { clearTimeout(this.walSoon); this.walSoon = null; }
     if (this.encoding) {
@@ -4723,6 +4927,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
     const validatedArgs = validateToolArgs(name, args);
     ragKgManager.noteActivity(); // fold the WAL shortly after this call, whatever it wrote
     
+    // An SQLITE_IOERR* reopens the connection; idempotent tools are retried once (wal-sidecar-guard).
+    return await ragKgManager.runWithIoRecovery(name, async () => {
     switch (name) {
       // Original MCP tools
       case "createEntities":
@@ -4854,6 +5060,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: any) => {
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
+    });
   } catch (error) {
     // v3.6 (spec §5c): machine-distinguishable failures. Embedding-gate errors
     // become structured retryable/terminal payloads; every error response now
@@ -4918,6 +5125,7 @@ async function main() {
     const shutdown = () => {
       if (shuttingDown) return;
       shuttingDown = true;
+      ragKgManager.shuttingDown = true; // no reopen inside the exit window (wal-sidecar-guard)
       // Synchronously, before anything is awaited: a host may SIGKILL before the settle
       // sequence below completes (codex: ~185 ms after SIGTERM).
       ragKgManager.checkpointWal();
@@ -4935,6 +5143,7 @@ async function main() {
     // Ctrl+Break; registering them is harmless where they never fire.
     process.on('SIGHUP', shutdown);
     process.on('SIGBREAK', shutdown);
+    ragKgManager.onFatal = shutdown; // a database that cannot be reopened ends the server (wal-sidecar-guard)
     ragKgManager.startWalKeeper();
     process.on('exit', () => { try { ragKgManager.cleanup(); } catch { /* idempotent */ } });
     console.error('🛡️ shutdown handlers registered'); // deterministic handler-ready marker (5R test residual)
