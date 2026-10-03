@@ -82,14 +82,23 @@ function printBanner(opts: { model: string; revision: string; dtype: string; cac
 // operators (every term is double-quoted; special characters stripped exactly
 // as the pre-3.6 hybridSearch sanitizer did). Returns null when nothing
 // searchable remains (contract: caller returns empty results + warning).
-// search-fusion-rrf (query input): what the model sees for a text. bge-m3 needs NO query instruction
-// (model card: "the BGE-M3 model no longer requires adding instructions to the queries"); the old
-// `Represent this sentence for searching relevant passages: ` prefix was a bge-v1.5 carry-over and
-// was applied to queries only, while every stored vector was embedded without it. Measured on the
-// frozen hub snapshot (93 queries, full-corpus vector rank): 36 better, 6 worse, 51 unchanged.
-// `isQuery` stays in the signature and in the embedding cache key.
-export function embeddingInput(text: string, _isQuery: boolean): string {
-  return text;
+// search-fusion-rrf (query input): what the model sees for a text. For the DEFAULT model (bge-m3) queries are
+// embedded as raw text — the model card: "the BGE-M3 model no longer requires adding instructions to the
+// queries"; measured on the frozen hub snapshot (93 queries, full-corpus vector rank): 36 better, 6 worse, 51 same.
+// A CUSTOM model (EMBEDDING_MODEL set to something else) keeps the pre-change query instruction: the evidence
+// above is for bge-m3 only, and some models (e.g. bge v1.5) still recommend an instruction on queries.
+// Passages are always raw. `isQuery` stays in the signature and in the embedding cache key.
+export const LEGACY_QUERY_INSTRUCTION = 'Represent this sentence for searching relevant passages: ';
+export function embeddingInput(text: string, isQuery: boolean, defaultModel = true): string {
+  return isQuery && !defaultModel ? `${LEGACY_QUERY_INSTRUCTION}${text}` : text;
+}
+// The embed function handed to the gate. Exported so the input wiring is testable with a stub model.
+export function makeEmbedFn(model: (input: string, opts: any) => Promise<{ data: any }>, defaultModel: boolean) {
+  return async (text: string, dims: number, isQuery: boolean) => {
+    const input = embeddingInput(text, isQuery, defaultModel);
+    const r = await model(input, { pooling: 'cls', normalize: true });
+    return new Float32Array((r.data as Float32Array).slice(0, dims));
+  };
 }
 
 export function compileFtsLiteralQuery(q: string): string | null {
@@ -467,10 +476,12 @@ export class RAGKnowledgeGraphManager {
       .get(EMBEDDING_MODEL, MODEL_REVISION, MODEL_DTYPE, dims, 'cls', 1) as { id: number };
     this.db.prepare(`INSERT INTO server_meta(key,value) VALUES('current_profile_id',?)
       ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(String(row.id));
-    // query_prefix_version: 1 = bge-v1.5 instruction prepended to queries (<= 6.3.2), 2 = no instruction
-    // (search-fusion-rrf). Records which convention last served this DB; nothing reads it for logic.
-    this.db.prepare(`INSERT INTO server_meta(key,value) VALUES('query_prefix_version','2')
-      ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run();
+    // query_prefix_version: diagnostic marker of the query-input convention of the engine that last INITIALISED
+    // this DB — 1 = instruction prepended to queries (<= 6.3.2, and custom models now), 2 = raw queries (default
+    // bge-m3 since search-fusion-rrf). It is written at init, not per query: it does not prove what the last query
+    // used, which engines are attached, or vector compatibility. Nothing reads it for logic.
+    this.db.prepare(`INSERT INTO server_meta(key,value) VALUES('query_prefix_version',?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(IS_DEFAULT_MODEL_CONFIG ? '2' : '1');
     return row.id;
   }
 
@@ -507,11 +518,7 @@ export class RAGKnowledgeGraphManager {
       }
       if (role === 'owner') lock.markComplete();
       console.error(`✅ ${EMBEDDING_MODEL} model loaded (${MODEL_DTYPE})`);
-      return async (text: string, dims: number, isQuery: boolean) => {
-        const input = embeddingInput(text, isQuery);
-        const r = await model(input, { pooling: 'cls', normalize: true });
-        return new Float32Array((r.data as Float32Array).slice(0, dims));
-      };
+      return makeEmbedFn(model as any, IS_DEFAULT_MODEL_CONFIG);
     } catch (e) {
       // Cache policy by CAUSE and ROLE (beta 2R B3 -> 4R M1 -> 5R M1), unit-
       // tested in modelCache: config errors touch nothing; integrity errors

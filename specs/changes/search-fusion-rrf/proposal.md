@@ -92,8 +92,11 @@ seeing results; the answer set is the chunks containing the identifier.
 - **D7 Query input = raw text (commit 2).** The loader prepended the bge-v1.5 instruction
   `Represent this sentence for searching relevant passages: ` to every query embedding (hybridSearch, searchNodes, graph
   seeds) while stored vectors were embedded without it; the bge-m3 model card: "the BGE-M3 model no longer requires
-  adding instructions to the queries". `embeddingInput(text, isQuery)` now returns the raw text; `isQuery` still keys
-  the cache; `server_meta.query_prefix_version` 1 -> 2. Found by the paraphrase diagnosis (framework hub
+  adding instructions to the queries". **Scope (codex r5): default model only** — `embeddingInput(text, isQuery,
+  defaultModel)` returns the raw text for the default bge-m3; a custom `EMBEDDING_MODEL` keeps the legacy query
+  instruction (no evidence for other models; bge v1.5 still recommends one). The loader returns
+  `makeEmbedFn(model, IS_DEFAULT_MODEL_CONFIG)`. `server_meta.query_prefix_version` = init-time diagnostic marker
+  (2 default / 1 custom), not evidence of what a query used. Found by the paraphrase diagnosis (framework hub
   `r2/RESULT-para-1_.md`): full-corpus vector rank on 93 frozen hub queries 36 better / 6 worse / 51 same.
 
 ## Contract and evidence
@@ -109,7 +112,7 @@ seeing results; the answer set is the chunks containing the identifier.
 | C5 | engine top-10 ids and scores == independent RRF recomputation (independent pool rebuild and FTS compiler; engine scorer not imported); the verdict recomputes every row and is tied to a unique run id, corpus, dist hash, completion flag and row count; node exit must be 0 or the known teardown 134 (reported separately) | **final dist `67249835…`: hub 93/93 · uap 54/54 · hal 56/56 exact, verdict PASS ×3** (node exit 134 at teardown each time, after a complete result). Verdict self-test 10/10 (stale run, missing file, exit 1, wrong dist, wrong corpus, short rows, tampered score, incomplete, good exit 0 / 134). Evidence: hub `r2/c5/final-dist/` |
 | C6 | `npm test` exit 0, new test wired | exit 0 (re-run on the final tree before commit) |
 | C7 | **default search median < 1 s on the frozen hub copy** (original r1 criterion, kept) — reported with cache condition, p95, max, search mode | **met.** Clean run (load average 3-5), commit-1 build `67249835…`, all 93 hub queries, embedding cache cleared before every call, mode `hybrid`: median 231 ms, p95 748 ms, max 1,285 ms. Commit-2 build `23795706…`: median 214 / 230 / 211 ms (hub / uap / hal), max 342 / 1,060 / 517 ms. Earlier runs under heavy contention from a concurrent model job (load average 20-90) are not used |
-| C8 | D7 query input: raw text for queries and passages; marker 2; non-vacuous | `test/query-input.test.mjs` (fails 10/10 on the commit-1 build) |
+| C8 | D7 query input: default model raw for queries and passages; custom model keeps the legacy query instruction; the real loader is wired through `makeEmbedFn` (stub model records its input); init marker 2 | `test/query-input.test.mjs` 14/14 (fails on the commit-1 build: no exports, loader inlined the instruction) |
 | C9 | D7 effect, hybridSearch (C5 verdict PASS ×3 on the commit-2 build, ids and scores) | hub paraphrase hit@1/5/10/MRR 2/7/7/0.217 -> **3/8/9/0.275** · identifier 7/17/18/0.600 -> 8/18/18/0.633 · K dev hub 49/51/51/0.943 = · uap 49/53/53/0.938 -> 49/53/53/0.937 · hal 51/56/56/0.955 -> 52/56/56/0.964 |
 | C10 | D7 effect, searchNodes known-item (pre-declared: 40 entities per corpus, query = first 120 chars of an observation >= 80 chars; acceptable iff hit@1 and hit@10 drop <= 1) | hit@1 / hit@10: hub 35/39 -> 34/39 · uap 31/40 -> 30/40 · hal 36/38 -> 37/38 — within the rule; no entity paraphrase set exists, so improvement there is unmeasured |
 
