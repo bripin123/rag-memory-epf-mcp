@@ -12,6 +12,23 @@ const golden = JSON.parse(readFileSync(new URL('./fixtures/graph-context-golden.
   assert.equal(JSON.stringify(now), JSON.stringify(golden), 'hybridSearch(useGraph:true) must be byte-identical to pre-extraction golden');
   console.log('  OK: differential parity — 9 cases identical');
 }
+// (A2) search-fusion-rrf: the SAME fixture with summaries OFF against the golden recorded on 6.3.2
+//      (dd9493f, RAG_MEMORY_SEARCH_SUMMARIES=off). Every useGraph:true / degraded case must stay
+//      byte-identical; c2 (default call) is the intended change: same order, scores = 1/(60 + vector rank).
+{
+  const goldenOff = JSON.parse(readFileSync(new URL('./fixtures/graph-context-golden-summaries-off.json', import.meta.url), 'utf8'));
+  process.env.RAG_MEMORY_SEARCH_SUMMARIES = 'off';
+  const off = await runCases(m);
+  process.env.RAG_MEMORY_SEARCH_SUMMARIES = 'on';   // back to what the fixture pins for the rest of this file
+  for (const k of Object.keys(goldenOff)) {
+    if (k === 'c2_default_off') continue;
+    assert.equal(JSON.stringify(off[k]), JSON.stringify(goldenOff[k]), `summaries off: ${k} must equal the 6.3.2 summaries-off golden`);
+  }
+  const ids = (c) => c.results.map(r => r.chunk_id);
+  assert.deepEqual(ids(off.c2_default_off), ids(goldenOff.c2_default_off), 'c2 default call: same order as 6.3.2 (no FTS hit in this fixture)');
+  off.c2_default_off.results.forEach((r, i) => assert.ok(Math.abs(r.fin - 1 / (61 + i)) < 1e-12, `c2 default call: rank ${i + 1} scores 1/(60+${i + 1})`));
+  console.log('  OK: summaries off — 8 legacy cases identical to 6.3.2, default call = rank fusion');
+}
 // (B) seam contract on the normal path
 {
   const g = await m.explainGraphContext(QUERY);

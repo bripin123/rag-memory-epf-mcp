@@ -296,7 +296,7 @@ export const addObservationsTool: ToolDefinition = {
 // === HYBRID SEARCH TOOL ===
 
 const hybridSearchCapability: ToolCapabilityInfo = {
-  description: 'Perform advanced hybrid search combining vector similarity with knowledge graph traversal',
+  description: 'Perform hybrid search over vector and FTS5 candidates with default reciprocal rank fusion and an optional legacy graph re-ranker',
   parameters: {
     type: 'object',
     properties: {
@@ -320,7 +320,8 @@ const hybridSearchCapability: ToolCapabilityInfo = {
 };
 
 const hybridSearchDescription: ToolRegistrationDescription = () => `<description>
-Hybrid document search: vector similarity + FTS5 BM25 over document chunks, with an **opt-in** knowledge-graph re-ranker.
+Hybrid document search: vector similarity + FTS5 BM25 over document chunks, fused by rank (reciprocal rank fusion,
+k=60, so an exact identifier that only FTS5 finds can still enter the returned top results), with an **opt-in** knowledge-graph re-ranker.
 Default (useGraph false) is the harm-reduced default for finding a fact you know exists (known-item retrieval).
 useGraph: true is a legacy/experimental re-ranker kept for backward compatibility and controlled evaluation — it does not
 add candidates, it only re-orders the vector/FTS pool, and measured on three real corpora (2026-08-17) it pushed the exact
@@ -330,14 +331,14 @@ chunk out of the top-5 in ~40% of known-item queries. For relationship explorati
 <importantNotes>
 - (!important!) **Graph re-ranking is opt-in (default false since v5.3.0)** — it re-orders candidates by matched/connected entity links, which is measured to hurt known-item retrieval; enable it only for backward compatibility or controlled evaluation
 - (!important!) Graph re-ranking does not generate candidates — for "what is connected to X" use openNodes -> getNeighbors
-- (!important!) Results include similarity scores, graph boost, and hybrid rankings
+- (!important!) relevance_score is a RANK score on the default call: 1/(60 + vector rank) + 1/(60 + FTS rank), at most 2/61; it is not a similarity or probability and is only comparable within one call (vector_similarity and fts_boost are reported alongside)
 - (!important!) **Best results when knowledge graph is well-populated** with entities and relationships
 </importantNotes>
 
 <whenToUseThisTool>
 - When you need comprehensive search across documents and knowledge
 - For complex queries requiring conceptual understanding
-- When exploring relationships between concepts
+- Exact identifiers (file names, setting keys, function names, hashes) as well as natural-language questions
 - **Before making decisions** - to gather all relevant information
 - When researching topics that span multiple domains
 - For discovery of implicit connections and patterns
@@ -345,7 +346,8 @@ chunk out of the top-5 in ~40% of known-item queries. For relationship explorati
 
 <features>
 - Vector similarity search using sentence transformers
-- Knowledge graph traversal for conceptual enhancement
+- Rank fusion of vector and FTS5 candidates: an exact term found only by FTS5 can enter the returned top results even when vector candidates are present
+- Optional legacy graph re-ranker (re-orders only; no traversal — use openNodes -> getNeighbors)
 - Hybrid scoring combining multiple relevance signals
 - Entity association highlighting
 - Configurable result limits and graph usage
@@ -353,7 +355,7 @@ chunk out of the top-5 in ~40% of known-item queries. For relationship explorati
 </features>
 
 <bestPractices>
-- Use natural language queries rather than keywords
+- Natural-language questions and exact identifiers both work; pass the identifier itself when you know it
 - Keep graph re-ranking off for "find the fact I know exists"; for "what is connected to this" use openNodes -> getNeighbors, not useGraph
 - Start with broader queries, then narrow down based on results
 - Review entity associations to understand why results were selected
@@ -362,7 +364,7 @@ chunk out of the top-5 in ~40% of known-item queries. For relationship explorati
 </bestPractices>
 
 <parameters>
-- query: Natural language search query (string, required)
+- query: Search query — a natural-language question or an exact term/identifier (string, required)
 - limit: Maximum results to return, default 5 (number, optional)
 - useGraph: Enable knowledge graph re-ranking, default false / opt-in (boolean, optional)
 </parameters>

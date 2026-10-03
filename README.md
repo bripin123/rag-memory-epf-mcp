@@ -154,6 +154,26 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### v6.4.0 (2026-10-03)
+
+- (Release candidate `6.4.0-rc.1` on the `next` dist-tag; `latest` stays 6.3.2 until the published artifact passes a
+  canary against a real project database.)
+
+- **Changed** `hybridSearch` default ranking = reciprocal rank fusion of the vector and FTS5 candidate lists
+  (k=60). A chunk that only FTS5 finds — typically an exact identifier, filename or setting key — can now reach
+  the top; before, it scored at most 0.0164 and sat under every vector candidate in the measured corpora.
+  `relevance_score` on the default call is a rank score (at most 2/61, comparable only within one call). Measured on frozen snapshots: exact-identifier hit@10 7/20 → 18/20; worse on 0 of
+  203 queries across three corpora.
+- **Changed** the per-result summary path is opt-in (`RAG_MEMORY_SEARCH_SUMMARIES=on`). It embedded every
+  sentence fragment of every candidate (median 121 s per search) and its context boost pushed vector-0 chunks
+  to rank 1. `off` keeps working. Legacy paths (`summaries=on`, `useGraph: true`) keep the 6.3.2 formula.
+- **Changed** with the default model (bge-m3) queries are embedded as raw text: the bge-v1.5 instruction the loader
+  prepended to every query is gone (bge-m3 needs none; stored vectors never had it). A custom `EMBEDDING_MODEL` keeps
+  the previous query instruction. Paraphrase hit@10 7 → 9 of 20, identifier hit@1 7 → 8,
+  document known-item (`hybridSearch`) unchanged or +1; entity known-item (`searchNodes`) hit@10 unchanged,
+  hit@1 -1 / -1 / +1 (hub / uap / hal). No re-index.
+- Details and rollout: `docs/UPDATING.md`, `specs/changes/search-fusion-rrf/proposal.md`.
+
 ### v6.3.2 (2026-09-25)
 
 - **Changed — on macOS the engine takes `-wal` and `-shm` out of cloud sync.** It sets

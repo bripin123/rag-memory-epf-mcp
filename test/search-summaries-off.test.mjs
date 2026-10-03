@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // v5 진단 스위치: RAG_MEMORY_SEARCH_SUMMARIES=off 면 문장별 임베딩(검색당 100+ 추론)이
-// 꺼지고 preview 요약 + relevanceScore 0 으로 동작한다. 기본값(on)은 불변.
+// 꺼지고 preview 요약 + relevanceScore 0 으로 동작한다. search-fusion-rrf 부터 기본값도 off 이고
+// (요약 경로 = =on 일 때만), 'off' 는 하위 호환으로 계속 off 를 뜻한다 — 이 시험이 그것을 잠근다.
 import assert from 'node:assert/strict';
 process.env.RAG_MEMORY_SEARCH_SUMMARIES = 'off';   // makeManager 의 dynamic import 전에
 import { writeFileSync } from 'node:fs';
