@@ -154,7 +154,10 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
-### Unreleased — search-fusion-rrf
+### v6.4.0 (2026-10-03)
+
+- (Release candidate `6.4.0-rc.1` on the `next` dist-tag; `latest` stays 6.3.2 until the published artifact passes a
+  canary against a real project database.)
 
 - **Changed** `hybridSearch` default ranking = reciprocal rank fusion of the vector and FTS5 candidate lists
   (k=60). A chunk that only FTS5 finds — typically an exact identifier, filename or setting key — can now reach
@@ -167,7 +170,8 @@ storeDocument(id, content, metadata)
 - **Changed** with the default model (bge-m3) queries are embedded as raw text: the bge-v1.5 instruction the loader
   prepended to every query is gone (bge-m3 needs none; stored vectors never had it). A custom `EMBEDDING_MODEL` keeps
   the previous query instruction. Paraphrase hit@10 7 → 9 of 20, identifier hit@1 7 → 8,
-  known-item unchanged or +1. No re-index.
+  document known-item (`hybridSearch`) unchanged or +1; entity known-item (`searchNodes`) hit@10 unchanged,
+  hit@1 -1 / -1 / +1 (hub / uap / hal). No re-index.
 - Details and rollout: `docs/UPDATING.md`, `specs/changes/search-fusion-rrf/proposal.md`.
 
 ### v6.3.2 (2026-09-25)

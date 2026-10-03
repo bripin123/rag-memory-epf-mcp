@@ -108,7 +108,10 @@ path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
 is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
 the next start becomes a clean download owner.
 
-## Next release (version set at release time; schema v14, unchanged): `hybridSearch` default = rank fusion, summaries opt-in
+## v6.4.0 (schema v14, unchanged): `hybridSearch` default = rank fusion, summaries opt-in
+
+(Release candidate `6.4.0-rc.1` on the `next` dist-tag first; `latest` stays 6.3.2 until the published artifact
+passes a canary against a real project database.)
 
 **What changed.** (1) The per-result summary path runs only with `RAG_MEMORY_SEARCH_SUMMARIES=on` (it used to
 run unless the variable was `off`; `off` still means off). (2) With summaries off and `useGraph: false` — the
@@ -140,8 +143,9 @@ corpus) hit@10 unchanged, hit@1 -1 / -1 / +1. No re-index: only query vectors ch
 bound (a chunk in one list at rank r gets 1/(60+r)), comparable only within one call; do not threshold it against
 old values or across queries/modes. `vector_similarity` and `fts_boost` keep their meaning. `content_summary`
 / `key_highlight` are preview slices unless summaries are turned on. The fragment-summary work is gone from default
-searches: measured query-cached medians were 20 / 10 / 6 ms on the frozen hub / uap / hal runs; cold-query latency
-without CPU contention is still being measured — this is not a universal millisecond guarantee. With
+searches: measured query-cached medians were 20 / 10 / 6 ms on the frozen hub / uap / hal runs; with the query
+embedding cache cleared before every call (one Mac, final build) medians were about 220 / 228 /
+203 ms (max 888 ms). Other machines and corpora are unmeasured — this is not a universal millisecond guarantee. With
 `useGraph: true` and the variable unset, summaries are now off; set `RAG_MEMORY_SEARCH_SUMMARIES=on` to reproduce
 the previous summary-enabled graph path.
 

@@ -2,7 +2,8 @@
 
 > Status: **r4 — branch `feat/search-fusion-rrf`: commit 1 = rank fusion + summaries opt-in (codex reviews r2-r4 applied),
 > commit 2 = query input without the bge-v1.5 instruction (D7, from the paraphrase diagnosis).** C7 met (clean run).
-> Version and publish: owner.
+> Version and publish: owner — **6.4.0** (owner 2026-10-03), `6.4.0-rc.1` on `next` first; codex review r6 =
+> release-ready (hub `r2/RESULT-r6-2_.md`), its four wording fixes applied.
 > Evidence (framework hub): `raw/advisor/2026-10-03-ruflo-principles/` — `RESULT-s0.md`, `s0/` (scripts,
 > pre-declarations, raw outputs), `r2/RESULT-r2-2_.md` (codex review), `r2/` C5 outputs.
 
@@ -120,7 +121,9 @@ seeing results; the answer set is the chunks containing the identifier.
 
 - **searchNodes** has its own lexical-burial pattern (vector top-limit first; FTS merged only when coverage < 100
   and only while results < limit; date filter applied after the vector cut). Out of scope; recorded for a follow-up.
-- Paraphrase recall stays low (hit@10 7/20). Separate work (framework hub).
+- Paraphrase recall stays low: hit@10 9/20 on the final build (7/20 after commit 1, before D7). Separate work
+  (framework hub `r2/PLAN-paraphrase.md`).
 - `relevance_score` scale change: no framework-fleet code thresholds on it (33 registry folders scanned; the two
   hits are unrelated app fields). External npm users may; changelog says so.
-- Windows not run. Cold-query latency not cleanly measured yet.
+- Windows not run. Cold-query latency is measured on one Mac only (C7: final build `8a4e2123…`, query cache cleared
+  every call, medians 220 / 228 / 203 ms hub / uap / hal, max 888 ms); other machines unmeasured.
