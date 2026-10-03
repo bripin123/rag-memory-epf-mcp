@@ -1,7 +1,8 @@
 # search-fusion-rrf — summaries opt-in, rank fusion instead of an additive FTS crumb
 
-> Status: **r3 — implemented on branch `feat/search-fusion-rrf`; codex design review r2 and code review r3 applied**
-> (2026-10-03, framework hub session 134). C7 met under contention (upper bound). Version and publish: owner.
+> Status: **r4 — branch `feat/search-fusion-rrf`: commit 1 = rank fusion + summaries opt-in (codex reviews r2-r4 applied),
+> commit 2 = query input without the bge-v1.5 instruction (D7, from the paraphrase diagnosis).** C7 met (clean run).
+> Version and publish: owner.
 > Evidence (framework hub): `raw/advisor/2026-10-03-ruflo-principles/` — `RESULT-s0.md`, `s0/` (scripts,
 > pre-declarations, raw outputs), `r2/RESULT-r2-2_.md` (codex review), `r2/` C5 outputs.
 
@@ -88,6 +89,13 @@ seeing results; the answer set is the chunks containing the identifier.
 - **D6 Docs.** Tool description (RRF, identifiers welcome, no "graph traversal" wording, `relevance_score` meaning),
   `docs/UPDATING.md` (also fixes the old "off → relevance_score 0" wording), README changelog, CODE_CONTEXT.
 
+- **D7 Query input = raw text (commit 2).** The loader prepended the bge-v1.5 instruction
+  `Represent this sentence for searching relevant passages: ` to every query embedding (hybridSearch, searchNodes, graph
+  seeds) while stored vectors were embedded without it; the bge-m3 model card: "the BGE-M3 model no longer requires
+  adding instructions to the queries". `embeddingInput(text, isQuery)` now returns the raw text; `isQuery` still keys
+  the cache; `server_meta.query_prefix_version` 1 -> 2. Found by the paraphrase diagnosis (framework hub
+  `r2/RESULT-para-1_.md`): full-corpus vector rank on 93 frozen hub queries 36 better / 6 worse / 51 same.
+
 ## Contract and evidence
 
 | | Contract | Evidence (2026-10-03) |
@@ -100,7 +108,10 @@ seeing results; the answer set is the chunks containing the identifier.
 | C4 | legacy parity per D3 table | `test/graph-context-explain.test.mjs`: summaries **on** 9/9 cases byte-identical to the 6.3.x golden; summaries **off** 8/8 graph/degraded cases byte-identical to a golden recorded on 6.3.2 dd9493f with off (`fixtures/graph-context-golden-summaries-off.json`); default case c2 same order, scores 1/(60+r) |
 | C5 | engine top-10 ids and scores == independent RRF recomputation (independent pool rebuild and FTS compiler; engine scorer not imported); the verdict recomputes every row and is tied to a unique run id, corpus, dist hash, completion flag and row count; node exit must be 0 or the known teardown 134 (reported separately) | **final dist `67249835…`: hub 93/93 · uap 54/54 · hal 56/56 exact, verdict PASS ×3** (node exit 134 at teardown each time, after a complete result). Verdict self-test 10/10 (stale run, missing file, exit 1, wrong dist, wrong corpus, short rows, tampered score, incomplete, good exit 0 / 134). Evidence: hub `r2/c5/final-dist/` |
 | C6 | `npm test` exit 0, new test wired | exit 0 (re-run on the final tree before commit) |
-| C7 | **default search median < 1 s on the frozen hub copy** (original r1 criterion, kept) — reported with cache condition, p95, max, search mode | **met, with a caveat.** Final dist `67249835…`, cold query (embedding cache cleared before every call), all 93 hub queries, mode `hybrid`: median 585 ms, p95 1,206 ms, max 1,480 ms (uap 54: 407 / 999 / 2,195 ms; hal 56: 219 / 320 / 364 ms). Caveat: measured while another tab ran a CPU-heavy model job, so these are upper bounds; an uncontended run was not taken. Query-cached medians 20 / 10 / 6 ms. Earlier runs under heavier contention (load average 20-90) gave 1.1-1.5 s medians and are not used |
+| C7 | **default search median < 1 s on the frozen hub copy** (original r1 criterion, kept) — reported with cache condition, p95, max, search mode | **met.** Clean run (load average 3-5), commit-1 build `67249835…`, all 93 hub queries, embedding cache cleared before every call, mode `hybrid`: median 231 ms, p95 748 ms, max 1,285 ms. Commit-2 build `23795706…`: median 214 / 230 / 211 ms (hub / uap / hal), max 342 / 1,060 / 517 ms. Earlier runs under heavy contention from a concurrent model job (load average 20-90) are not used |
+| C8 | D7 query input: raw text for queries and passages; marker 2; non-vacuous | `test/query-input.test.mjs` (fails 10/10 on the commit-1 build) |
+| C9 | D7 effect, hybridSearch (C5 verdict PASS ×3 on the commit-2 build, ids and scores) | hub paraphrase hit@1/5/10/MRR 2/7/7/0.217 -> **3/8/9/0.275** · identifier 7/17/18/0.600 -> 8/18/18/0.633 · K dev hub 49/51/51/0.943 = · uap 49/53/53/0.938 -> 49/53/53/0.937 · hal 51/56/56/0.955 -> 52/56/56/0.964 |
+| C10 | D7 effect, searchNodes known-item (pre-declared: 40 entities per corpus, query = first 120 chars of an observation >= 80 chars; acceptable iff hit@1 and hit@10 drop <= 1) | hit@1 / hit@10: hub 35/39 -> 34/39 · uap 31/40 -> 30/40 · hal 36/38 -> 37/38 — within the rule; no entity paraphrase set exists, so improvement there is unmeasured |
 
 ## Known limits / follow-ups
 

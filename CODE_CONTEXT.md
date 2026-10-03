@@ -206,6 +206,11 @@ targets FTS ranked first for 17/20 queries surfaced 7/20). The legacy formula st
 bonuses (+0.1 per entity mention, +0.05 for digits, +0.03 for "important"-class words), so it can
 displace `vectorSimilarity` inside that `max` — measured vector-0 chunks at 1.2-1.7 taking rank 1.
 
+**Query input.** `embeddingInput(text, isQuery)` returns the raw text for both; bge-m3 needs no query instruction.
+Up to 6.3.2 queries (not passages) got the bge-v1.5 `Represent this sentence for searching relevant passages: `
+prefix, a carry-over from the pre-bge-m3 models; removing it moved 36 of 93 frozen hub queries up and 6 down
+(full-corpus vector rank). `isQuery` still keys the embedding cache.
+
 **graphology analytics read `relationships` only.** `_buildGraphologyGraph` (index.ts:4104) loads
 entity nodes and `relationships` edges; `chunk_entities` is not in that graph. `getGraphMetrics`
 (pagerank/degree/betweenness/closeness), `detectCommunities` (Louvain) and `analyzeGraphStructure`

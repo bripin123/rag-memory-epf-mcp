@@ -82,6 +82,16 @@ function printBanner(opts: { model: string; revision: string; dtype: string; cac
 // operators (every term is double-quoted; special characters stripped exactly
 // as the pre-3.6 hybridSearch sanitizer did). Returns null when nothing
 // searchable remains (contract: caller returns empty results + warning).
+// search-fusion-rrf (query input): what the model sees for a text. bge-m3 needs NO query instruction
+// (model card: "the BGE-M3 model no longer requires adding instructions to the queries"); the old
+// `Represent this sentence for searching relevant passages: ` prefix was a bge-v1.5 carry-over and
+// was applied to queries only, while every stored vector was embedded without it. Measured on the
+// frozen hub snapshot (93 queries, full-corpus vector rank): 36 better, 6 worse, 51 unchanged.
+// `isQuery` stays in the signature and in the embedding cache key.
+export function embeddingInput(text: string, _isQuery: boolean): string {
+  return text;
+}
+
 export function compileFtsLiteralQuery(q: string): string | null {
   const sanitized = q.replace(/["\*\(\)\-]/g, ' ').trim();
   if (!sanitized) return null;
@@ -457,8 +467,10 @@ export class RAGKnowledgeGraphManager {
       .get(EMBEDDING_MODEL, MODEL_REVISION, MODEL_DTYPE, dims, 'cls', 1) as { id: number };
     this.db.prepare(`INSERT INTO server_meta(key,value) VALUES('current_profile_id',?)
       ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(String(row.id));
-    this.db.prepare(`INSERT INTO server_meta(key,value) VALUES('query_prefix_version','1')
-      ON CONFLICT(key) DO NOTHING`).run();
+    // query_prefix_version: 1 = bge-v1.5 instruction prepended to queries (<= 6.3.2), 2 = no instruction
+    // (search-fusion-rrf). Records which convention last served this DB; nothing reads it for logic.
+    this.db.prepare(`INSERT INTO server_meta(key,value) VALUES('query_prefix_version','2')
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run();
     return row.id;
   }
 
@@ -496,7 +508,7 @@ export class RAGKnowledgeGraphManager {
       if (role === 'owner') lock.markComplete();
       console.error(`✅ ${EMBEDDING_MODEL} model loaded (${MODEL_DTYPE})`);
       return async (text: string, dims: number, isQuery: boolean) => {
-        const input = isQuery ? `Represent this sentence for searching relevant passages: ${text}` : text;
+        const input = embeddingInput(text, isQuery);
         const r = await model(input, { pooling: 'cls', normalize: true });
         return new Float32Array((r.data as Float32Array).slice(0, dims));
       };

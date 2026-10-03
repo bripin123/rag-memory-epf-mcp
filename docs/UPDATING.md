@@ -126,6 +126,14 @@ found only by FTS scored at most 0.0164 against ~0.4-0.6 for every vector candid
 queries surfaced their target in the top 10 for 7/20 queries although FTS ranked it first for 17/20. Rank fusion:
 18/20, and worse than the old formula on 0 of 203 queries across three corpora.
 
+**Query input (same release).** Queries are embedded as raw text. Up to 6.3.2 the loader prepended the bge-v1.5
+instruction `Represent this sentence for searching relevant passages: ` to every query (hybridSearch, searchNodes,
+graph seeds) while stored vectors were embedded without it; the bge-m3 model card says the model needs no query
+instruction. Measured on the frozen snapshots: hybridSearch paraphrase hit@10 7 -> 9 / 20 and MRR 0.217 -> 0.275,
+identifier hit@1 7 -> 8, known-item unchanged on hub / uap and hit@1 +1 on hal; searchNodes known-item (40 entities per
+corpus) hit@10 unchanged, hit@1 -1 / -1 / +1. No re-index: only query vectors change. `server_meta.query_prefix_version`
+is now 2.
+
 **What a caller notices.** On the default call `relevance_score` is a rank score — at most 2/61 ≈ 0.0328, no lower
 bound (a chunk in one list at rank r gets 1/(60+r)), comparable only within one call; do not threshold it against
 old values or across queries/modes. `vector_similarity` and `fts_boost` keep their meaning. `content_summary`

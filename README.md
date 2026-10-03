@@ -164,6 +164,9 @@ storeDocument(id, content, metadata)
 - **Changed** the per-result summary path is opt-in (`RAG_MEMORY_SEARCH_SUMMARIES=on`). It embedded every
   sentence fragment of every candidate (median 121 s per search) and its context boost pushed vector-0 chunks
   to rank 1. `off` keeps working. Legacy paths (`summaries=on`, `useGraph: true`) keep the 6.3.2 formula.
+- **Changed** queries are embedded as raw text: the bge-v1.5 instruction the loader prepended to every query is gone
+  (bge-m3 needs none; stored vectors never had it). Paraphrase hit@10 7 → 9 of 20, identifier hit@1 7 → 8,
+  known-item unchanged or +1. No re-index.
 - Details and rollout: `docs/UPDATING.md`, `specs/changes/search-fusion-rrf/proposal.md`.
 
 ### v6.3.2 (2026-09-25)
