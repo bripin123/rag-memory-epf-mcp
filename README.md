@@ -156,8 +156,10 @@ storeDocument(id, content, metadata)
 
 ### v6.4.0 (2026-10-03)
 
-- (Release candidate `6.4.0-rc.1` on the `next` dist-tag; `latest` stays 6.3.2 until the published artifact passes a
-  canary against a real project database.)
+- (Published first as `6.4.0-rc.1` on the `next` dist-tag; promoted to `latest` after a canary of the published
+  artifact against a backup copy of a real project database: version and model as expected, `hybrid` mode on all
+  probes, the identifier probe's answer at rank 4 and the known-item probe's at rank 1, every score <= 2/61,
+  query-cold median 445 ms, `query_prefix_version` 2, entity/relation/document/chunk counts unchanged, no errors.)
 
 - **Changed** `hybridSearch` default ranking = reciprocal rank fusion of the vector and FTS5 candidate lists
   (k=60). A chunk that only FTS5 finds — typically an exact identifier, filename or setting key — can now reach
