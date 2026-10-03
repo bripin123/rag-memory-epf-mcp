@@ -4010,6 +4010,9 @@ export class RAGKnowledgeGraphManager {
   }> {
     if (!this.db) throw new Error('Database not initialized');
     if (!this.encoding) throw new Error('Tokenizer not initialized');
+    // search-fusion-rrf: summary mode is read ONCE, at call entry (before any await), and used for the
+    // whole call. Opt-in since this change (was opt-out via =off in v5..6.3.2).
+    const summariesOn = process.env.RAG_MEMORY_SEARCH_SUMMARIES === 'on';
     
     console.error(`🔍 Enhanced hybrid search: "${query}"`);
     // Parity with searchNodes (beta 1R supplement): an unsearchable query gets
@@ -4092,6 +4095,11 @@ export class RAGKnowledgeGraphManager {
         }
       } catch (embErr) {
         vectorDegraded = true;
+        // search-fusion-rrf (D5): a failure on a LATER cross-lingual variant used to leave the earlier
+        // variants' vector candidates in resultMap while the envelope said 'fts-only'. Drop them so the
+        // degraded call really is FTS-only (no vector rank, no summary, no graph) in every mode.
+        resultMap.clear();
+        primaryQueryEmbedding = null;
         // 'inference_error' (not 'model_not_ready'): model_state may still read
         // 'ready' here — a contradictory reason pair confused callers (beta B6).
         degradationReason = this.degradationReason() ?? 'inference_error';
@@ -4099,6 +4107,12 @@ export class RAGKnowledgeGraphManager {
       }
     }
     const vectorResults = Array.from(resultMap.values()).sort((a, b) => a.distance - b.distance);
+    // search-fusion-rrf: vector rank (1-based, best distance across variants) for rank fusion.
+    // Taken here, before FTS5-only candidates are appended to vectorResults below.
+    const vectorRankOf = new Map<string, number>(vectorResults.map((r, i) => [r.chunk_id, i + 1]));
+    // Default ranking = reciprocal rank fusion of the vector list and the FTS5 list (k=60).
+    // The legacy formula stays for the opt-in diagnostics (summaries on, graph re-ranker on).
+    const rankFusion = !useGraph && !summariesOn;
 
     // FTS5 full-text search as additional signal (Reciprocal Rank Fusion)
     const ftsBoostMap = new Map<string, number>();
@@ -4297,12 +4311,12 @@ export class RAGKnowledgeGraphManager {
       }
       
       // Generate semantic summary (skip when degraded — no embeddings available).
-      // RAG_MEMORY_SEARCH_SUMMARIES=off: diagnostic escape hatch (v5) — the summary
-      // path embeds EVERY sentence of EVERY candidate (~100+ inferences per search,
-      // measured 90-120s cold). Off = preview slices + relevanceScore 0; ranking
-      // then rests on vectorSimilarity + boosts. Default unchanged.
+      // search-fusion-rrf: the summary path is OPT-IN (RAG_MEMORY_SEARCH_SUMMARIES=on). It embeds
+      // every sentence fragment of every candidate one at a time (~400 inferences per search on a
+      // real corpus, median 121 s measured 2026-10-03) and its unbounded context boost let
+      // vector-0 chunks take rank 1 (known-item hit@1 9/10 off vs 4/10 on). Default = preview slices.
       let summary: string, keyHighlight: string, relevanceScore: number;
-      if (vectorDegraded || !primaryQueryEmbedding || process.env.RAG_MEMORY_SEARCH_SUMMARIES === 'off') {
+      if (vectorDegraded || !primaryQueryEmbedding || !summariesOn) {
         keyHighlight = result.text.slice(0, 150);
         summary = result.text.slice(0, 300);
         relevanceScore = 0;
@@ -4316,8 +4330,11 @@ export class RAGKnowledgeGraphManager {
       }
       
       const vectorSimilarity = Math.max(0, 1 - result.distance / 2);
-      const ftsBoost = ftsBoostMap.get(result.chunk_id) || 0;
-      const finalScore = Math.max(vectorSimilarity, relevanceScore) + graphBoost + ftsBoost;
+      const ftsBoost = ftsBoostMap.get(result.chunk_id) || 0;   // = 1/(60 + FTS rank), 0 if not an FTS hit
+      const vectorRank = vectorRankOf.get(result.chunk_id);
+      const finalScore = rankFusion
+        ? (vectorRank !== undefined ? 1 / (60 + vectorRank) : 0) + ftsBoost
+        : Math.max(vectorSimilarity, relevanceScore) + graphBoost + ftsBoost;
       
       // Determine document title and source ID
       let documentTitle: string;

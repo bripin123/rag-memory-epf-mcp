@@ -4,6 +4,12 @@
 import { writeFileSync } from 'node:fs';
 import { makeManager, installControlledEmbedder, axisVec } from '../../helpers/engine-test-db.mjs';
 
+// search-fusion-rrf: this fixture pins the LEGACY path byte-for-byte against the golden recorded on
+// 6.3.x, when the summary path was on by default. With summaries on, hybridSearch keeps the 6.3.2
+// formula for every case here (c2 included), so the golden stays valid. The new default path
+// (summaries off + rank fusion) is covered by test/search-fusion-rrf.test.mjs.
+process.env.RAG_MEMORY_SEARCH_SUMMARIES = 'on';
+
 export const QUERY = 'graph context probe query';
 // Case c3 ("후보 0" in the delta spec): the graph must find no seed at all. Its vector is the unit
 // vector on axis 2, and every entity vector lives in the span of axes 0 and 1, so the cosine is 0

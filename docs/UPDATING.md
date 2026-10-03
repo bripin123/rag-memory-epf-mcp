@@ -108,6 +108,38 @@ path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
 is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
 the next start becomes a clean download owner.
 
+## Next release (version set at release time; schema v14, unchanged): `hybridSearch` default = rank fusion, summaries opt-in
+
+**What changed.** (1) The per-result summary path runs only with `RAG_MEMORY_SEARCH_SUMMARIES=on` (it used to
+run unless the variable was `off`; `off` still means off). (2) With summaries off and `useGraph: false` — the
+default call — results are ranked by reciprocal rank fusion of the vector list and the FTS5 list:
+`relevance_score = 1/(60 + vector rank) + 1/(60 + FTS rank)`, a list a chunk is absent from contributes 0.
+Healthy-path candidate gathering and depth are unchanged. If vector search fails after an earlier query variant
+succeeded, the call now discards those partial vector candidates and returns a true FTS-only result (the previous
+version could keep them while reporting `fts-only`). `summaries=on` or `useGraph: true` keep the 6.3.2 formula
+(`max(vector_similarity, summary relevance) + graph boost + FTS term`) unchanged.
+
+**Why.** Measured 2026-10-03 on the frozen eval snapshots (spec `specs/changes/search-fusion-rrf/proposal.md`):
+the summary path embedded ~400 sentence fragments per search (median 121 s) and its unbounded context boost let
+vector-0 chunks take rank 1 (known-item hit@1 9/10 with summaries off vs 4/10 on). With summaries off, a chunk
+found only by FTS scored at most 0.0164 against ~0.4-0.6 for every vector candidate, so exact-identifier
+queries surfaced their target in the top 10 for 7/20 queries although FTS ranked it first for 17/20. Rank fusion:
+18/20, and worse than the old formula on 0 of 203 queries across three corpora.
+
+**What a caller notices.** On the default call `relevance_score` is a rank score — at most 2/61 ≈ 0.0328, no lower
+bound (a chunk in one list at rank r gets 1/(60+r)), comparable only within one call; do not threshold it against
+old values or across queries/modes. `vector_similarity` and `fts_boost` keep their meaning. `content_summary`
+/ `key_highlight` are preview slices unless summaries are turned on. The fragment-summary work is gone from default
+searches: measured query-cached medians were 20 / 10 / 6 ms on the frozen hub / uap / hal runs; cold-query latency
+without CPU contention is still being measured — this is not a universal millisecond guarantee. With
+`useGraph: true` and the variable unset, summaries are now off; set `RAG_MEMORY_SEARCH_SUMMARIES=on` to reproduce
+the previous summary-enabled graph path.
+
+**Fleet rollout.** No migration. Recommended like v5.3.0: publish an rc on the `next` dist-tag first, run it
+against a real project database (identifier query + known-item probe), then promote to `latest`.
+Regression locks: `test/search-fusion-rrf.test.mjs`, `test/search-summaries-off.test.mjs`, and
+`test/graph-context-explain.test.mjs` (legacy path byte-identical with summaries on).
+
 ## v5.3.0 (schema v14, unchanged): `hybridSearch` graph re-ranking is opt-in
 
 **What changed.** `useGraph` defaults to `false` (was `true`) — in the manager signature, the tool JSON
@@ -207,8 +239,10 @@ the real v14 (this is exactly how code-v8 never ran in production).
 **Diagnostic env (v5)**: `RAG_MEMORY_SEARCH_SUMMARIES=off` disables the per-result
 sentence-similarity summaries in `hybridSearch` (which embed every sentence of every
 candidate — 100+ inferences, 90-120s cold per search, measured). Off = preview-slice
-summaries, `relevance_score` 0, ranking rests on vector similarity + boosts. Default
-unchanged. The 3-arm release harness sets this uniformly across all arms.
+summaries, the internal summary relevance is 0 (the response's `relevance_score` is still the final score) and
+ranking rests on vector similarity + boosts. **Superseded by the next
+release: summaries are off by default and opt-in with `=on`** (see the section above). The 3-arm release
+harness sets this uniformly across all arms.
 
 ## v3.6 breaking response changes
 

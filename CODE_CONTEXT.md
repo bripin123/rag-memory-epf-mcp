@@ -182,8 +182,9 @@ Engine"). Regression: `test/alias-link-gate.test.mjs`.
 method"* — there is no such method.
 
 **Search does not use the graph to generate candidates.** `hybridSearch` (index.ts:3548) builds the
-pool from vector search over `chunks` plus FTS5, fuses with RRF (k=60), then applies `graphBoost` as
-a re-ranker over that pool. `useGraph` is opt-in, default **false** since v5.3.0; four places must
+pool from vector search over `chunks` plus FTS5, ranks the default call by RRF (k=60; before
+search-fusion-rrf only the FTS term was RRF-shaped and was added to a cosine), and with `useGraph: true`
+applies `graphBoost` as a re-ranker over that pool (legacy formula). `useGraph` is opt-in, default **false** since v5.3.0; four places must
 agree (method signature, dispatch `=== true`, tool JSON, zod default). Relationship traversal is
 `openNodes` -> `getNeighbors`, never `useGraph`.
 
@@ -193,10 +194,17 @@ query 0.15**, plus 0.15 when connected to a vector-matched entity; geometric dec
 0.4. Given the alias-heavy link table above, a chunk can be boosted purely for mentioning a common
 filename.
 
-Final score is `max(vectorSimilarity, relevanceScore) + graphBoost + ftsBoost`. `relevanceScore`
-comes from `generateContentSummary`, whose `enhanceSimilarityWithContext` adds query-independent
+**Final score (search-fusion-rrf).** Default call (`useGraph` false, summaries off):
+`1/(60 + vectorRank) + 1/(60 + ftsRank)` — `vectorRank` is the position in the merged vector list
+(best distance across cross-lingual variants), `ftsRank` the first-seen FTS5 rank (`ftsBoost` already
+holds that term); a list the chunk is absent from adds 0. Before this, the default was
+`max(vectorSimilarity, relevanceScore) + graphBoost + ftsBoost`, so an FTS-only chunk scored at most
+0.0164 against ~0.4-0.6 for every vector candidate and never reached the top (measured: identifier
+targets FTS ranked first for 17/20 queries surfaced 7/20). The legacy formula still runs when
+`RAG_MEMORY_SEARCH_SUMMARIES=on` or `useGraph: true`. `relevanceScore` comes from
+`generateContentSummary` (opt-in), whose `enhanceSimilarityWithContext` adds unbounded query-independent
 bonuses (+0.1 per entity mention, +0.05 for digits, +0.03 for "important"-class words), so it can
-displace `vectorSimilarity` inside that `max`.
+displace `vectorSimilarity` inside that `max` — measured vector-0 chunks at 1.2-1.7 taking rank 1.
 
 **graphology analytics read `relationships` only.** `_buildGraphologyGraph` (index.ts:4104) loads
 entity nodes and `relationships` edges; `chunk_entities` is not in that graph. `getGraphMetrics`
