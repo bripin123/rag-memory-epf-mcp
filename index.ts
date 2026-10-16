@@ -35,7 +35,8 @@ import { addRevision, correctRevision, transitionStatus, linkSources,
          nextProjectionOrder, type SourceInput } from './src/observations/lifecycle.js';
 import { getObservationHistory } from './src/observations/history.js';
 import { kgComparisonValue, captureKgEmbedInput, parseEvidenceMetadata, fingerprintFromMetadata, sha256Utf8,
-         type KgChunkRow, type KgEmbedCapture } from './src/kg/relation-evidence.js';
+         EVIDENCE_FORMAT, resolveEvidenceItem, EvidenceInputError, EvidenceCommitConflictError,
+         type KgChunkRow, type KgEmbedCapture, type EvidenceItemInput, type PreparedEvidenceChunk } from './src/kg/relation-evidence.js';
 
 // Import chunk text algorithm (extracted for publish-time invariant testing)
 import { chunkStructured as chunkStructuredText, effectiveSignature, isCurrentFormatSignature, LEGACY_SIGNATURE, DEFAULT_MAX_TOKENS } from './src/chunkerC.js';
@@ -2425,6 +2426,66 @@ export class RAGKnowledgeGraphManager {
       ...(discarded > 0 && { discardedChunks: discarded }),
       ...(errors.length > 0 && { errors: errors.slice(0, 5) }),
     };
+  }
+
+  // D1 (kg-relation-evidence): opt-in evidence-backed relationship chunks. Manager method only — not an
+  // MCP tool (Q3). `items` is the COMPLETE set S of relationships that get a relationship chunk: a
+  // successful call atomically replaces ALL relationship KG chunks (triplet or evidence) with the
+  // evidence-v1 chunks of S; entity KG chunks, documents and relationship rows are untouched; [] is
+  // valid and empties relationship KG chunks. Any invalid item rejects the whole call before any
+  // write. Bodies are prepared first; inside the commit transaction every item is re-resolved from
+  // the CURRENT rows (active status and chunk type/parent first, then the fingerprint) and must match
+  // what was prepared; the re-resolved rows are what gets inserted. Vectors come later from
+  // embedKnowledgeGraphChunks or the backfill.
+  async generateRelationEvidenceChunks(items: EvidenceItemInput[], options: { formatVersion: typeof EVIDENCE_FORMAT }):
+      Promise<{ relationshipChunks: number; removedRelationshipChunks: number; formatVersion: typeof EVIDENCE_FORMAT }> {
+    if (!this.db) throw new Error('Database not initialized');
+    if (options?.formatVersion !== EVIDENCE_FORMAT) {
+      throw new Error(`generateRelationEvidenceChunks: formatVersion must be '${EVIDENCE_FORMAT}'`);
+    }
+    if (!Array.isArray(items)) throw new Error('generateRelationEvidenceChunks: items must be an array');
+    const seen = new Set<string>();
+    items.forEach((it, i) => {
+      const id = (it as { relationship_id?: unknown } | null)?.relationship_id;
+      if (typeof id !== 'string') return;
+      if (seen.has(id)) throw new EvidenceInputError('duplicate-relationship', i, id);
+      seen.add(id);
+    });
+    const profileAtPrepare = this.currentProfileId;
+    const prepared: PreparedEvidenceChunk[] = items.map((it, i) => resolveEvidenceItem(this.db!, it, i, profileAtPrepare));
+
+    __kgFaultHook?.('evidence-pre-commit');
+
+    let removed = 0;
+    this.db.transaction(() => {
+      const db = this.db!;
+      // R1 (REVIEW-PLAN): what is published is the metadata re-resolved HERE, from the current rows —
+      // not the prepared copy. A display-only change between preparation and commit (confidence is not a
+      // fingerprint input) therefore succeeds with the current value instead of re-publishing the old one;
+      // any fingerprint input change still fails the whole call.
+      const current: PreparedEvidenceChunk[] = [];
+      for (let i = 0; i < items.length; i++) {
+        let now: PreparedEvidenceChunk;
+        try { now = resolveEvidenceItem(db, items[i], i, this.currentProfileId); }
+        catch (e) { throw new EvidenceCommitConflictError(i, e instanceof EvidenceInputError ? e.code : String(e)); }
+        if (now.metadata.input_fingerprint !== prepared[i].metadata.input_fingerprint) {
+          throw new EvidenceCommitConflictError(i, 'fingerprint-changed');
+        }
+        current.push(now);   // same fingerprint => same body (every body input is a fingerprint input)
+      }
+      const old = db.prepare(`SELECT rowid FROM chunk_metadata WHERE chunk_type = 'relationship'`).all() as Array<{ rowid: number }>;
+      removed = deleteKgChunkRows(db, old.map(r => r.rowid));
+      const ins = db.prepare(`
+        INSERT INTO chunk_metadata (chunk_id, chunk_type, relationship_id, chunk_index, text, start_pos, end_pos, metadata)
+        VALUES (?, 'relationship', ?, 0, ?, 0, ?, ?)`);
+      current.forEach((p, i) => {
+        ins.run(p.chunk_id, p.relationship_id, p.text, p.body_codepoints, JSON.stringify(p.metadata));
+        if (i === 0) __kgFaultHook?.('evidence-mid-commit');
+      });
+    })();
+    this.coordinator?.invalidateCoverage();
+    console.error(`✅ Evidence relationship chunks: ${prepared.length} written, ${removed} relationship chunks replaced`);
+    return { relationshipChunks: prepared.length, removedRelationshipChunks: removed, formatVersion: EVIDENCE_FORMAT };
   }
 
   // NEW: Generate textual representation for entity chunks

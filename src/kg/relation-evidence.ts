@@ -175,4 +175,132 @@ export function captureKgEmbedInput(row: KgChunkRow, profileId: number): KgEmbed
 }
 
 // (resolvers are added by Tasks 5, 6 and 7 below this line)
-export type { Database };
+
+// ---- D1 resolution (generation AND commit re-check run exactly this) ----
+
+export class EvidenceInputError extends Error {
+  constructor(readonly code: string, readonly itemIndex: number, detail: string) {
+    super(`generateRelationEvidenceChunks: item ${itemIndex}: ${code}${detail ? ` (${detail})` : ''}`);
+    this.name = 'EvidenceInputError';
+  }
+}
+export class EvidenceCommitConflictError extends Error {
+  constructor(readonly itemIndex: number, readonly reason: string) {
+    super(`generateRelationEvidenceChunks: item ${itemIndex} changed between preparation and commit: ${reason}`);
+    this.name = 'EvidenceCommitConflictError';
+  }
+}
+
+const WHY_STATUSES: readonly WhyStatus[] = ['reason-stated', 'relation-only', 'unjudged'];
+
+// Every stored source of an observation, sorted (D1: the real rows, never a summary label).
+export function readSourceTuples(db: Database.Database, observationId: string): SourceTuple[] {
+  const rows = db.prepare(`SELECT source_kind, source_ref, source_hash FROM observation_sources WHERE observation_id = ?`)
+    .all(observationId) as Array<{ source_kind: string; source_ref: string; source_hash: string | null }>;
+  return rows.map(r => ({ source_kind: r.source_kind, source_ref: r.source_ref, source_hash: r.source_hash ?? null }))
+    .sort(compareSourceTuples);
+}
+function sourceSummary(sources: SourceTuple[]): ObservationRefMeta['source_summary'] {
+  if (sources.length === 0) return 'unrecorded';
+  return sources.every(s => s.source_kind === 'import') ? 'import-only' : 'recorded';
+}
+
+// Validate one item against the CURRENT rows and build its body + metadata. Any failure throws
+// EvidenceInputError; nothing is written here. Order matters for the commit re-check
+// (REVIEW-ALPHA3 §3.1): an observation's ACTIVE status and a document chunk's type/parent are checked
+// before any hash or fingerprint, because a retract keeps id, revision and content and changes only
+// the status (lifecycle.ts:146-147) — the fingerprint alone cannot see it.
+export function resolveEvidenceItem(db: Database.Database, item: EvidenceItemInput, itemIndex: number, profileId: number): PreparedEvidenceChunk {
+  const fail: (code: string, detail?: string) => never = (code, detail = '') => { throw new EvidenceInputError(code, itemIndex, detail); };
+  if (!item || typeof item !== 'object') fail('invalid-item');
+  if (typeof item.relationship_id !== 'string' || item.relationship_id === '') fail('invalid-item', 'relationship_id');
+  if (!Array.isArray(item.evidence) || item.evidence.length === 0) fail('empty-evidence');
+  if (item.evidence.length > EVIDENCE_CAPS.maxEntries) fail('too-many-entries', `${item.evidence.length} > ${EVIDENCE_CAPS.maxEntries}`);
+  const rel = db.prepare(`
+    SELECT r.id, r.source_entity, r.target_entity, r.relationType, r.confidence,
+           e1.name AS source_name, e2.name AS target_name
+    FROM relationships r
+    JOIN entities e1 ON e1.id = r.source_entity
+    JOIN entities e2 ON e2.id = r.target_entity
+    WHERE r.id = ?`).get(item.relationship_id) as {
+      id: string; source_entity: string; target_entity: string; relationType: string; confidence: number;
+      source_name: string; target_name: string } | undefined;
+  if (!rel) return fail('unknown-relationship', item.relationship_id);
+
+  const refs: EvidenceRefMeta[] = [];
+  const quotes: string[] = [];
+  item.evidence.forEach((e, j) => {
+    if (!e || typeof e !== 'object') return fail('unknown-evidence-kind', `entry ${j}`);
+    if (e.kind === 'document') {
+      if (typeof e.chunk_id !== 'string') return fail('unknown-chunk', `entry ${j}`);
+      const c = db.prepare(`
+        SELECT m.chunk_id, m.chunk_type, m.document_id, m.text, d.id AS doc_id
+        FROM chunk_metadata m LEFT JOIN documents d ON d.id = m.document_id
+        WHERE m.chunk_id = ?`).get(e.chunk_id) as {
+          chunk_id: string; chunk_type: string | null; document_id: string | null; text: string | null; doc_id: string | null } | undefined;
+      if (!c) return fail('unknown-chunk', `entry ${j}: ${e.chunk_id}`);
+      if (c.chunk_type !== 'document' || c.document_id === null || c.doc_id === null || c.text === null) {
+        return fail('not-a-document-chunk', `entry ${j}: ${e.chunk_id}`);
+      }
+      if (typeof e.start !== 'number' || typeof e.end !== 'number' || !Number.isInteger(e.start) || !Number.isInteger(e.end)) {
+        return fail('range-not-integer', `entry ${j}`);
+      }
+      const n = cpLength(c.text);
+      if (!(0 <= e.start && e.start < e.end && e.end <= n)) return fail('range-out-of-bounds', `entry ${j}: [${e.start},${e.end}) of ${n} codepoints`);
+      if (e.end - e.start > EVIDENCE_CAPS.maxQuoteCodepoints) return fail('quote-over-cap', `entry ${j}: ${e.end - e.start} codepoints`);
+      const quote = cpSlice(c.text, e.start, e.end);
+      if (sha256Utf8(quote) !== e.quote_sha256) return fail('quote-hash-mismatch', `entry ${j}`);
+      refs.push({ kind: 'document', document_id: c.document_id, chunk_id: c.chunk_id, start: e.start, end: e.end,
+                  chunk_text_sha256: sha256Utf8(c.text), quote_sha256: e.quote_sha256 });
+      quotes.push(quote);
+      return;
+    }
+    if (e.kind === 'observation') {
+      if (typeof e.observation_id !== 'string') return fail('unknown-observation', `entry ${j}`);
+      const o = db.prepare(`SELECT observation_id, entity_id, revision_no, content, status FROM entity_observations WHERE observation_id = ?`)
+        .get(e.observation_id) as { observation_id: string; entity_id: string; revision_no: number; content: string; status: string } | undefined;
+      if (!o) return fail('unknown-observation', `entry ${j}: ${e.observation_id}`);
+      if (o.status !== 'active') return fail('observation-not-active', `entry ${j}: status ${o.status}`);
+      if (o.revision_no !== e.revision_no) return fail('observation-revision-mismatch', `entry ${j}`);
+      if (sha256Utf8(o.content) !== e.content_sha256) return fail('observation-content-mismatch', `entry ${j}`);
+      const len = cpLength(o.content);   // the quoted unit is the WHOLE current content; never cut
+      if (len > EVIDENCE_CAPS.maxQuoteCodepoints) return fail('quote-over-cap', `entry ${j}: ${len} codepoints`);
+      const sources = readSourceTuples(db, o.observation_id);
+      refs.push({ kind: 'observation', observation_id: o.observation_id, entity_id: o.entity_id, revision_no: o.revision_no,
+                  content_sha256: e.content_sha256, status_at_generation: 'active', sources, source_summary: sourceSummary(sources) });
+      quotes.push(o.content);
+      return;
+    }
+    return fail('unknown-evidence-kind', `entry ${j}`);
+  });
+
+  const sup: EvidenceSupportInput = item.support === undefined ? {} : item.support;
+  if (sup === null || typeof sup !== 'object') fail('invalid-support');
+  const why = sup.why_status ?? 'unjudged';
+  if (!WHY_STATUSES.includes(why)) fail('invalid-support', `why_status ${String(why)}`);
+  if (sup.valid_time !== undefined && typeof sup.valid_time !== 'string') fail('invalid-support', 'valid_time');
+  if (sup.scope_note !== undefined && typeof sup.scope_note !== 'string') fail('invalid-support', 'scope_note');
+
+  const text = buildEvidenceBody(rel.source_name, rel.relationType, rel.target_name, quotes);
+  const bodyCp = cpLength(text);
+  if (bodyCp > EVIDENCE_CAPS.maxBodyCodepoints) fail('body-over-cap', `${bodyCp} codepoints`);
+  const fp = computeInputFingerprint({
+    relationship_id: rel.id, source_entity_id: rel.source_entity, target_entity_id: rel.target_entity,
+    relation_type: rel.relationType, source_name: rel.source_name, target_name: rel.target_name,
+    kg_format: EVIDENCE_FORMAT, refs, profile_id: profileId,
+  });
+  const metadata: EvidenceChunkMetadataV1 = {
+    kg_format: EVIDENCE_FORMAT,
+    relationship_id: rel.id, source_entity_id: rel.source_entity, target_entity_id: rel.target_entity,
+    source_entity: rel.source_name, target_entity: rel.target_name, relation_type: rel.relationType, direction: 'source->target',
+    confidence: rel.confidence,
+    evidence_refs: refs,
+    support: { why_status: why, valid_time: sup.valid_time ?? null, scope_note: sup.scope_note ?? null },
+    generated_ref_status: 'refs-resolved',
+    input_fingerprint: fp, fingerprint_profile_id: profileId,
+    body_codepoints: bodyCp,
+    embedded_truncation: 'unchecked',
+    evidence_semantics: EVIDENCE_SEMANTICS,
+  };
+  return { chunk_id: evidenceChunkId(rel.id), relationship_id: rel.id, text, body_codepoints: bodyCp, metadata };
+}
