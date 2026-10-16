@@ -35,8 +35,9 @@ import { addRevision, correctRevision, transitionStatus, linkSources,
          nextProjectionOrder, type SourceInput } from './src/observations/lifecycle.js';
 import { getObservationHistory } from './src/observations/history.js';
 import { kgComparisonValue, captureKgEmbedInput, parseEvidenceMetadata, fingerprintFromMetadata, sha256Utf8,
-         EVIDENCE_FORMAT, resolveEvidenceItem, EvidenceInputError, EvidenceCommitConflictError,
-         type KgChunkRow, type KgEmbedCapture, type EvidenceItemInput, type PreparedEvidenceChunk } from './src/kg/relation-evidence.js';
+         EVIDENCE_FORMAT, resolveEvidenceItem, EvidenceInputError, EvidenceCommitConflictError, resolveEvidenceStatus,
+         type KgChunkRow, type KgEmbedCapture, type EvidenceItemInput, type PreparedEvidenceChunk,
+         type EvidenceStatus, type EvidenceRefStatus, type EvidenceChunkMetadataV1 } from './src/kg/relation-evidence.js';
 
 // Import chunk text algorithm (extracted for publish-time invariant testing)
 import { chunkStructured as chunkStructuredText, effectiveSignature, isCurrentFormatSignature, LEGACY_SIGNATURE, DEFAULT_MAX_TOKENS } from './src/chunkerC.js';
@@ -244,7 +245,10 @@ interface EnhancedSearchResult {
 }
 
 // NEW: Interface for detailed context retrieval
-interface DetailedContext {
+// D2④ (kg-relation-evidence): the document branch keeps today's string fields and shape; the KG
+// branch reports document_id/document_title null plus the real source. hybridSearch results are not
+// affected by this split (EnhancedSearchResult is unchanged).
+interface DocumentDetailedContext {
   chunk_id: string;
   document_id: string;
   full_text: string;
@@ -257,6 +261,29 @@ interface DetailedContext {
   entities: string[];
   metadata: Record<string, any>;
 }
+interface KgDetailedContextBase {
+  chunk_id: string;
+  document_id: null;
+  document_title: null;
+  source_kind: 'entity' | 'relationship';
+  source_id: string;
+  full_text: string;
+  entities: string[];
+  metadata: Record<string, any>;            // the chunk's own metadata
+}
+interface EntityDetailedContext extends KgDetailedContextBase {
+  source_kind: 'entity';
+  entity: { name: string; entityType: string; observations: Array<{ observation_id: string; revision_no: number; content: string }> };
+}
+interface RelationshipDetailedContext extends KgDetailedContextBase {
+  source_kind: 'relationship';
+  relationship: { id: string; source: string; target: string; relationType: string; confidence: number };
+  evidence_status: EvidenceStatus;           // reference resolution, not a truth verdict
+  evidence_refs: EvidenceRefStatus[];
+  support: EvidenceChunkMetadataV1['support'] | null;   // the caller's label, returned as stored
+}
+type KgDetailedContext = EntityDetailedContext | RelationshipDetailedContext;
+type DetailedContext = DocumentDetailedContext | KgDetailedContext;
 
 // Safe rowid for vec0 virtual tables (require literal integer, not parameterized)
 // Trim incomplete UTF-8 multi-byte sequences at chunk boundaries.
@@ -4363,6 +4390,11 @@ export class RAGKnowledgeGraphManager {
     for (const result of vectorResults) {
       // Get entities associated with this chunk (for document chunks)
       let chunkEntities: string[] = [];
+      // D2④ (kg-relation-evidence): full_context_available = "getDetailedContext can resolve the stored
+      // body". Document chunks: unchanged (true — the FK cascade removes a chunk with its document). KG
+      // chunks: only while their entity / relationship row exists. It is NOT a verified-evidence signal;
+      // that is evidence_status in getDetailedContext. 6.4.0 hard-coded true.
+      let sourceResolved = result.chunk_type === 'document';
       if (result.chunk_type === 'document') {
         chunkEntities = this.db.prepare(`
           SELECT e.name 
@@ -4377,6 +4409,7 @@ export class RAGKnowledgeGraphManager {
         `).get(result.entity_id) as { name: string } | undefined;
         if (entity) {
           chunkEntities = [entity.name];
+          sourceResolved = true;
         }
       } else if (result.chunk_type === 'relationship' && result.relationship_id) {
         // For relationship chunks, get both entities
@@ -4389,6 +4422,7 @@ export class RAGKnowledgeGraphManager {
         `).get(result.relationship_id) as { source_name: string; target_name: string } | undefined;
         if (relEntities) {
           chunkEntities = [relEntities.source_name, relEntities.target_name];
+          sourceResolved = true;
         }
       }
       
@@ -4498,7 +4532,7 @@ export class RAGKnowledgeGraphManager {
         vector_similarity: vectorSimilarity,
         graph_boost: (useGraph && !vectorDegraded) ? graphBoost : undefined,
         fts_boost: ftsBoost > 0 ? ftsBoost : undefined,
-        full_context_available: true,
+        full_context_available: sourceResolved,
         chunk_type: result.chunk_type as 'document' | 'entity' | 'relationship',
         source_id: sourceId
       });
@@ -4548,6 +4582,14 @@ export class RAGKnowledgeGraphManager {
     if (!this.db) throw new Error('Database not initialized');
     
     console.error(`📖 Getting detailed context for chunk: ${chunkId}`);
+
+    // D2④ (kg-relation-evidence): KG chunks have no documents row, so the INNER JOIN below never found
+    // them (6.4.0: every KG hit failed here). Branch on chunk_type first; the document branch below is
+    // unchanged.
+    const head = this.db.prepare(`SELECT chunk_type FROM chunk_metadata WHERE chunk_id = ?`).get(chunkId) as { chunk_type: string | null } | undefined;
+    if (head && (head.chunk_type === 'entity' || head.chunk_type === 'relationship')) {
+      return this.getKgDetailedContext(chunkId);
+    }
     
     // Get the main chunk
     const chunk = this.db.prepare(`
@@ -4630,6 +4672,44 @@ export class RAGKnowledgeGraphManager {
       entities: entities,
       metadata: metadata
     };
+  }
+
+  // D2④: entity -> the entity and its ACTIVE observations (history stays with getObservationHistory);
+  // relationship -> the relationship row + evidence_status + per-reference evidence_refs. When the
+  // entity / relationship row itself is gone the call fails as an unknown chunk does.
+  private getKgDetailedContext(chunkId: string): KgDetailedContext {
+    const row = this.db!.prepare(`SELECT chunk_id, chunk_type, entity_id, relationship_id, text, metadata FROM chunk_metadata WHERE chunk_id = ?`)
+      .get(chunkId) as KgChunkRow;
+    let meta: Record<string, any> = {};
+    try {
+      const parsed: unknown = JSON.parse(row.metadata ?? '{}');
+      if (parsed && typeof parsed === 'object') meta = parsed as Record<string, any>;
+    } catch { meta = {}; }
+    const notFound = () => new Error(`Chunk with ID ${chunkId} not found`);
+    if (row.chunk_type === 'entity') {
+      const ent = row.entity_id
+        ? this.db!.prepare(`SELECT id, name, entityType FROM entities WHERE id = ?`).get(row.entity_id) as { id: string; name: string; entityType: string } | undefined
+        : undefined;
+      if (!ent) throw notFound();
+      const observations = this.db!.prepare(`SELECT observation_id, revision_no, content FROM entity_observations
+        WHERE entity_id = ? AND status = 'active' ORDER BY projection_order`).all(ent.id) as Array<{ observation_id: string; revision_no: number; content: string }>;
+      return { chunk_id: row.chunk_id, document_id: null, document_title: null, source_kind: 'entity', source_id: ent.id,
+               full_text: row.text ?? '', entities: [ent.name], metadata: meta,
+               entity: { name: ent.name, entityType: ent.entityType, observations } };
+    }
+    const rel = row.relationship_id
+      ? this.db!.prepare(`
+          SELECT r.id, r.relationType, r.confidence, e1.name AS source_name, e2.name AS target_name
+          FROM relationships r JOIN entities e1 ON e1.id = r.source_entity JOIN entities e2 ON e2.id = r.target_entity
+          WHERE r.id = ?`).get(row.relationship_id) as { id: string; relationType: string; confidence: number; source_name: string; target_name: string } | undefined
+      : undefined;
+    if (!rel) throw notFound();
+    const ev = resolveEvidenceStatus(this.db!, meta);
+    return { chunk_id: row.chunk_id, document_id: null, document_title: null, source_kind: 'relationship', source_id: rel.id,
+             full_text: row.text ?? '', entities: [rel.source_name, rel.target_name], metadata: meta,
+             relationship: { id: rel.id, source: rel.source_name, target: rel.target_name, relationType: rel.relationType, confidence: rel.confidence },
+             evidence_status: ev.status, evidence_refs: ev.refs,
+             support: meta.kg_format === EVIDENCE_FORMAT && meta.support ? meta.support : null };
   }
 
   async getKnowledgeGraphStats(): Promise<any> {

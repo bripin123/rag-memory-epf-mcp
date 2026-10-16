@@ -315,3 +315,76 @@ export function resolveEvidenceItem(db: Database.Database, item: EvidenceItemInp
   };
   return { chunk_id: evidenceChunkId(rel.id), relationship_id: rel.id, text, body_codepoints: bodyCp, metadata };
 }
+
+// ---- D2④ reader: reference resolution (NOT a truth verdict) ----
+
+export type EvidenceStatus = 'claim_only' | 'refs_available' | 'refs_unavailable';
+export interface EvidenceRefStatus { index: number; kind: string; status: 'available' | 'missing' | 'mismatch'; ref: unknown; text: string | null }
+
+// legacy triplet -> claim_only, no refs. evidence-v1 -> each reference resolved against the CURRENT
+// rows; all available -> refs_available, anything else (missing, mismatch, malformed or empty list) ->
+// refs_unavailable. An inactive or historical revision is 'mismatch', never 'available'.
+export function resolveEvidenceStatus(db: Database.Database, meta: Record<string, unknown> | null): { status: EvidenceStatus; refs: EvidenceRefStatus[] } {
+  if (!meta || meta.kg_format === undefined) return { status: 'claim_only', refs: [] };
+  const list = meta.kg_format === EVIDENCE_FORMAT && Array.isArray(meta.evidence_refs) ? (meta.evidence_refs as unknown[]) : null;
+  if (!list || list.length === 0) return { status: 'refs_unavailable', refs: [] };
+  const refs = list.map((r, i) => resolveOneRef(db, r, i));
+  return { status: refs.every(r => r.status === 'available') ? 'refs_available' : 'refs_unavailable', refs };
+}
+
+// R4 (REVIEW-PLAN): structure is checked at runtime before any field is used — `as SourceTuple[]` is not
+// a check, and `sources: [null]` used to reach `s.source_kind`. A structurally malformed reference is
+// 'mismatch' (so the chunk is refs_unavailable), never a TypeError. Real DB errors are NOT caught here.
+const isStr = (v: unknown): v is string => typeof v === 'string';
+const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v);
+export function isSourceTuple(v: unknown): v is SourceTuple {
+  if (!v || typeof v !== 'object') return false;
+  const s = v as Record<string, unknown>;
+  return isStr(s.source_kind) && isStr(s.source_ref) && (s.source_hash === null || isStr(s.source_hash));
+}
+export function isWellFormedRef(v: unknown): boolean {
+  if (!v || typeof v !== 'object') return false;
+  const r = v as Record<string, unknown>;
+  if (r.kind === 'document') {
+    return isStr(r.document_id) && isStr(r.chunk_id) && isInt(r.start) && isInt(r.end) && isStr(r.chunk_text_sha256) && isStr(r.quote_sha256);
+  }
+  if (r.kind === 'observation') {
+    return isStr(r.observation_id) && isStr(r.entity_id) && isInt(r.revision_no) && isStr(r.content_sha256)
+      && Array.isArray(r.sources) && r.sources.every(isSourceTuple);
+  }
+  return false;
+}
+
+function resolveOneRef(db: Database.Database, raw: unknown, index: number): EvidenceRefStatus {
+  const r = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  const out = (status: EvidenceRefStatus['status'], text: string | null = null): EvidenceRefStatus =>
+    ({ index, kind: typeof r.kind === 'string' ? r.kind : 'unknown', status, ref: raw, text });
+  if (!isWellFormedRef(raw)) return out('mismatch');
+  if (r.kind === 'document') {
+    const c = db.prepare(`
+      SELECT m.chunk_type, m.document_id, m.text, d.id AS doc_id
+      FROM chunk_metadata m LEFT JOIN documents d ON d.id = m.document_id WHERE m.chunk_id = ?`)
+      .get(r.chunk_id as string) as { chunk_type: string | null; document_id: string | null; text: string | null; doc_id: string | null } | undefined;
+    if (!c || c.doc_id === null) return out('missing');
+    if (c.chunk_type !== 'document' || c.document_id !== r.document_id || c.text === null) return out('mismatch');
+    if (sha256Utf8(c.text) !== r.chunk_text_sha256) return out('mismatch');
+    if (typeof r.start !== 'number' || typeof r.end !== 'number' || !Number.isInteger(r.start) || !Number.isInteger(r.end)) return out('mismatch');
+    if (!(0 <= r.start && r.start < r.end && r.end <= cpLength(c.text))) return out('mismatch');
+    const quote = cpSlice(c.text, r.start, r.end);
+    if (sha256Utf8(quote) !== r.quote_sha256) return out('mismatch');
+    return out('available', quote);
+  }
+  if (r.kind === 'observation') {
+    const o = db.prepare(`SELECT entity_id, revision_no, content, status FROM entity_observations WHERE observation_id = ?`)
+      .get(r.observation_id as string) as { entity_id: string; revision_no: number; content: string; status: string } | undefined;
+    if (!o) return out('missing');
+    if (o.status !== 'active' || o.entity_id !== r.entity_id || o.revision_no !== r.revision_no || sha256Utf8(o.content) !== r.content_sha256) {
+      return out('mismatch');
+    }
+    const now = readSourceTuples(db, r.observation_id as string).map(s => [s.source_kind, s.source_ref, s.source_hash]);
+    const stored = [...(r.sources as SourceTuple[])].sort(compareSourceTuples).map(s => [s.source_kind, s.source_ref, s.source_hash]);
+    if (JSON.stringify(now) !== JSON.stringify(stored)) return out('mismatch');
+    return out('available', o.content);
+  }
+  return out('mismatch');
+}
