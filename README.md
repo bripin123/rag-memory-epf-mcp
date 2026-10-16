@@ -154,6 +154,41 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### Unreleased — kg-relation-evidence (version and publish: owner)
+
+- **Changed — new opt-in manager method `generateRelationEvidenceChunks(items, { formatVersion: 'evidence-v1' })`.**
+  `items` is the whole set of relationships that should have a relationship chunk: on success every relationship KG
+  chunk is replaced by evidence-backed chunks for that set, built from verified quotes (document chunk codepoint
+  ranges) and current active observations; relationships outside the set get no chunk, and entity chunks and
+  relationship rows are untouched. Caps: 1–8 evidence entries per item, ≤ 4,000 codepoints per quote, ≤ 8,000
+  codepoints of final body — over-cap input rejects the whole call without writes, never truncated. Not exposed over
+  MCP and does not change search defaults. The no-argument generator `generateKnowledgeGraphChunks()` keeps the
+  previous entity/triplet bodies, IDs, metadata and counts (the lifecycle and atomicity fixes below still apply);
+  calling it replaces existing evidence relationship chunks with triplet chunks. "Evidence-backed" means
+  caller-selected evidence whose references the engine verified exist verbatim, not an independent proof.
+- **Changed — stale KG chunks leave search immediately.** Deleting a relationship, or changing or removing a cited
+  observation or document, removes the KG chunk (vector, FTS row) in the same transaction. No automatic evidence
+  regeneration is scheduled; the chunk stays absent until the caller explicitly generates again. A confidence-only
+  update refreshes the copied metadata without re-embedding.
+- **Changed — `getDetailedContext` resolves KG chunks.** Entity chunks return the entity and its active observations;
+  relationship chunks return the relationship plus `evidence_status` (`claim_only` / `refs_available` /
+  `refs_unavailable`) and per-reference `available` / `missing` / `mismatch`, with `document_id: null` and
+  `document_title: null` in this branch only. Document detail and all `hybridSearch` fields are unchanged, except that
+  `full_context_available` is now `false` for a KG chunk whose entity or relationship row is gone.
+- **Changed — a failed KG replacement leaves the previous snapshot intact; no partial replacement is published. A KG
+  embedding computed for an input that changed meanwhile (text, evidence fingerprint or profile) is dropped,** on the
+  dedicated path and in background backfill. A profile change before inference starts embeds under the new profile.
+- **Changed — oversize blocks split faster.** An oversize block that reaches the fallback split is split using a
+  verified token-window estimate, with the previous linear scan kept when no candidate verifies (C6 numbers: framework
+  receipts `raw/measurements/2026-10-16-kg-relation-evidence/C6-BENCH.md`, one synthetic input per size on one Mac,
+  Node 24.12.0 — not a guarantee for every input). Inputs that never reach this fallback keep their previous
+  boundaries. The chunking signature now says `fallback=cp-window-N`; documents stamped `cp-exact-N` stay current
+  format. A signature change alone does not re-chunk an unchanged document that still has chunk metadata (missing
+  vectors are re-queued without re-chunking; if no chunks remain, the normal path runs).
+- **Documented — `limit` sets both the maximum result count and the retrieval depth** (each query variant requests up
+  to `limit × 3` vector and up to `limit × 3` FTS candidates, then merged), so results for different limits can
+  differ. No algorithm change.
+
 ### v6.4.0 (2026-10-03)
 
 - (Published first as `6.4.0-rc.1` on the `next` dist-tag; promoted to `latest` after a canary of the published

@@ -20,14 +20,19 @@ export function mergeMinTokens(maxTokens: number): number {
   return Math.floor(maxTokens / 2);   // NOT >>1 — bitshift wraps at 2^31 (r12)
 }
 
+// kg-relation-evidence D3: fallback=cp-window-N names the windowed oversize split below. Boundaries
+// differ from cp-exact only for blocks that reach the fallback, so the signature says so.
 export function effectiveSignature(maxTokens: number): string {
-  return `c1:enc=cl100k_base:max=${maxTokens}:overlap=0:fence=on:merge=${mergeMinTokens(maxTokens)}:fallback=cp-exact-${maxTokens}`;
+  return `c1:enc=cl100k_base:max=${maxTokens}:overlap=0:fence=on:merge=${mergeMinTokens(maxTokens)}:fallback=cp-window-${maxTokens}`;
 }
 
 // Strict parse (r5-15): the regex alone classified impossible signatures
 // (max=0, max/fallback mismatch) as current. Cross-check the components.
+// Both c1 fallbacks are the current FORMAT (stats "current" vs legacy/unknown, index.ts:4826-4831):
+// a document stamped cp-exact by 6.4.0 is not re-chunked by an unchanged-content sync and must not be
+// reported as an unknown format.
 export function isCurrentFormatSignature(sig: string): boolean {
-  const m = /^c1:enc=cl100k_base:max=(\d+):overlap=0:fence=on:merge=(\d+):fallback=cp-exact-(\d+)$/.exec(sig);
+  const m = /^c1:enc=cl100k_base:max=(\d+):overlap=0:fence=on:merge=(\d+):fallback=cp-(?:exact|window)-(\d+)$/.exec(sig);
   if (!m) return false;
   const max = Number(m[1]);
   return Number.isInteger(max) && max > 0 && m[1] === m[3] && Number(m[2]) === mergeMinTokens(max);
@@ -104,29 +109,68 @@ export function buildBlocks(lines: string[]): Block[] {
   return blocks;
 }
 
-// cp-exact oversize split, non-monotonicity-safe (spec §4.3-6, r5-5).
-// BPE prefix token counts are NOT monotonic ('/sdkX' -> 1,1,2,1,2), so binary
-// search is invalid. Scan prefixes linearly, remember the last fitting one, and
-// keep probing LOOKAHEAD candidates past a miss to recover dips. If not even
-// one codepoint fits, throw — never emit an over-budget chunk.
+// Oversize split for a block with no structural cut (spec §4.3-6; kg-relation-evidence D3).
+// 6.4.0 scanned every codepoint prefix and re-encoded it (one encode per codepoint, quadratic per
+// chunk; 20k chars 4.6 s, 575k 162 s measured). Now: encode a window once, map the first maxTokens
+// window tokens back to a codepoint count, then VERIFY that candidate by encoding the real substring —
+// the window tokenisation is only an estimate, because BPE re-tokenises a truncated final piece
+// differently (prefix counts are not monotonic: '/sdkX' -> 1,1,2,1,2). Shrink the token count
+// (1, 2, 4, ... fewer) until a candidate verifies; if none does, fall back to the 6.4.0 linear scan for
+// this chunk only, which also keeps its throw. Contract (chunk-invariants, chunker-c): lossless,
+// contiguous codepoint offsets, every chunk's ACTUAL encode length <= maxTokens, deterministic, always
+// advances. Not a longest-fit guarantee — neither was LOOKAHEAD.
 const LOOKAHEAD = 16;
-function splitOversize(block: string, enc: Tiktoken, maxTokens: number): string[] {
+const WINDOW_MIN_CP = 64;
+const WINDOW_CP_PER_TOKEN = 8;
+
+function utf8Bytes(cp: string): number {
+  const c = cp.codePointAt(0)!;
+  return c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;   // a lone surrogate encodes as U+FFFD = 3
+}
+
+function linearFit(cps: string[], start: number, enc: Tiktoken, maxTokens: number): number {
+  let lastFit = 0;
+  let missesSinceFit = 0;
+  for (let probe = start + 1; probe <= cps.length && missesSinceFit < LOOKAHEAD; probe++) {
+    const t = enc.encode(cps.slice(start, probe).join('')).length;
+    if (t <= maxTokens) { lastFit = probe - start; missesSinceFit = 0; }
+    else missesSinceFit++;
+  }
+  return lastFit;
+}
+
+function windowFit(cps: string[], start: number, enc: Tiktoken, maxTokens: number): number {
+  const rest = cps.length - start;
+  let w = Math.min(rest, Math.max(WINDOW_MIN_CP, maxTokens * WINDOW_CP_PER_TOKEN));
+  let toks = enc.encode(cps.slice(start, start + w).join(''));
+  while (toks.length <= maxTokens && w < rest) {
+    w = Math.min(rest, w * 2);
+    toks = enc.encode(cps.slice(start, start + w).join(''));
+  }
+  if (toks.length <= maxTokens) return rest;             // the whole remainder fits
+  for (let keep = maxTokens, step = 1; keep >= 1; keep -= step, step *= 2) {
+    const bytes = enc.decode(toks.slice(0, keep)).length;
+    let used = 0;
+    let c = 0;
+    while (c < w && used + utf8Bytes(cps[start + c]) <= bytes) { used += utf8Bytes(cps[start + c]); c++; }
+    if (c === 0) continue;
+    if (enc.encode(cps.slice(start, start + c).join('')).length <= maxTokens) return c;
+  }
+  return 0;
+}
+
+export function splitOversize(block: string, enc: Tiktoken, maxTokens: number): string[] {
   const cps = [...block];
   const out: string[] = [];
   let start = 0;
   while (start < cps.length) {
-    let lastFit = 0;
-    let missesSinceFit = 0;
-    for (let probe = start + 1; probe <= cps.length && missesSinceFit < LOOKAHEAD; probe++) {
-      const t = enc.encode(cps.slice(start, probe).join('')).length;
-      if (t <= maxTokens) { lastFit = probe - start; missesSinceFit = 0; }
-      else missesSinceFit++;
-    }
-    if (lastFit === 0) {
+    let take = windowFit(cps, start, enc, maxTokens);
+    if (take === 0) take = linearFit(cps, start, enc, maxTokens);
+    if (take === 0) {
       throw new Error(`chunker c1: codepoint at offset ${start} exceeds maxTokens=${maxTokens} on its own — cannot honor the token budget`);
     }
-    out.push(cps.slice(start, start + lastFit).join(''));
-    start += lastFit;
+    out.push(cps.slice(start, start + take).join(''));
+    start += take;
   }
   return out;
 }

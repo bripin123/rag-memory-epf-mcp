@@ -97,6 +97,11 @@ rmSync(dir, { recursive: true, force: true });
   const orphanCase = [...cases].filter(n => !registered.has(n));
   assert.deepEqual(missingCase, [], `registered tools with no dispatch case: ${missingCase.join(', ')}`);
   assert.deepEqual(orphanCase, [], `dispatch cases for unregistered tools: ${orphanCase.join(', ')}`);
+  // kg-relation-evidence C7.2: the evidence generator is a manager method only (Q3) — no tool, no case,
+  // and the advertised tool count is unchanged (README: 38).
+  assert.equal(registered.size, 38, `tool count changed to ${registered.size}`);
+  assert.ok(!registered.has('generateRelationEvidenceChunks') && !cases.has('generateRelationEvidenceChunks'),
+    'generateRelationEvidenceChunks must not be an MCP tool');
 
   // 모든 도구가 유효한 MCP inputSchema 를 낸다 (빈 properties 로 통과하지 못하게)
   for (const t of getAllMCPTools()) {

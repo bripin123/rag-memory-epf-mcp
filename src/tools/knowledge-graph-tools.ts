@@ -306,7 +306,7 @@ const hybridSearchCapability: ToolCapabilityInfo = {
       },
       limit: {
         type: 'number',
-        description: 'Maximum number of results to return',
+        description: 'Maximum number of results to return AND the retrieval depth (each query variant requests up to limit x 3 vector and up to limit x 3 FTS candidates, then merged), so hybridSearch(q, 30) cut to 10 can differ from hybridSearch(q, 10)',
         default: 5
       },
       useGraph: {
@@ -332,6 +332,8 @@ chunk out of the top-5 in ~40% of known-item queries. For relationship explorati
 - (!important!) **Graph re-ranking is opt-in (default false since v5.3.0)** — it re-orders candidates by matched/connected entity links, which is measured to hurt known-item retrieval; enable it only for backward compatibility or controlled evaluation
 - (!important!) Graph re-ranking does not generate candidates — for "what is connected to X" use openNodes -> getNeighbors
 - (!important!) relevance_score is a RANK score on the default call: 1/(60 + vector rank) + 1/(60 + FTS rank), at most 2/61; it is not a similarity or probability and is only comparable within one call (vector_similarity and fts_boost are reported alongside)
+- (!important!) limit is both the maximum result count and the retrieval depth (each query variant requests up to limit x 3 vector candidates and up to limit x 3 FTS candidates, which are then merged), so results, even the top-1, can differ between limits; for comparisons fix the call limit and cut k from the returned list
+- (!important!) full_context_available means getDetailedContext can resolve the stored chunk body; it is not a verified-evidence signal (for knowledge-graph relationship chunks read evidence_status there)
 - (!important!) **Best results when knowledge graph is well-populated** with entities and relationships
 </importantNotes>
 
@@ -365,7 +367,7 @@ chunk out of the top-5 in ~40% of known-item queries. For relationship explorati
 
 <parameters>
 - query: Search query — a natural-language question or an exact term/identifier (string, required)
-- limit: Maximum results to return, default 5 (number, optional)
+- limit: Maximum results to return AND retrieval depth (up to limit x 3 vector and limit x 3 FTS candidates per query variant), default 5 (number, optional). For comparisons fix the call limit and cut k from the returned list
 - useGraph: Enable knowledge graph re-ranking, default false / opt-in (boolean, optional)
 </parameters>
 
@@ -377,7 +379,7 @@ chunk out of the top-5 in ~40% of known-item queries. For relationship explorati
 
 const hybridSearchSchema: z.ZodRawShape = {
   query: z.string().describe('The search query to find relevant information'),
-  limit: z.number().optional().default(5).describe('Maximum number of results to return'),
+  limit: z.number().optional().default(5).describe('Maximum number of results to return; also the retrieval depth (up to limit x 3 vector and limit x 3 FTS candidates per query variant)'),
   useGraph: z.boolean().optional().default(false).describe('Opt-in legacy/experimental graph re-ranker (default false since v5.3.0; measured to hurt known-item retrieval; for exploration use openNodes -> getNeighbors)'),
 };
 
@@ -491,6 +493,8 @@ Perfect drill-down tool for exploring the full content behind search result high
 - (!important!) **Returns complete chunk text** - not just summaries or highlights
 - (!important!) **Includes surrounding chunks** - for better context understanding
 - (!important!) **Shows entity associations** - to understand knowledge graph connections
+- (!important!) **Knowledge-graph chunks** (chunk_type entity/relationship) return document_id: null and document_title: null with source_kind and source_id; an entity chunk returns the entity and its active observations, a relationship chunk returns the relationship, evidence_status (claim_only | refs_available | refs_unavailable) and per-reference evidence_refs (available | missing | mismatch)
+- (!important!) evidence_status is reference resolution, not a truth verdict: refs_available means every cited quote or observation still matches verbatim (current chunk range and hashes, or the current active observation revision); whoever generated the chunk selected the evidence
 </importantNotes>
 
 <whenToUseThisTool>

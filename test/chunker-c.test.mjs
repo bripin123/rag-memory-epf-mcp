@@ -159,7 +159,11 @@ assert.throws(() => chunkStructured('🎉', enc, 1), /exceeds maxTokens/,
 }
 
 // ---------- signature: 강한 파서 (r5-15, r11 merge 성분) ----------
-assert.equal(effectiveSignature(800), 'c1:enc=cl100k_base:max=800:overlap=0:fence=on:merge=400:fallback=cp-exact-800');
+assert.equal(effectiveSignature(800), 'c1:enc=cl100k_base:max=800:overlap=0:fence=on:merge=400:fallback=cp-window-800');
+// kg-relation-evidence D3: documents stamped by the previous fallback stay "current format" (their
+// boundaries only differ where the fallback ran, and an unchanged-content sync never re-chunks).
+assert.ok(isCurrentFormatSignature('c1:enc=cl100k_base:max=800:overlap=0:fence=on:merge=400:fallback=cp-exact-800'));
+assert.ok(!isCurrentFormatSignature('c1:enc=cl100k_base:max=800:overlap=0:fence=on:merge=400:fallback=cp-other-800'), 'unknown fallback = unknown');
 assert.ok(isCurrentFormatSignature(effectiveSignature(800)));
 assert.ok(isCurrentFormatSignature(effectiveSignature(400)));
 assert.ok(isCurrentFormatSignature(effectiveSignature(401)), 'merge = floor(max/2)');
@@ -173,5 +177,70 @@ assert.ok(!isCurrentFormatSignature('c1:enc=cl100k_base:max=0:overlap=0:fence=on
 assert.equal(mergeMinTokens(2147483648), 1073741824, '32-bit 경계: floor, not bitshift');
 assert.ok(isCurrentFormatSignature(effectiveSignature(2147483648)), '2^31 signature round-trip');
 assert.ok(isCurrentFormatSignature(effectiveSignature(Number.MAX_SAFE_INTEGER - 1)), 'MAX_SAFE_INTEGER-1 round-trip');
+
+// ---------- kg-relation-evidence D3: windowed fallback ----------
+{
+  const { splitOversize } = await import('../dist/src/chunkerC.js');
+  const { accessibilityTree, jsonDump, minifiedJs, cjkAstralCrlf } = await import('./helpers/oversize-corpus.mjs');
+  // '/sdkX'.repeat(400) is exactly 800 tokens (fits max=800, never reaches the fallback); 401 = 802 tokens.
+  const inputs = [
+    ['accessibility tree', accessibilityTree(6000)], ['JSON dump', jsonDump(6000)], ['minified JS', minifiedJs(6000)],
+    ['CJK/astral/CRLF', cjkAstralCrlf(6000)], ['astral only', '🎉'.repeat(3000)], ['/sdkX repeated', '/sdkX'.repeat(401)],
+  ];
+  for (const [name, text] of inputs) {
+    for (const max of [800, 5]) {
+      const segs = chunkStructured(text, enc, max);
+      checkInvariants(text, segs, max);
+      assert.ok(segs.length > 1, `${name} max=${max}: split happened`);
+      assert.deepEqual(chunkStructured(text, enc, max), segs, `${name} max=${max}: deterministic`);
+    }
+    console.log(`fallback ok: ${name} (max 800 and 5)`);
+  }
+  // shrink path: an encoder whose standalone encoding of mid-length strings is far over budget forces
+  // the window candidate to fail verification; the split must still be lossless and within budget.
+  const poisoned = { encode: (s) => { const t = enc.encode(s); const n = [...s].length; return n >= 10 && n < 64 ? Uint32Array.from([...t, ...new Array(100).fill(0)]) : t; },
+                     decode: (t) => enc.decode(t) };
+  const text = 'abcdefghij'.repeat(300);
+  const parts = splitOversize(text, poisoned, 5);
+  assert.equal(parts.join(''), text, 'all window candidates rejected -> linearFit fallback: lossless');
+  assert.ok(parts.every(p => [...p].length < 10 && enc.encode(p).length <= 5), 'all window candidates rejected -> linearFit fallback: every piece verified short and within budget');
+  // ^ with poison [10,64) every window candidate (keep 5, 4, 2 -> 28, 20, 10 cp) is rejected, so linearFit
+  //   produced those pieces. Successful shrink (REVIEW-T10 I1): poison [11,64) rejects keep 5 and 4 (28, 20 cp)
+  //   and accepts keep 2 (10 cp). Per chunk that is 1 window encode + 3 verifies = 4 encode calls; linearFit
+  //   needs >= 26 (10 fitting probes + LOOKAHEAD 16 misses). Output invariants alone cannot tell the two paths
+  //   apart (both yield 10-cp pieces), so the call bound is what fails if the shrunk candidate is not taken.
+  {
+    let calls = 0;
+    const poison11 = { encode: (s) => { calls++; const t = enc.encode(s); const n = [...s].length; return n >= 11 && n < 64 ? Uint32Array.from([...t, ...new Array(100).fill(0)]) : t; },
+                       decode: (t) => enc.decode(t) };
+    const text11 = 'abcdefghij'.repeat(300);
+    const shrunk = splitOversize(text11, poison11, 5);
+    const used = calls;
+    assert.equal(shrunk.join(''), text11, 'successful shrink: lossless');
+    assert.ok(shrunk.every(p => [...p].length === 10 && enc.encode(p).length <= 5), 'successful shrink: every piece is 10 cp and within the real budget');
+    assert.ok(used <= 5 * shrunk.length,
+      `successful shrink: ${used} encode calls for ${shrunk.length} chunks (${(used / shrunk.length).toFixed(1)}/chunk) exceeds 5/chunk — the shrunk candidate was not taken (linearFit needs >= 26/chunk)`);
+    assert.deepEqual(splitOversize(text11, poison11, 5), shrunk, 'successful shrink: deterministic');
+    console.log(`fallback ok: successful shrink (${used} encode calls / ${shrunk.length} chunks)`);
+  }
+  // linear fallback: a decode that yields no bytes gives no window candidate; the old scan takes over
+  const blind = { encode: (s) => enc.encode(s), decode: () => new Uint8Array(0) };
+  const linearRef = (block, max) => {          // the 6.4.0 algorithm, restated as the oracle
+    const cps = [...block]; const out = []; let start = 0;
+    while (start < cps.length) {
+      let lastFit = 0, miss = 0;
+      for (let probe = start + 1; probe <= cps.length && miss < 16; probe++) {
+        if (enc.encode(cps.slice(start, probe).join('')).length <= max) { lastFit = probe - start; miss = 0; } else miss++;
+      }
+      if (lastFit === 0) throw new Error('exceeds maxTokens');
+      out.push(cps.slice(start, start + lastFit).join('')); start += lastFit;
+    }
+    return out;
+  };
+  const small = 'abcdefghij'.repeat(30);
+  assert.deepEqual(splitOversize(small, blind, 5), linearRef(small, 5), 'no window candidate -> exactly the old linear scan');
+  assert.throws(() => splitOversize('🎉', enc, 1), /exceeds maxTokens/, 'a single codepoint over budget still throws');
+  console.log('fallback ok: shrink path, linear fallback, throw');
+}
 
 console.log('chunker-c: ALL PASS');
