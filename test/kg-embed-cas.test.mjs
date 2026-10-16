@@ -158,6 +158,9 @@ try {
     for (const x of db.prepare(`SELECT rowid FROM chunk_metadata WHERE chunk_type IN ('entity','relationship')`).all()) {
       assert.equal(await m.reembedChunkByRowid(x.rowid), true, `backfill wrote rowid ${x.rowid}`);
       assert.equal(vecAt(x.rowid), 1);
+      // same provenance assertions as the dedicated control above (REVIEW-T8-2_ minor)
+      const y = one(`SELECT text, input_hash, profile_id, provenance_state FROM chunk_metadata WHERE rowid = ?`, x.rowid);
+      assert.equal(y.provenance_state, 'verified'); assert.equal(y.profile_id, p1); assert.equal(y.input_hash, sha(y.text));
     }
     console.log('  PASS C5 positive: legacy entity/triplet rows embedded by the backfill callback');
   }

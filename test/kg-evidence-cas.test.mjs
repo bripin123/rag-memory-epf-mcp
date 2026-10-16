@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { makeManager, installFakeEmbedder } from './helpers/engine-test-db.mjs';
-import { fingerprintFromMetadata } from '../dist/src/kg/relation-evidence.js';
+import { fingerprintFromMetadata, kgComparisonValue } from '../dist/src/kg/relation-evidence.js';
 
 const sha = (s) => createHash('sha256').update(s, 'utf8').digest('hex');
 const F = { formatVersion: 'evidence-v1' };
@@ -40,6 +40,8 @@ try {
   const oid = one(`SELECT observation_id FROM entity_observations WHERE content LIKE '%zqxcas91%'`).observation_id;
   const oref = () => { const o = one(`SELECT revision_no, content FROM entity_observations WHERE observation_id = ?`, oid); return { kind: 'observation', observation_id: oid, revision_no: o.revision_no, content_sha256: sha(o.content) }; };
   const row = () => one(`SELECT rowid, chunk_id, text, metadata, profile_id, provenance_state, input_hash FROM chunk_metadata WHERE chunk_id = ?`, CH);
+  // the KgChunkRow shape writeKgVectorIfCurrent reads (index.ts writeKgVectorIfCurrent), plus profile_id
+  const rowAt = (r) => one(`SELECT rowid, chunk_id, chunk_type, entity_id, relationship_id, text, metadata, profile_id FROM chunk_metadata WHERE rowid = ?`, r);
   const relChunks = () => JSON.stringify(all(`SELECT rowid, chunk_id, text, metadata FROM chunk_metadata WHERE chunk_type = 'relationship' ORDER BY rowid`));
   const gen = (evidence) => m.generateRelationEvidenceChunks([{ relationship_id: R, evidence }], F);
   const paths = {
@@ -65,7 +67,31 @@ try {
       await run(r0.rowid);
       assert.equal(vecAt(r0.rowid), 0, `${name}: orphan vector after delete during inference`);
       console.log(`  PASS ${name}: deleted during inference -> dropped`); }
-    // same text under a different chunk_id at the same rowid
+    // same rowid + same text + same profile + same comparison value; ONLY chunk_id differs (C5 "same text
+    // under a different chunk_id"). Relationship id and metadata stay R's, so kgComparisonValue is equal
+    // and only the chunk_id guard in writeKgVectorIfCurrent can reject (REVIEW-T8-2_ I1).
+    { restore(); await gen([range(0, 13)]); const r0 = row(); const old0 = rowAt(r0.rowid);
+      const ALIAS = `${CH}_alias`;
+      const fired = during(r0.text, () => {
+        db.prepare(`DELETE FROM chunk_metadata WHERE rowid = ?`).run(r0.rowid);
+        db.prepare(`INSERT INTO chunk_metadata (rowid, chunk_id, chunk_type, relationship_id, chunk_index, text, start_pos, end_pos, metadata)
+          VALUES (?, ?, 'relationship', ?, 0, ?, 0, 1, ?)`).run(r0.rowid, ALIAS, R, r0.text, r0.metadata);
+      });
+      await run(r0.rowid);
+      const n0 = rowAt(r0.rowid);
+      assert.ok(fired(), `${name}: fixture side effect ran`);
+      assert.equal(n0.chunk_id, ALIAS, `${name}: fixture: the other chunk_id is in place`);
+      assert.notEqual(n0.chunk_id, old0.chunk_id, `${name}: fixture: chunk_id differs`);
+      assert.equal(n0.rowid, old0.rowid, `${name}: fixture: same rowid`);
+      assert.equal(n0.text, old0.text, `${name}: fixture: same text`);
+      assert.equal(n0.relationship_id, old0.relationship_id, `${name}: fixture: same relationship_id`);
+      assert.equal(m.currentProfileId, p1, `${name}: fixture: same profile`);
+      assert.ok(kgComparisonValue(old0) !== null, `${name}: fixture: comparison value of the original row is not null`);
+      assert.equal(kgComparisonValue(n0), kgComparisonValue(old0), `${name}: fixture: same comparison value, so only the chunk_id guard can reject`);
+      assert.equal(vecAt(r0.rowid), 0, `${name}: vector attached to another chunk_id with the same text and inputs`);
+      db.prepare(`DELETE FROM chunk_metadata WHERE chunk_id = ?`).run(ALIAS);
+      console.log(`  PASS ${name}: same rowid/text/profile/comparison value, other chunk_id -> dropped`); }
+    // variant: same text under a different chunk_id AND a different source identity at the same rowid
     { restore(); await gen([range(0, 13)]); const r0 = row();
       during(r0.text, () => {
         db.prepare(`DELETE FROM chunk_metadata WHERE rowid = ?`).run(r0.rowid);
@@ -75,7 +101,7 @@ try {
       await run(r0.rowid);
       assert.equal(vecAt(r0.rowid), 0, `${name}: vector attached to another chunk with the same text`);
       db.prepare(`DELETE FROM chunk_metadata WHERE chunk_id = 'kg_relationship_rel_other'`).run();
-      console.log(`  PASS ${name}: same text, other chunk_id -> dropped`); }
+      console.log(`  PASS ${name}: same text, other chunk_id and other relationship_id -> dropped`); }
     // profile switched DURING inference -> dropped
     { restore(); await gen([range(0, 13), oref()]); const r0 = row();
       during(r0.text, () => { m.currentProfileId = p2; });
