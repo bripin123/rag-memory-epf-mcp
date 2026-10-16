@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { makeManager, installFakeEmbedder } from './helpers/engine-test-db.mjs';
-import { cpLength, fingerprintFromMetadata, EVIDENCE_CAPS } from '../dist/src/kg/relation-evidence.js';
+import { cpLength, fingerprintFromMetadata, EVIDENCE_CAPS, kgComparisonValue } from '../dist/src/kg/relation-evidence.js';
 
 const sha = (s) => createHash('sha256').update(s, 'utf8').digest('hex');
 const F = { formatVersion: 'evidence-v1' };
@@ -207,5 +207,45 @@ try {
   const hit = pos.results.find(x => x.chunk_id === `kg_relationship_${R1}`);
   assert.ok(hit && hit.source_id === R1 && hit.fts_boost !== undefined, 'the evidence chunk is retrieved (FTS-matched) for a query only its quote answers');
   assert.equal(typeof hit.document_title, 'string', 'search field types unchanged');
+
+  // ---- Fix round 1, I1 (REVIEW-T5-2_): a hole in an array is an invalid entry, never skipped. This is a
+  // manager API called from JS, so no JSON layer turns holes into null first. Negatives run before the
+  // positive below so that every snapshot is taken over a fully embedded state.
+  const okRef = docRef('ev-doc_chunk_0', s1, s1 + cp(q1));
+  await rejectsZeroWrites('evidence = new Array(1) (one hole, no entry)', [{ relationship_id: R1, evidence: new Array(1) }], 'unknown-evidence-kind');
+  const validThenHole = [okRef]; validThenHole.length = 2;
+  await rejectsZeroWrites('valid entry + hole in one item', [{ relationship_id: R1, evidence: validThenHole }], 'unknown-evidence-kind');
+  const holeThenValid = new Array(2); holeThenValid[1] = okRef;
+  await rejectsZeroWrites('valid A + item B with a hole', [items[0], { relationship_id: R2, evidence: holeThenValid }], 'unknown-evidence-kind');
+  const sparseItems = [items[0]]; sparseItems.length = 2;
+  await rejectsZeroWrites('items array with a hole', sparseItems, 'invalid-item');
+
+  // ---- Fix round 1, I2: an endpoint entity id must be a non-empty string, because kgComparisonValue
+  // returns null for an empty one and neither CAS path could ever embed that chunk. The fixture goes
+  // through importGraph, which copies ids as given (the schema has no non-empty CHECK). Empty NAMES and
+  // an empty raw relationType are legal and must still generate a comparable chunk.
+  await m.importGraph({
+    entities: [
+      { id: '', name: 'Empty Id Holder', entityType: 'ORG' },
+      { id: 'entity_empty_name', name: '', entityType: 'ORG' },
+    ],
+    relations: [
+      { id: 'rel_empty_source', source_entity: '', target_entity: eid('Beta Lab'), relationType: 'FUNDS' },
+      { id: 'rel_empty_target', source_entity: eid('Alpha Corp'), target_entity: '', relationType: 'FUNDS' },
+      { id: 'rel_empty_name_type', source_entity: 'entity_empty_name', target_entity: eid('Beta Lab'), relationType: '' },
+    ],
+  }, { merge: true });
+  assert.equal(one(`SELECT count(*) n FROM entities WHERE id = ''`).n, 1, 'fixture: an entity with an empty id exists');
+  assert.equal(one(`SELECT source_entity s FROM relationships WHERE id = 'rel_empty_source'`).s, '', 'fixture: relationship with an empty source id');
+  await rejectsZeroWrites('empty source entity id', [{ relationship_id: 'rel_empty_source', evidence: [okRef] }], 'invalid-relationship-endpoint');
+  await rejectsZeroWrites('empty target entity id', [{ relationship_id: 'rel_empty_target', evidence: [okRef] }], 'invalid-relationship-endpoint');
+  await m.generateRelationEvidenceChunks([{ relationship_id: 'rel_empty_name_type', evidence: [okRef] }], F);
+  const en = one(`SELECT rowid, chunk_id, chunk_type, entity_id, relationship_id, text, metadata FROM chunk_metadata WHERE chunk_id = ?`, 'kg_relationship_rel_empty_name_type');
+  const enMeta = JSON.parse(en.metadata);
+  assert.equal(enMeta.source_entity, ''); assert.equal(enMeta.relation_type, '');
+  assert.equal(enMeta.source_entity_id, 'entity_empty_name');
+  assert.equal(en.text, ` —  — Beta Lab\n\n${q1}`, 'empty name and empty type are kept verbatim in the claim line');
+  assert.equal(kgComparisonValue(en), 'fp:' + enMeta.input_fingerprint, 'the published row is comparable, so the CAS paths can embed it');
+  console.log('  PASS fix round 1: holes rejected (evidence and items), empty endpoint ids rejected, empty name/type accepted and comparable');
   console.log(process.exitCode ? 'kg-relation-evidence: FAIL' : 'kg-relation-evidence: ALL PASS');
 } finally { cleanup(); }

@@ -226,11 +226,22 @@ export function resolveEvidenceItem(db: Database.Database, item: EvidenceItemInp
       id: string; source_entity: string; target_entity: string; relationType: string; confidence: number;
       source_name: string; target_name: string } | undefined;
   if (!rel) return fail('unknown-relationship', item.relationship_id);
+  // kgComparisonValue (D2⑤) never accepts an empty endpoint id, so a chunk published with one could never
+  // be embedded by either CAS path. The schema has no non-empty CHECK and importGraph copies ids as given,
+  // so the shared preparation/commit resolver checks it before any write. Names and the raw type may
+  // legitimately be empty; only the ids are identifiers (REVIEW-T5-2_ I2).
+  if (typeof rel.source_entity !== 'string' || rel.source_entity === '' || typeof rel.target_entity !== 'string' || rel.target_entity === '') {
+    return fail('invalid-relationship-endpoint', item.relationship_id);
+  }
 
   const refs: EvidenceRefMeta[] = [];
   const quotes: string[] = [];
-  item.evidence.forEach((e, j) => {
-    if (!e || typeof e !== 'object') return fail('unknown-evidence-kind', `entry ${j}`);
+  // Array.from visits every index; forEach alone skips holes, so new Array(1) passed the 1–8 count with zero
+  // resolved entries and [ref, <hole>] dropped one silently (D1: at least one entry, none dropped;
+  // REVIEW-T5-2_ I1). This is a JS manager API, so no JSON layer turns holes into null first. A hole
+  // reads as undefined and fails as an invalid entry.
+  Array.from(item.evidence).forEach((e, j) => {
+    if (!e || typeof e !== 'object') return fail('unknown-evidence-kind', `entry ${j}${j in item.evidence ? '' : ': hole'}`);
     if (e.kind === 'document') {
       if (typeof e.chunk_id !== 'string') return fail('unknown-chunk', `entry ${j}`);
       const c = db.prepare(`

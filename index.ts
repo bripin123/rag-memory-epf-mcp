@@ -2452,7 +2452,9 @@ export class RAGKnowledgeGraphManager {
       seen.add(id);
     });
     const profileAtPrepare = this.currentProfileId;
-    const prepared: PreparedEvidenceChunk[] = items.map((it, i) => resolveEvidenceItem(this.db!, it, i, profileAtPrepare));
+    // Array.from, not map: map skips holes, so a hole in items reached the commit loop unprepared and
+    // surfaced as a commit conflict instead of an input error (D1, same class as REVIEW-T5-2_ I1).
+    const prepared: PreparedEvidenceChunk[] = Array.from(items, (it, i) => resolveEvidenceItem(this.db!, it, i, profileAtPrepare));
 
     __kgFaultHook?.('evidence-pre-commit');
 
