@@ -90,7 +90,9 @@ try {
   m.db.exec(`DELETE FROM chunks WHERE rowid = ${Number(rowid)}`);
   const ok = await timed('kg_embed_backfill', () => m.reembedChunkByRowid(rowid));
   const meta = m.db.prepare(`SELECT profile_id, provenance_state FROM chunk_metadata WHERE rowid = ?`).get(rowid);
-  step('backfill callback re-embedded the evidence row with the real model', ok === true && meta.profile_id === m.currentProfileId && meta.provenance_state === 'verified', meta);
+  // The dedicated step above already embedded this text under this profile, so the backfill call is served from the
+  // profile-scoped cache: what this proves is the KG CAS write-back on the backfill path, not a fresh inference.
+  step('backfill callback restored a cached real-model vector through the KG CAS',ok === true && meta.profile_id === m.currentProfileId && meta.provenance_state === 'verified', meta);
   const labObs = obsRef('zqxrealgrant90').observation_id;
   await m.correctObservation(labObs, `${D}Real Lab studies coral reef restoration with zqxrealgrant90 funding and zqxrealnew92 volunteers.`);
   for (const q of [NL, 'zqxrealquote91']) step(`after the cited observation changed: evidence chunk absent (${q})`, !(await search(q)).results.some(x => x.chunk_id === CH));

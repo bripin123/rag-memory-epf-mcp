@@ -57,10 +57,10 @@ Single MCP stdio server. One SQLite file per project is the whole persistence la
 external service, no daemon, no second store.
 
 ```
-index.ts                        4,695 lines. The engine class + the MCP server, one file.
+index.ts                        5,477 lines. The engine class + the MCP server, one file.
   class RAGKnowledgeGraphManager   all engine behaviour (writers, readers, search, documents)
-  server.setRequestHandler(ListToolsRequestSchema)   tool listing  (4455)
-  server.setRequestHandler(CallToolRequestSchema)    one switch, one case per tool  (4462)
+  server.setRequestHandler(ListToolsRequestSchema)   tool listing  (5220)
+  server.setRequestHandler(CallToolRequestSchema)    one switch, one case per tool  (5227)
 
 src/observations/               v13 observation lifecycle
   schema.ts       OBSERVATION_SCHEMA_SQL — the DDL string shared by migration and tests
@@ -82,7 +82,8 @@ src/backup/preflight.ts   pre-migration backup (Online Backup API) into the next
 src/embeddingGate.ts      embedding admission control
 src/backfillCoordinator.ts  background embedding backfill
 src/modelCache.ts         version-independent model cache (v3.6)
-src/chunkerC.ts           document chunking — structure-anchored chunker "c1" (there is no src/chunkText.ts)
+src/chunkerC.ts           document chunking — structure-anchored chunker "c1" (there is no src/chunkText.ts) · an oversize block that reaches the fallback is split by a verified token window, with the previous linear scan kept when no candidate verifies (signature fallback=cp-window-N; a cp-exact-N stamp stays current format)
+src/kg/relation-evidence.ts  evidence-v1 relationship chunks (kg-relation-evidence): codepoints, fingerprint, comparison value, item resolution, dependency lookups, reader reference status
 
 test/*.test.mjs           plain node scripts. No framework. They import ../dist/index.js.
 ```
@@ -181,12 +182,20 @@ Engine"). Regression: `test/alias-link-gate.test.mjs`.
 `nonliteral`. That label means *"the name is not in the text"*, **not** *"linked by a non-lexical
 method"* — there is no such method.
 
-**Search does not use the graph to generate candidates.** `hybridSearch` (index.ts:3548) builds the
+**Search does not use the graph to generate candidates.** `hybridSearch` (index.ts:4243) builds the
 pool from vector search over `chunks` plus FTS5, ranks the default call by RRF (k=60; before
 search-fusion-rrf only the FTS term was RRF-shaped and was added to a cosine), and with `useGraph: true`
 applies `graphBoost` as a re-ranker over that pool (legacy formula). `useGraph` is opt-in, default **false** since v5.3.0; four places must
 agree (method signature, dispatch `=== true`, tool JSON, zod default). Relationship traversal is
 `openNodes` -> `getNeighbors`, never `useGraph`.
+`limit` is both the maximum result count and the retrieval depth: for each query variant the vector query asks for
+up to `limit * 3` neighbours (index.ts:4327) and FTS5 for up to `LIMIT limit * 3` rows (index.ts:4371); the per-variant
+lists are merged and the final list is cut to `limit`. So `hybridSearch(q, 30)` cut to 10 can differ from
+`hybridSearch(q, 10)`, even at the top-1 (`test/search-limit-depth.test.mjs`: target (vector 4, FTS 1) vs competitor
+(vector 3, FTS 2) — limit 1 puts the competitor first, limit 2 the target, 1/64+1/61 ≈ 0.03201844 > 1/63+1/62 ≈
+0.03200205). That fixture detects the vector depth only (only two documents contain its identifier, so an FTS-only
+depth change is not detected there). For comparisons fix the call `limit` and cut `k` from the returned list. This
+is documented behaviour, not a defect; no algorithm change.
 
 `graphBoost` scores each entity linked to the candidate chunk: query-vector-matched or exact term
 match 0.3, substring 0.2, **any whitespace token of the entity name >= 3 chars occurring in the
@@ -320,6 +329,36 @@ first). `test/wal-sidecar-guard.test.mjs`.
 **Tool declarations carry no logic.** `src/tools/*` is descriptions and zod schemas; behaviour is a
 manager method. Keep it that way — `validateToolArgs` is the only bridge.
 
+**KG chunks (kg-relation-evidence).** KG chunks are derived rows (`chunk_type` entity/relationship, no document).
+Five obligations. They are covered by the named regression tests for the existing writers and readers; a new
+writer must preserve them.
+1. Deleting a relationship deletes its chunk, vector and FTS row in the same transaction (`deleteRelations`;
+   `test/kg-delete-relation.test.mjs`).
+2. `confidence` inside relationship chunk metadata is a display copy; `updateRelations` refreshes it in place and
+   never re-embeds (`test/kg-confidence-copy.test.mjs`).
+3. Evidence-v1 chunks (`generateRelationEvidenceChunks(items, { formatVersion: 'evidence-v1' })`, manager method
+   only, not an MCP tool) cite document chunk codepoint ranges and active observation revisions. `items` is the
+   whole set S: on success every relationship chunk is replaced by S's chunks, entity chunks and relationship rows
+   stay, `items=[]` leaves no relationship chunk. Any writer that changes a cited observation or document collects
+   the citing chunks from evidence metadata BEFORE mutating and deletes them in the same transaction —
+   `mutateEntityAndInvalidate(entityId, (kg) => …)` hands observation writers `kg.collect(ids)` / `kg.mark(rowids)`;
+   document writers call `collectEvidenceRowidsCitingDocument` (`test/kg-evidence-invalidation.test.mjs`). No
+   automatic evidence regeneration is scheduled: the chunk stays absent until the caller explicitly generates again
+   (the missing-vector backfill only re-embeds rows that still exist; it never recreates metadata).
+4. KG vectors are written only through `writeKgVectorIfCurrent` (dedicated path and backfill): chunk id, text hash,
+   comparison value (fingerprint, or legacy source identity + body hash) and the profile current when inference
+   started must all still hold; `null` is never equal. A profile change before inference starts embeds under the new
+   profile; a change during inference drops the result. A failed full regeneration leaves the previous snapshot
+   intact; no partial replacement is published (`test/kg-embed-cas.test.mjs`, `test/kg-evidence-cas.test.mjs`).
+5. `getDetailedContext` branches on `chunk_type`; `full_context_available` means "body resolvable", not "evidence
+   verified" (`evidence_status`) (`test/kg-detail-context.test.mjs`).
+The no-argument `generateKnowledgeGraphChunks()` keeps the previous entity/triplet bodies, IDs, metadata and counts
+(the fixes above still apply); calling it replaces existing evidence relationship chunks with triplet chunks
+(`test/kg-defaults.test.mjs`).
+The fingerprint serialisation (positional JSON array, evidence in input order, ranges included, sorted source tuples,
+`null` for an absent hash, UTF-8, SHA-256 hex) is fixed in `src/kg/relation-evidence.ts`;
+`test/kg-evidence-core.test.mjs` pins golden values — changing it is a format change.
+
 ---
 
 ## 3. Conventions
@@ -395,7 +434,7 @@ tests = `node:assert/strict` in `.test.mjs`, no runner.
 | Add an MCP tool | the four edits in §1 |
 | Change observation behaviour | `src/observations/lifecycle.ts` + the calling writer in `index.ts`, inside `mutateEntityAndInvalidate` (or, if already in a transaction, `rebuildProjection` + `invalidateDerivedForEntity`) |
 | Add a test | new `test/*.test.mjs` + wire into `verify:engine` |
-| Verify | `npm test > <logfile> 2>&1; echo "EXIT:$?"` — never pipe, and set `RAG_MEMORY_REALDATA_DB` to a pre-v13 copy to include the real-data regression |
+| Verify | `npm test > <logfile> 2>&1` as the LAST command, so the harness sees npm's own exit code (an `echo` after it exits 0 even when tests fail) — never pipe, and set `RAG_MEMORY_REALDATA_DB` to a pre-v13 copy to include the real-data regression |
 
 ---
 
