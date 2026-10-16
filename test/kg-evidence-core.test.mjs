@@ -70,4 +70,21 @@ assert.equal(kgComparisonValue({ ...evRow, metadata: JSON.stringify({ ...meta, e
 assert.equal(kgComparisonValue({ ...evRow, metadata: JSON.stringify({ ...meta, input_fingerprint: undefined }) }), null, 'missing fingerprint is never equal');
 assert.equal(kgComparisonValue({ ...evRow, relationship_id: 'r9' }), null, 'metadata of another relationship is never equal');
 assert.deepEqual(captureKgEmbedInput(legacyRel, 3), { rowid: 7, chunk_id: 'kg_relationship_r1', text_sha256: sha256Utf8('a b c'), cmp, profile_id: 3 });
+// I1: absent / null / string hashes under one kind+ref sort the same whatever the input order
+const srcA = { source_kind: 'k', source_ref: 'r' }, srcN = { source_kind: 'k', source_ref: 'r', source_hash: null }, srcS = { source_kind: 'k', source_ref: 'r', source_hash: 'a' };
+const obsWith = (sources) => ({ ...obs, sources });
+const o1 = { ...base, refs: [obsWith([srcA, srcN, srcS])] }, o2 = { ...base, refs: [obsWith([srcS, srcN, srcA])] }, o3 = { ...base, refs: [obsWith([srcS, srcA, srcN])] };
+assert.equal(fingerprintSerialization(o1), fingerprintSerialization(o2));
+assert.equal(fingerprintSerialization(o1), fingerprintSerialization(o3));
+assert.equal(computeInputFingerprint(o1), computeInputFingerprint(o2));
+assert.ok(fingerprintSerialization(o1).includes('[["k","r",null],["k","r",null],["k","r","a"]]'), 'null sorts before the string');
+assert.ok(compareSourceTuples(srcA, srcS) < 0 && compareSourceTuples(srcS, srcA) > 0 && compareSourceTuples(srcA, srcN) === 0);
+
+// I2: a null relationship_id row is never equal even when its metadata is self-consistent with null
+const badMeta = { ...meta, relationship_id: null };
+badMeta.input_fingerprint = fingerprintFromMetadata(badMeta, 1);
+assert.equal(kgComparisonValue({ ...legacyRel, relationship_id: null, metadata: JSON.stringify(badMeta) }), null, 'rejected for the missing id, not a fingerprint mismatch');
+const goodMeta = { ...meta, relationship_id: 'r1' };
+goodMeta.input_fingerprint = fingerprintFromMetadata(goodMeta, 1);
+assert.equal(kgComparisonValue({ ...legacyRel, metadata: JSON.stringify(goodMeta) }), `fp:${goodMeta.input_fingerprint}`, 'control: same construction with a valid id');
 console.log('kg-evidence-core: ALL PASS');

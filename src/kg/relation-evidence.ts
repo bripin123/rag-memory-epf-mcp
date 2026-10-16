@@ -78,10 +78,13 @@ export function compareSourceTuples(a: SourceTuple, b: SourceTuple): number {
   const c = (x: string, y: string) => (x < y ? -1 : x > y ? 1 : 0);
   if (a.source_kind !== b.source_kind) return c(a.source_kind, b.source_kind);
   if (a.source_ref !== b.source_ref) return c(a.source_ref, b.source_ref);
-  if (a.source_hash === b.source_hash) return 0;
-  if (a.source_hash === null) return -1;
-  if (b.source_hash === null) return 1;
-  return c(a.source_hash, b.source_hash);
+  // An absent hash is null (global constraints): normalise here so undefined vs 'a' is not a tie.
+  const ah = a.source_hash ?? null;
+  const bh = b.source_hash ?? null;
+  if (ah === bh) return 0;
+  if (ah === null) return -1;
+  if (bh === null) return 1;
+  return c(ah, bh);
 }
 
 function int(v: unknown, what: string): number {
@@ -145,7 +148,12 @@ export function kgComparisonValue(row: KgChunkRow): string | null {
     if (meta.kg_format !== EVIDENCE_FORMAT || row.chunk_type !== 'relationship') return null;
     const m = meta as unknown as EvidenceChunkMetadataV1;
     if (typeof m.input_fingerprint !== 'string' || typeof m.fingerprint_profile_id !== 'number') return null;
+    // A row without a source id is never equal (D2⑤), even if its metadata agrees with that null.
+    if (typeof row.relationship_id !== 'string' || row.relationship_id === '') return null;
     if (m.relationship_id !== row.relationship_id) return null;
+    for (const k of [m.source_entity_id, m.target_entity_id, m.source_entity, m.target_entity, m.relation_type]) {
+      if (typeof k !== 'string' || k === '') return null;
+    }
     try {
       if (fingerprintFromMetadata(m, m.fingerprint_profile_id) !== m.input_fingerprint) return null;
     } catch { return null; }
