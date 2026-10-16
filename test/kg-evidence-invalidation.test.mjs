@@ -86,9 +86,12 @@ try {
     const s = await m.hybridSearch('zqxquote73', 10, false);
     searchMode(s, label, partialOk);
     defect(!s.results.some(x => x.chunk_id === CHUNK), `${label}: hybridSearch still returns it`);
-    let detail = 'resolved';
-    try { await m.getDetailedContext(CHUNK); } catch (e) { detail = /not found/.test(e.message) ? 'not-found' : `error: ${e.message}`; }
-    defect(detail === 'not-found', `${label}: detail ${detail}`);
+    // Only "not found" is the expected absence. Detail returning normally = the stale body is still
+    // readable (RED); any other error is re-thrown so redCase classifies it ERROR, never RED (review I2).
+    let detailResolved = false;
+    try { await m.getDetailedContext(CHUNK); detailResolved = true; }
+    catch (e) { if (!/not found/.test(String(e?.message))) throw e; }
+    defect(!detailResolved, `${label}: detail still resolves`);
   };
   // One writer = one C1 case; `after` restores the fixture whatever the verdict.
   const writerCase = async (name, { token = 'zqxnewfact74', act, after, partialOk = false }) => {
@@ -243,6 +246,7 @@ try {
         outcomes = Object.fromEntries(['chunkDocument', 'generateRelationEvidenceChunks', 'deleteDocument'].map((k, i) =>
           [k, settled[i].status === 'fulfilled' ? 'fulfilled' : `rejected: ${settled[i].reason?.code ?? ''} ${settled[i].reason?.message ?? settled[i].reason}`.trim()]));
         console.log(`    C→G→A outcomes: ${JSON.stringify(outcomes)}`);
+        fixture(settled[0].status === 'fulfilled' && settled[2].status === 'fulfilled', 'chunkDocument and deleteDocument both completed');
         fixture(one(`SELECT count(*) n FROM documents WHERE id = 'inv-doc'`).n === 0, 'deleteDocument removed the document');
         const citing = evidenceCitingDoc();
         defect(citing.length === 0, `evidence citing the deleted document survived: ${citing.join(', ')}`);
@@ -291,6 +295,52 @@ try {
   await failureCase('deleteDocument: the documents DELETE fails', {
     ...trigger(`CREATE TEMP TRIGGER t7_inject BEFORE DELETE ON main.documents WHEN OLD.id = 'inv-doc' BEGIN SELECT RAISE(ABORT, 't7 injected source failure'); END`),
     call: () => m.deleteDocument('inv-doc'), pattern: /t7 injected source failure/ });
+
+  // ---- review I1: coverage after storeDocument / deleteDocument ----
+  // The coordinator caches the coverage snapshot. A primitive that removes chunks and evidence must
+  // invalidate it after its commit, or coverage and search_mode report the pre-change totals. Setup: one
+  // unembedded document chunk (re-chunk) + one embedded evidence chunk citing it, read once so 1/2 is
+  // cached; then the writer removes both (real total 0 -> 100%). The test never clears the cache itself.
+  const realCoverage = () => {
+    const total = one(`SELECT count(*) n FROM chunk_metadata`).n;
+    const embedded = one(`SELECT count(*) n FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid WHERE m.provenance_state IN ('verified','legacy_assumed')`).n;
+    return { total, embedded, pct: total > 0 ? Math.round((embedded / total) * 100) : 100 };
+  };
+  const coverageCase = async (name, call) => {
+    await redCase(`I1 coverage and search_mode match the real totals right after ${name}`, {
+      control: async () => {
+        await resetDoc();
+        await m.chunkDocument('inv-doc');
+        // test harness: cancel the debounced backfill kick so it cannot embed the chunk (and refresh the
+        // snapshot) behind the writer — the RED must come from the writer, not from timer luck.
+        if (m.coordinator?.kickTimer) { clearTimeout(m.coordinator.kickTimer); m.coordinator.kickTimer = null; }
+        await m.generateRelationEvidenceChunks(items('zqxnewfact74'), F);
+        m.embeddingCache = new Map();
+        await m.embedKnowledgeGraphChunks();
+        const s = await m.hybridSearch('zqxquote73', 10, false);   // caches the snapshot
+        const real = realCoverage();
+        assert.deepEqual([real.total, real.embedded], [2, 1], 'control: one unembedded document chunk + one embedded evidence chunk');
+        assert.equal(s.search_mode, 'hybrid-partial', 'control: the partial state is visible');
+        assert.equal(s.coverage.chunk_pct, 50, 'control: cached chunk_pct 50');
+        const c = m.coordinator.coverage();
+        assert.deepEqual([c.chunk.total, c.chunk.embedded], [2, 1], 'control: the snapshot holds 1/2');
+      },
+      defect: async () => {
+        await call();
+        const real = realCoverage();
+        fixture(real.total === 0, `the writer removed the chunk and the evidence (real total ${real.total})`);
+        const c = m.coordinator.coverage();
+        defect(c.chunk.total === real.total && c.chunk.embedded === real.embedded,
+          `coverage() reports ${c.chunk.embedded}/${c.chunk.total}, real ${real.embedded}/${real.total} (stale snapshot)`);
+        const s = await m.hybridSearch('zqxquote73', 10, false);
+        defect(s.coverage.chunk_pct === real.pct, `search envelope chunk_pct ${s.coverage.chunk_pct}, real ${real.pct}`);
+        defect(s.search_mode === 'hybrid', `search_mode ${s.search_mode} with no unembedded chunk left`);
+      },
+    });
+    try { await resetDoc(); } catch (e) { process.exitCode = 1; console.log(`  ERROR fixture restore after I1 ${name}: ${e?.message}`); }
+  };
+  await coverageCase('storeDocument', () => m.storeDocument('inv-doc', DOC, {}));
+  await coverageCase('deleteDocument', async () => { fixture((await m.deleteDocument('inv-doc')).deleted === true, 'the document was deleted'); });
 
   // confidence-only update: metadata refreshed, zero re-embeds, fingerprint unchanged
   { const r = await fresh('zqxnewfact74');

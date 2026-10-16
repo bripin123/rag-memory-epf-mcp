@@ -3059,6 +3059,9 @@ export class RAGKnowledgeGraphManager {
       `).run(id, content, metadataJson);
       return c;
     })();
+    // R-B item 6 (review I1): only after the commit succeeded — chunks and evidence were removed, so the
+    // cached coverage snapshot is stale. A rollback throws above and never reaches this.
+    this.coordinator?.invalidateCoverage();
 
     console.error(`✅ Document stored: ${id}`);
     return { id, stored: true, replaced: existed, deletedChunks: cleaned.deletedChunks };
@@ -3658,6 +3661,8 @@ export class RAGKnowledgeGraphManager {
           DELETE FROM documents WHERE id = ?
         `).run(documentId);
       })();
+      // R-B item 6 (review I1): after the successful commit only (a rollback throws above).
+      this.coordinator?.invalidateCoverage();
       
       if (result.changes > 0) {
         console.error(`✅ Document '${documentId}' deleted successfully`);
