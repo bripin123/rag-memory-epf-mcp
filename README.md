@@ -154,7 +154,7 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
-### Unreleased — kg-relation-evidence (version and publish: owner)
+### v6.4.1 (2026-10-16)
 
 - **Changed — new opt-in manager method `generateRelationEvidenceChunks(items, { formatVersion: 'evidence-v1' })`.**
   `items` is the whole set of relationships that should have a relationship chunk: on success every relationship KG
@@ -178,6 +178,13 @@ storeDocument(id, content, metadata)
 - **Changed — a failed KG replacement leaves the previous snapshot intact; no partial replacement is published. A KG
   embedding computed for an input that changed meanwhile (text, evidence fingerprint or profile) is dropped,** on the
   dedicated path and in background backfill. A profile change before inference starts embeds under the new profile.
+  An evidence row whose reference list is empty or malformed is never written back.
+- **Changed — `importGraph` requires string ids for documents and observation sources.** A `documents[i].id` or an
+  `observation_sources[i].observation_id` that is not a string (a number, `null`, or missing) rejects the whole import
+  before anything is written. Previously such a value was bound as-is: a number such as `7.5` could replace the
+  document whose TEXT id is `'7.5'` while the evidence chunks citing it stayed in search.
+- **Fixed — `deleteEntities` refreshes cached coverage** after at least one entity was deleted, so the coverage figures
+  and `search_mode` reported by `hybridSearch` and stats reflect the deletion without waiting for another write.
 - **Changed — oversize blocks split faster.** An oversize block that reaches the fallback split is split using a
   verified token-window estimate, with the previous linear scan kept when no candidate verifies (C6 numbers: framework
   receipts `raw/measurements/2026-10-16-kg-relation-evidence/C6-BENCH.md`, one synthetic input per size on one Mac,

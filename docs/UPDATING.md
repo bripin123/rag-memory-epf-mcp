@@ -108,6 +108,16 @@ path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
 is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
 the next start becomes a clean download owner.
 
+## v6.4.1 (schema v14, unchanged): evidence-backed relationship chunks (opt-in), KG lifecycle fixes, faster oversize split
+
+**What changes for an existing database.** Nothing is migrated and search defaults are unchanged (the 113-query
+parity run on a frozen real project database returned the same ids, scores and field types as 6.4.0). Documents
+chunked from now on are stamped `fallback=cp-window-N`; documents stamped `cp-exact-N` by 6.4.0 stay current format
+and an unchanged-content sync does not re-chunk them. KG chunks for a deleted relationship or a changed cited source
+now leave search in the same transaction. **`importGraph` now refuses non-string document ids and
+observation-source ids** (the whole import, nothing written) — a dump produced by `exportGraph` uses string ids.
+Details: README changelog.
+
 ## v6.4.0 (schema v14, unchanged): `hybridSearch` default = rank fusion, summaries opt-in
 
 (Published first as `6.4.0-rc.1` on the `next` dist-tag; promoted to `latest` after the published artifact passed a
