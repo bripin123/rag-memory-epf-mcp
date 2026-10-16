@@ -204,6 +204,25 @@ assert.ok(isCurrentFormatSignature(effectiveSignature(Number.MAX_SAFE_INTEGER - 
   const parts = splitOversize(text, poisoned, 5);
   assert.equal(parts.join(''), text, 'shrink path: lossless');
   assert.ok(parts.every(p => [...p].length < 10 && enc.encode(p).length <= 5), 'shrink path: every piece verified short and within budget');
+  // ^ with poison [10,64) every window candidate (keep 5, 4, 2 -> 28, 20, 10 cp) is rejected, so linearFit
+  //   produced those pieces. Successful shrink (REVIEW-T10 I1): poison [11,64) rejects keep 5 and 4 (28, 20 cp)
+  //   and accepts keep 2 (10 cp). Per chunk that is 1 window encode + 3 verifies = 4 encode calls; linearFit
+  //   needs >= 26 (10 fitting probes + LOOKAHEAD 16 misses). Output invariants alone cannot tell the two paths
+  //   apart (both yield 10-cp pieces), so the call bound is what fails if the shrunk candidate is not taken.
+  {
+    let calls = 0;
+    const poison11 = { encode: (s) => { calls++; const t = enc.encode(s); const n = [...s].length; return n >= 11 && n < 64 ? Uint32Array.from([...t, ...new Array(100).fill(0)]) : t; },
+                       decode: (t) => enc.decode(t) };
+    const text11 = 'abcdefghij'.repeat(300);
+    const shrunk = splitOversize(text11, poison11, 5);
+    const used = calls;
+    assert.equal(shrunk.join(''), text11, 'successful shrink: lossless');
+    assert.ok(shrunk.every(p => [...p].length === 10 && enc.encode(p).length <= 5), 'successful shrink: every piece is 10 cp and within the real budget');
+    assert.ok(used <= 5 * shrunk.length,
+      `successful shrink: ${used} encode calls for ${shrunk.length} chunks (${(used / shrunk.length).toFixed(1)}/chunk) exceeds 5/chunk — the shrunk candidate was not taken (linearFit needs >= 26/chunk)`);
+    assert.deepEqual(splitOversize(text11, poison11, 5), shrunk, 'successful shrink: deterministic');
+    console.log(`fallback ok: successful shrink (${used} encode calls / ${shrunk.length} chunks)`);
+  }
   // linear fallback: a decode that yields no bytes gives no window candidate; the old scan takes over
   const blind = { encode: (s) => enc.encode(s), decode: () => new Uint8Array(0) };
   const linearRef = (block, max) => {          // the 6.4.0 algorithm, restated as the oracle
