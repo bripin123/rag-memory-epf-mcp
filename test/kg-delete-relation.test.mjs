@@ -11,6 +11,7 @@ try {
   const db = m.db;
   const one = (sql, ...p) => db.prepare(sql).get(...p);
   installFakeEmbedder(m);
+  await m.startReconciliation(); // fresh DB -> 'n/a', opens the coordinator eligibility barrier so vector search runs
   await m.createEntities([
     { name: 'Zqxdel Source', entityType: 'CONCEPT', observations: ['[2026-01-01] source side'] },
     { name: 'Zqxdel Target', entityType: 'CONCEPT', observations: ['[2026-01-01] target side'] },
@@ -30,6 +31,7 @@ try {
       assert.equal(vecAt(rowid), 1, 'control: the chunk has a vector');
       assert.ok(ftsRowids('feeds').includes(rowid), 'control: FTS finds the chunk');
       const r = await m.hybridSearch('feeds', 10, false);
+      assert.equal(r.search_mode, 'hybrid', 'control: vector side active (not fts-only)');
       assert.ok(r.results.some(x => x.chunk_id === chunkId), 'control: hybridSearch returns the chunk');
     },
     defect: async () => {

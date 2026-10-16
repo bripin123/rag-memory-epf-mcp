@@ -14,6 +14,7 @@ try {
   const db = m.db;
   const one = (sql, ...p) => db.prepare(sql).get(...p);
   const counter = installFakeEmbedder(m);
+  await m.startReconciliation(); // fresh DB -> 'n/a', opens the coordinator eligibility barrier so vector search runs
   await m.createEntities([
     { name: 'Conf Left', entityType: 'CONCEPT', observations: ['[2026-01-01] left'] },
     { name: 'Conf Right', entityType: 'CONCEPT', observations: ['[2026-01-01] right'] },
@@ -30,6 +31,7 @@ try {
       assert.equal(JSON.parse(row().metadata).confidence, 1, 'control: generated copy = 1.0');
       assert.equal(vecAt(row().rowid), 1, 'control: vector present');
       const s = await m.hybridSearch('trusts', 10, false);
+      assert.equal(s.search_mode, 'hybrid', 'control: vector side active (not fts-only)');
       assert.ok(s.results.some(x => x.chunk_id === chunkId), 'control: the relationship chunk is retrievable before the update');
     },
     defect: async () => {

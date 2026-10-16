@@ -55,3 +55,46 @@ export function deleteKgRelationshipChunks(db: Database.Database, relationshipId
   }
   return n;
 }
+
+// kg-relation-evidence D2: the one place that removes KG chunk rows by rowid. A rowid that is not a
+// KG row (or no longer exists) is skipped BEFORE anything is deleted, so a rowid reused by a document
+// chunk never loses its vector. Order: vector (vec0 needs a literal integer rowid), entity links,
+// metadata (the chunks_fts delete trigger fires on the metadata row). Callers already inside a
+// transaction pass rowids they collected before mutating the source.
+export function deleteKgChunkRows(db: Database.Database, rowids: number[]): number {
+  let n = 0;
+  for (const raw of new Set(rowids)) {
+    const rowid = Number(raw);
+    if (!Number.isInteger(rowid) || rowid < 0) throw new Error(`Invalid rowid: ${raw}`);
+    const row = db.prepare(`SELECT chunk_type FROM chunk_metadata WHERE rowid = ?`).get(rowid) as { chunk_type: string | null } | undefined;
+    if (!row || (row.chunk_type !== 'entity' && row.chunk_type !== 'relationship')) continue;
+    db.exec(`DELETE FROM chunks WHERE rowid = ${rowid}`);
+    db.prepare(`DELETE FROM chunk_entities WHERE chunk_rowid = ?`).run(rowid);
+    n += db.prepare(`DELETE FROM chunk_metadata WHERE rowid = ?`).run(rowid).changes;
+  }
+  return n;
+}
+
+// kg-relation-evidence D2②: relationship KG chunks (triplet and evidence-v1) carry a DISPLAY copy of
+// `confidence` (index.ts:2319-2324). It is not a search input, so refresh it in place: the body, the
+// input_hash and the vector stay, and kg_format / evidence_refs / input_fingerprint are never touched.
+// The narrowed FTS trigger (migration 12) fires only on text/chunk_id, so this does not reindex.
+export function refreshKgRelationshipConfidence(db: Database.Database, relationshipId: string): number {
+  const rel = db.prepare(`SELECT confidence FROM relationships WHERE id = ?`).get(relationshipId) as { confidence: number } | undefined;
+  if (!rel) return 0;
+  const rows = db.prepare(
+    `SELECT rowid, metadata FROM chunk_metadata WHERE chunk_type = 'relationship' AND relationship_id = ?`
+  ).all(relationshipId) as Array<{ rowid: number; metadata: string | null }>;
+  let n = 0;
+  for (const r of rows) {
+    let meta: unknown;
+    try { meta = JSON.parse(r.metadata ?? '{}'); } catch { continue; }   // malformed: the reader reports it
+    if (!meta || typeof meta !== 'object') continue;
+    const m = meta as Record<string, unknown>;
+    if (m.confidence === rel.confidence) continue;
+    m.confidence = rel.confidence;
+    db.prepare(`UPDATE chunk_metadata SET metadata = ? WHERE rowid = ?`).run(JSON.stringify(m), r.rowid);
+    n++;
+  }
+  return n;
+}

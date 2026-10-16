@@ -30,7 +30,7 @@ import { getAllMCPTools, validateToolArgs, getSystemInfo } from './src/tools/too
 // Import migration system
 import { MigrationManager } from './src/migrations/migration-manager.js';
 import { backupBeforeMigration } from './src/backup/preflight.js';
-import { rebuildProjection, deleteStaleKgChunks, deleteKgRelationshipChunks } from './src/observations/projection.js';
+import { rebuildProjection, deleteStaleKgChunks, deleteKgRelationshipChunks, deleteKgChunkRows, refreshKgRelationshipConfidence } from './src/observations/projection.js';
 import { addRevision, correctRevision, transitionStatus, linkSources,
          nextProjectionOrder, type SourceInput } from './src/observations/lifecycle.js';
 import { getObservationHistory } from './src/observations/history.js';
@@ -1505,11 +1505,22 @@ export class RAGKnowledgeGraphManager {
       const sourceId = `entity_${relation.from.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
       const targetId = `entity_${relation.to.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
 
-      this.db.prepare(`
-        DELETE FROM relationships
-        WHERE source_entity = ? AND target_entity = ? AND relationType = ?
-      `).run(sourceId, targetId, relation.relationType);
+      // D2① (kg-relation-evidence): the KG chunk is keyed by relationship_id, so capture the ids
+      // BEFORE the DELETE and remove chunk, vector and FTS row in the same transaction as the row.
+      // 6.4.0 deleted only the row and the chunk stayed searchable (test/kg-delete-relation.test.mjs).
+      this.db.transaction(() => {
+        const ids = this.db!.prepare(`
+          SELECT id FROM relationships
+          WHERE source_entity = ? AND target_entity = ? AND relationType = ?
+        `).all(sourceId, targetId, relation.relationType) as Array<{ id: string }>;
+        deleteKgRelationshipChunks(this.db!, ids.map(r => r.id));
+        this.db!.prepare(`
+          DELETE FROM relationships
+          WHERE source_entity = ? AND target_entity = ? AND relationType = ?
+        `).run(sourceId, targetId, relation.relationType);
+      })();
     }
+    this.coordinator?.invalidateCoverage();
   }
 
   async updateRelations(updates: { from: string; to: string; relationType: string; confidence?: number; metadata?: Record<string, any> }[]): Promise<{ updated: number; notFound: number }> {
@@ -1551,9 +1562,14 @@ export class RAGKnowledgeGraphManager {
       }
 
       values.push(relationId);
-      this.db.prepare(`
-        UPDATE relationships SET ${setClauses.join(', ')} WHERE id = ?
-      `).run(...values);
+      // D2② (kg-relation-evidence): the copied display confidence in the KG chunk is refreshed in the
+      // same transaction; body unchanged, so no re-embed (test/kg-confidence-copy.test.mjs).
+      this.db.transaction(() => {
+        this.db!.prepare(`
+          UPDATE relationships SET ${setClauses.join(', ')} WHERE id = ?
+        `).run(...values);
+        if (update.confidence !== undefined) refreshKgRelationshipConfidence(this.db!, relationId);
+      })();
       updated++;
     }
 
