@@ -1,0 +1,21 @@
+{
+  "generated_from": "rag-memory-epf-mcp 6.4.0 (7ac45b3) dist",
+  "text_sha256": "79ed69e34ff37cb34fab8c3ba124757e87e0df61420176aa2c56116b9dd3e817",
+  "segments": [
+    {
+      "start_pos": 0,
+      "end_pos": 2601,
+      "text_sha256": "f1e564b8d2c1fa485bca5f926e6758a16e740052844f190fa4c643c643fb631c"
+    },
+    {
+      "start_pos": 2601,
+      "end_pos": 4985,
+      "text_sha256": "3beb8ecfa40f88be84c136575f5543f3c8b1cbb91f3a7a613c09ab74d8e4f6b7"
+    },
+    {
+      "start_pos": 4985,
+      "end_pos": 7457,
+      "text_sha256": "7253357d9c2783de4b63c8ecb5321624cbbc2a2f2c5ceb489727aa334783dc1e"
+    }
+  ]
+}
