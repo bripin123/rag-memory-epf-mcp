@@ -151,8 +151,13 @@ export function kgComparisonValue(row: KgChunkRow): string | null {
     // A row without a source id is never equal (D2⑤), even if its metadata agrees with that null.
     if (typeof row.relationship_id !== 'string' || row.relationship_id === '') return null;
     if (m.relationship_id !== row.relationship_id) return null;
-    for (const k of [m.source_entity_id, m.target_entity_id, m.source_entity, m.target_entity, m.relation_type]) {
+    // Identifiers must be non-empty; names and the raw type are stored as-is and may legitimately be
+    // empty strings (the engine accepts them), so for those only a non-string is "missing".
+    for (const k of [m.source_entity_id, m.target_entity_id]) {
       if (typeof k !== 'string' || k === '') return null;
+    }
+    for (const k of [m.source_entity, m.target_entity, m.relation_type]) {
+      if (typeof k !== 'string') return null;
     }
     try {
       if (fingerprintFromMetadata(m, m.fingerprint_profile_id) !== m.input_fingerprint) return null;

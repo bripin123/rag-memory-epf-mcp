@@ -87,4 +87,13 @@ assert.equal(kgComparisonValue({ ...legacyRel, relationship_id: null, metadata: 
 const goodMeta = { ...meta, relationship_id: 'r1' };
 goodMeta.input_fingerprint = fingerprintFromMetadata(goodMeta, 1);
 assert.equal(kgComparisonValue({ ...legacyRel, metadata: JSON.stringify(goodMeta) }), `fp:${goodMeta.input_fingerprint}`, 'control: same construction with a valid id');
+// N1: empty names / raw type are present, not missing; non-string names are missing
+const selfConsistent = (patch) => { const mm = { ...goodMeta, ...patch }; mm.input_fingerprint = fingerprintFromMetadata(mm, 1); return mm; };
+const rowOf = (mm) => ({ ...legacyRel, metadata: JSON.stringify(mm) });
+for (const patch of [{ source_entity: '' }, { target_entity: '' }, { relation_type: '' }]) {
+  const mm = selfConsistent(patch);
+  assert.equal(kgComparisonValue(rowOf(mm)), `fp:${mm.input_fingerprint}`, `empty string allowed: ${Object.keys(patch)[0]}`);
+}
+assert.equal(kgComparisonValue(rowOf(selfConsistent({ source_entity: null }))), null, 'null name is missing');
+assert.equal(kgComparisonValue(rowOf(selfConsistent({ source_entity_id: '' }))), null, 'empty identifier is missing');
 console.log('kg-evidence-core: ALL PASS');
