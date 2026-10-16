@@ -11,10 +11,14 @@ import { redCase, defect, fixture } from './helpers/red-case.mjs';
 
 const sha = (s) => createHash('sha256').update(s, 'utf8').digest('hex');
 const { manager: m, cleanup } = await makeManager();
+const { setKgFaultPoint } = await import('../dist/index.js');
 try {
   const db = m.db;
   const one = (sql, ...p) => db.prepare(sql).get(...p);
   installFakeEmbedder(m);
+  // Fresh DB -> reconciliation 'n/a' opens the coordinator eligibility barrier, so hybridSearch runs its
+  // vector side; without it every search control below would be FTS-only (C1 control strength, D2⑤).
+  await m.startReconciliation();
   const baseEmbed = m.gate.embedFn;
   // Run fn once, the first time `text` reaches the model; everything else embeds normally.
   const during = (text, fn) => {
@@ -59,7 +63,12 @@ try {
     await paths[path](r.rowid);
     assert.equal(vecAt(r.rowid), 1, `control(${path}): a normal embedding writes a vector`);
     assert.ok(ftsRowids('guards').includes(r.rowid), `control(${path}): FTS finds the chunk`);
-    assert.ok((await m.hybridSearch('guards', 10, false)).results.some(x => x.chunk_id === relChunk), `control(${path}): hybridSearch returns it`);
+    const res = await m.hybridSearch('guards', 10, false);
+    // Vector side must be active (not fts-only). The backfill control embeds only this one chunk, so the
+    // two entity chunks stay vectorless and the engine reports 'hybrid-partial' (index.ts search_mode:
+    // chunk coverage < 100%); the dedicated control embeds every KG row -> 'hybrid'.
+    assert.equal(res.search_mode, path === 'dedicated' ? 'hybrid' : 'hybrid-partial', `control(${path}): vector side active (not fts-only)`);
+    assert.ok(res.results.some(x => x.chunk_id === relChunk), `control(${path}): hybridSearch returns it`);
   };
   const cases = [
     { name: '⑤ dedicated: chunk deleted during inference -> no orphan vector', path: 'dedicated',
@@ -114,11 +123,95 @@ try {
       try { await m.generateKnowledgeGraphChunks(); } catch (e) { threw = e; } finally { db.exec(`DROP TRIGGER IF EXISTS c1_fail_kg_insert`); }
       fixture(threw && /c1 injected KG insert failure/.test(threw.message), 'the injected insert failure fired');
       defect(snap() === before, 'a failed regeneration changed the published KG (old chunks or vectors gone, partial rows published)');
-      defect((await m.hybridSearch('guards', 10, false)).results.some(x => x.chunk_id === relChunk), 'the previously retrievable chunk is no longer retrievable');
+      const res = await m.hybridSearch('guards', 10, false);
+      fixture(res.search_mode === 'hybrid', 'vector side active (not fts-only)');
+      defect(res.results.some(x => x.chunk_id === relChunk), 'the previously retrievable chunk is no longer retrievable');
+      // Vector side, not FTS alone (D2⑤): the surviving chunk must still carry its vector.
+      const kept = relRow();
+      defect(kept !== undefined && vecAt(kept.rowid) === 1, 'the previously retrievable chunk lost its vector');
       await m.deleteRelations([{ from: 'Cas Right', to: 'Cas Left', relationType: 'WARNS' }]);
     },
   });
   restore();
-  // TASK4-APPEND (Task 4 inserts its positive / atomicity / document-regression block here)
+  // Own reset (Task 1 review): the case above skips its cleanup when its RED throws, so the WARNS
+  // relation (and its KG chunk) may still be there. Remove it, then start from a fresh generation.
+  if (one(`SELECT count(*) n FROM relationships WHERE relationType = 'WARNS'`).n > 0) {
+    await m.deleteRelations([{ from: 'Cas Right', to: 'Cas Left', relationType: 'WARNS' }]);
+  }
+  db.exec(`DROP TRIGGER IF EXISTS c1_fail_kg_insert`);
+  await fresh();
+  // ---- Task 4: positive controls (C5), atomic regeneration (D2⑤), document path regression ----
+  {
+    await fresh();
+    const res = await m.embedKnowledgeGraphChunks();
+    const rows = db.prepare(`SELECT rowid, text, input_hash, profile_id, provenance_state FROM chunk_metadata WHERE chunk_type IN ('entity','relationship')`).all();
+    assert.equal(res.embeddedChunks, rows.length, 'every legacy KG row embedded by the dedicated path');
+    assert.equal(res.discardedChunks, undefined, 'nothing discarded when nothing changed');
+    for (const x of rows) {
+      assert.equal(vecAt(x.rowid), 1); assert.equal(x.provenance_state, 'verified');
+      assert.equal(x.profile_id, p1); assert.equal(x.input_hash, sha(x.text));
+    }
+    console.log('  PASS C5 positive: legacy entity/triplet rows embedded by the dedicated path');
+  }
+  {
+    await fresh();
+    for (const x of db.prepare(`SELECT rowid FROM chunk_metadata WHERE chunk_type IN ('entity','relationship')`).all()) {
+      assert.equal(await m.reembedChunkByRowid(x.rowid), true, `backfill wrote rowid ${x.rowid}`);
+      assert.equal(vecAt(x.rowid), 1);
+    }
+    console.log('  PASS C5 positive: legacy entity/triplet rows embedded by the backfill callback');
+  }
+  {
+    await fresh(); await m.embedKnowledgeGraphChunks();
+    await m.createRelations([{ from: 'Cas Right', to: 'Cas Left', relationType: 'WATCHES' }]);
+    const snap = () => JSON.stringify({
+      meta: db.prepare(`SELECT rowid, chunk_id, text, metadata FROM chunk_metadata WHERE chunk_type IN ('entity','relationship') ORDER BY rowid`).all(),
+      vec: db.prepare(`SELECT rowid FROM chunks ORDER BY rowid`).all(),
+    });
+    const before = snap();
+    setKgFaultPoint('kg-generate-mid', () => { throw new Error('injected mid-generation failure'); });
+    try { await assert.rejects(() => m.generateKnowledgeGraphChunks(), /injected mid-generation failure/); }
+    finally { setKgFaultPoint(null, null); }
+    assert.equal(snap(), before, 'a failed regeneration changed the published KG');
+    console.log('  PASS ⑤ mid-generation failure publishes nothing (old KG and vectors intact)');
+  }
+  {
+    // R5: the embedding cache key has no profile (index.ts:2644-2654). Fill the cache under P1, then switch
+    // to profile P2 with a model whose output is distinguishable; the stored vector must be the P2 model's
+    // output, not the cached P1 vector relabelled P2 — on both KG write paths.
+    const vecOf = (rowid) => new Float32Array(Uint8Array.from(one(`SELECT embedding FROM chunks WHERE rowid = ${Number(rowid)}`).embedding).buffer);
+    for (const path of ['dedicated', 'backfill']) {
+      const r = await fresh();
+      await m.embedKnowledgeGraphChunks();                        // P1 vectors computed and CACHED
+      assert.equal(vecAt(r.rowid), 1);
+      db.exec(`DELETE FROM chunks WHERE rowid = ${Number(r.rowid)}`);   // a backfill target again; cache NOT cleared
+      let p2Calls = 0;
+      m.gate.embedFn = async (t, ...rest) => { p2Calls++; const v = await baseEmbed(t, ...rest); v[1023] = 0.777; return v; };
+      m.currentProfileId = p2;
+      try {
+        if (path === 'dedicated') await m.embedKnowledgeGraphChunks(); else assert.equal(await m.reembedChunkByRowid(r.rowid), true);
+      } finally { m.currentProfileId = p1; m.gate.embedFn = baseEmbed; }
+      assert.ok(p2Calls > 0, `${path}: the P2 model was never called — a P1 cache hit was reused`);
+      assert.ok(Math.abs(vecOf(r.rowid)[1023] - 0.777) < 1e-6, `${path}: the stored vector is not the P2 model's output`);
+      assert.equal(one(`SELECT profile_id FROM chunk_metadata WHERE rowid = ?`, r.rowid).profile_id, p2);
+      console.log(`  PASS ${path}: P1 cached, profile P2 -> P2 model output stored (R5)`);
+    }
+    restore();
+  }
+  {
+    // The document path keeps its own contract (text re-check), regression-tested separately (D2⑤).
+    await m.syncDocumentFromFile('/cas-doc.md', 'cas-doc', { content: 'Document body for the CAS regression zqxdoccas81.' });
+    const d = one(`SELECT rowid, text FROM chunk_metadata WHERE document_id = 'cas-doc'`);
+    db.exec(`DELETE FROM chunks WHERE rowid = ${Number(d.rowid)}`);
+    restore();
+    assert.equal(await m.reembedChunkByRowid(d.rowid), true, 'document row re-embedded');
+    assert.equal(vecAt(d.rowid), 1);
+    db.exec(`DELETE FROM chunks WHERE rowid = ${Number(d.rowid)}`);
+    during(d.text, () => { db.prepare(`UPDATE chunk_metadata SET text = ? WHERE rowid = ?`).run('changed during inference', d.rowid); });
+    assert.equal(await m.reembedChunkByRowid(d.rowid), false, 'document text changed during inference -> discarded');
+    assert.equal(vecAt(d.rowid), 0);
+    restore();
+    console.log('  PASS document path regression (text CAS unchanged)');
+  }
   console.log(process.exitCode ? 'kg-embed-cas: FAIL' : 'kg-embed-cas: ALL PASS');
 } finally { cleanup(); }
