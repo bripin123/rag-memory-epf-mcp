@@ -159,6 +159,11 @@ export function kgComparisonValue(row: KgChunkRow): string | null {
     for (const k of [m.source_entity, m.target_entity, m.relation_type]) {
       if (typeof k !== 'string') return null;
     }
+    // Final review A2: the reader (resolveEvidenceStatus) and every dependency lookup (collectCiting) treat
+    // an empty or malformed evidence_refs as ineligible; a row that cannot be resolved must not be
+    // comparable either, even when its stored fingerprint recomputes from that metadata.
+    const refs: unknown = m.evidence_refs;
+    if (!Array.isArray(refs) || refs.length === 0 || !refs.every(isWellFormedRef)) return null;
     try {
       if (fingerprintFromMetadata(m, m.fingerprint_profile_id) !== m.input_fingerprint) return null;
     } catch { return null; }

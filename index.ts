@@ -1424,6 +1424,7 @@ export class RAGKnowledgeGraphManager {
 
     console.error(`🗑️ Deleting entities: ${entityNames.join(', ')}`);
 
+    let anyDeleted = false;
     for (const name of entityNames) {
       const entityId = `entity_${name.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '_')}`;
 
@@ -1505,6 +1506,7 @@ export class RAGKnowledgeGraphManager {
         })(entityId);
 
         if (deleted) {
+          anyDeleted = true;
           console.error(`  └─ Deleted entity '${name}' successfully`);
         } else {
           console.warn(`⚠️ Entity '${name}' not found, skipping`);
@@ -1516,6 +1518,9 @@ export class RAGKnowledgeGraphManager {
       }
     }
 
+    // D2③ (final review A1): the committed deletes removed entity vectors and KG/evidence chunks, so the
+    // cached coverage snapshot is stale — drop it like every other D2③ writer, once, after the commits.
+    if (anyDeleted) this.coordinator?.invalidateCoverage();
     console.error(`✅ Entity deletion process completed`);
   }
 
@@ -3850,6 +3855,27 @@ export class RAGKnowledgeGraphManager {
 
     console.error(`📥 Importing knowledge graph (merge: ${options.merge !== false})...`);
 
+    // D2③ / C3 (final review I1): the evidence dependency collectors compare string ids strictly, but
+    // the INSERTs below bind whatever the dump holds, and SQLite stores a number bound to a TEXT id
+    // column as its decimal text (7.5 -> '7.5'). A numeric id could therefore replace a document, or add
+    // a source to an observation, that cited evidence names by string while the collector misses it.
+    // One id contract for writing and collecting: these two ids must be strings, checked before any
+    // write, so a violation refuses the whole import with nothing written. No numeric normalisation.
+    if (Array.isArray(data.documents)) {
+      data.documents.forEach((doc, i) => {
+        if (typeof doc?.id !== 'string') {
+          throw new Error(`importGraph: documents[${i}].id must be a string (got ${doc?.id === null ? 'null' : typeof doc?.id}); nothing was imported`);
+        }
+      });
+    }
+    if (Array.isArray(data.observation_sources)) {
+      data.observation_sources.forEach((so, i) => {
+        if (typeof so?.observation_id !== 'string') {
+          throw new Error(`importGraph: observation_sources[${i}].observation_id must be a string (got ${so?.observation_id === null ? 'null' : typeof so?.observation_id}); nothing was imported`);
+        }
+      });
+    }
+
     const imported = { entities: 0, relations: 0, documents: 0 };
     const skipped = { entities: 0, relations: 0, documents: 0 };
     // merge 로 배열 위치가 재배정된 관찰. 조용히 순서를 바꾸면 호출자가 알 수 없으므로
@@ -3951,7 +3977,8 @@ export class RAGKnowledgeGraphManager {
         VALUES (?, ?, ?, ?)
       `);
       for (const doc of data.documents) {
-        if (typeof doc?.id === 'string') for (const r of collectEvidenceRowidsCitingDocument(this.db!, doc.id)) citedEvidence.add(r);
+        // doc.id is a string here (checked above, before any write).
+        for (const r of collectEvidenceRowidsCitingDocument(this.db!, doc.id)) citedEvidence.add(r);
         const result = stmt.run(
           doc.id,
           doc.content,

@@ -202,8 +202,8 @@ assert.ok(isCurrentFormatSignature(effectiveSignature(Number.MAX_SAFE_INTEGER - 
                      decode: (t) => enc.decode(t) };
   const text = 'abcdefghij'.repeat(300);
   const parts = splitOversize(text, poisoned, 5);
-  assert.equal(parts.join(''), text, 'shrink path: lossless');
-  assert.ok(parts.every(p => [...p].length < 10 && enc.encode(p).length <= 5), 'shrink path: every piece verified short and within budget');
+  assert.equal(parts.join(''), text, 'all window candidates rejected -> linearFit fallback: lossless');
+  assert.ok(parts.every(p => [...p].length < 10 && enc.encode(p).length <= 5), 'all window candidates rejected -> linearFit fallback: every piece verified short and within budget');
   // ^ with poison [10,64) every window candidate (keep 5, 4, 2 -> 28, 20, 10 cp) is rejected, so linearFit
   //   produced those pieces. Successful shrink (REVIEW-T10 I1): poison [11,64) rejects keep 5 and 4 (28, 20 cp)
   //   and accepts keep 2 (10 cp). Per chunk that is 1 window encode + 3 verifies = 4 encode calls; linearFit
