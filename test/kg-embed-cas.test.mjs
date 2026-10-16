@@ -182,7 +182,11 @@ try {
     const vecOf = (rowid) => new Float32Array(Uint8Array.from(one(`SELECT embedding FROM chunks WHERE rowid = ${Number(rowid)}`).embedding).buffer);
     for (const path of ['dedicated', 'backfill']) {
       const r = await fresh();
-      await m.embedKnowledgeGraphChunks();                        // P1 vectors computed and CACHED
+      // Prime the P1 cache through the SAME path that is then run under P2 (review I1): priming the
+      // backfill case through the dedicated path would leave the backfill call's own cache key empty, so a
+      // dropped cacheScope on the backfill call alone would still miss the cache and pass.
+      if (path === 'dedicated') await m.embedKnowledgeGraphChunks();   // P1 vectors computed and CACHED
+      else assert.equal(await m.reembedChunkByRowid(r.rowid), true, 'backfill: P1 vector stored (and cached)');
       assert.equal(vecAt(r.rowid), 1);
       db.exec(`DELETE FROM chunks WHERE rowid = ${Number(r.rowid)}`);   // a backfill target again; cache NOT cleared
       let p2Calls = 0;
