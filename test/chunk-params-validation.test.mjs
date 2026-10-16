@@ -34,7 +34,7 @@ try {
     assert.equal(typeof c.startPos, 'number', 'char offsets exact');
   }
   assert.equal(manager.db.prepare(`SELECT chunking_signature FROM documents WHERE id='d1'`).get().chunking_signature,
-    'c1:enc=cl100k_base:max=400:overlap=0:fence=on:merge=200:fallback=cp-exact-400', 'chunkDocument stamps signature');
+    'c1:enc=cl100k_base:max=400:overlap=0:fence=on:merge=200:fallback=cp-window-400', 'chunkDocument stamps signature');
   // r12: 공개 tool description 이 runtime 계약과 어긋나면 MCP 에이전트가 공식 문서를
   // 따라 실패한다 — 비영(非0) overlap 광고 문구 금지를 계약으로 잠근다.
   const { chunkDocumentTool } = await import('../dist/src/tools/rag-tools.js');
