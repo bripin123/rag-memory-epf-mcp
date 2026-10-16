@@ -388,3 +388,43 @@ function resolveOneRef(db: Database.Database, raw: unknown, index: number): Evid
   }
   return out('mismatch');
 }
+
+// ---- D2③ dependency lookups ----
+// Dependencies are read from the evidence metadata the generator wrote, never inferred from
+// observation_sources.source_ref (a string, not an FK). A row that says evidence-v1 but cannot be
+// parsed, whose evidence_refs is not an array, or that holds ANY entry failing isWellFormedRef (the
+// same structural rule the reader uses: null, {}, an unknown kind, bad field types, malformed source
+// tuples) is returned by every lookup: it cannot be verified, so any writer that calls a lookup removes
+// it (fail-closed, REVIEW-PLAN R4).
+interface EvidenceRowView { rowid: number; refs: unknown[] | null }
+function evidenceRowViews(db: Database.Database): EvidenceRowView[] {
+  const rows = db.prepare(
+    `SELECT rowid, metadata FROM chunk_metadata WHERE chunk_type = 'relationship' AND metadata LIKE '%evidence-v1%'`
+  ).all() as Array<{ rowid: number; metadata: string | null }>;
+  const out: EvidenceRowView[] = [];
+  for (const r of rows) {
+    let m: unknown;
+    try { m = JSON.parse(r.metadata ?? 'null'); } catch { out.push({ rowid: r.rowid, refs: null }); continue; }
+    if (!m || typeof m !== 'object') { out.push({ rowid: r.rowid, refs: null }); continue; }
+    const meta = m as Record<string, unknown>;
+    if (meta.kg_format !== EVIDENCE_FORMAT) continue;      // a legacy row that merely mentions the string
+    out.push({ rowid: r.rowid, refs: Array.isArray(meta.evidence_refs) ? meta.evidence_refs : null });
+  }
+  return out;
+}
+function collectCiting(db: Database.Database, hit: (ref: Record<string, unknown>) => boolean): number[] {
+  return evidenceRowViews(db)
+    .filter(v => v.refs === null || v.refs.length === 0 || v.refs.some(r => !isWellFormedRef(r) || hit(r as Record<string, unknown>)))
+    .map(v => v.rowid);
+}
+export function collectEvidenceRowidsCitingObservations(db: Database.Database, observationIds: string[]): number[] {
+  if (observationIds.length === 0) return [];
+  const ids = new Set(observationIds);
+  return collectCiting(db, r => r.kind === 'observation' && typeof r.observation_id === 'string' && ids.has(r.observation_id));
+}
+export function collectEvidenceRowidsCitingDocument(db: Database.Database, documentId: string): number[] {
+  return collectCiting(db, r => r.kind === 'document' && r.document_id === documentId);
+}
+export function collectEvidenceRowidsCitingOwnerEntity(db: Database.Database, entityId: string): number[] {
+  return collectCiting(db, r => r.kind === 'observation' && r.entity_id === entityId);
+}

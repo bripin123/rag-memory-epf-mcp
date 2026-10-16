@@ -36,6 +36,7 @@ import { addRevision, correctRevision, transitionStatus, linkSources,
 import { getObservationHistory } from './src/observations/history.js';
 import { kgComparisonValue, captureKgEmbedInput, parseEvidenceMetadata, fingerprintFromMetadata, sha256Utf8,
          EVIDENCE_FORMAT, resolveEvidenceItem, EvidenceInputError, EvidenceCommitConflictError, resolveEvidenceStatus,
+         collectEvidenceRowidsCitingObservations, collectEvidenceRowidsCitingDocument, collectEvidenceRowidsCitingOwnerEntity,
          type KgChunkRow, type KgEmbedCapture, type EvidenceItemInput, type PreparedEvidenceChunk,
          type EvidenceStatus, type EvidenceRefStatus, type EvidenceChunkMetadataV1 } from './src/kg/relation-evidence.js';
 
@@ -284,6 +285,9 @@ interface RelationshipDetailedContext extends KgDetailedContextBase {
 }
 type KgDetailedContext = EntityDetailedContext | RelationshipDetailedContext;
 type DetailedContext = DocumentDetailedContext | KgDetailedContext;
+// D2③: handed to every observation mutation. collect() reads the evidence chunks citing the given
+// observations BEFORE the mutation; mark() schedules them for deletion in the same transaction.
+interface CitedEvidence { collect(observationIds: string[]): number[]; mark(rowids: number[]): void }
 
 // Safe rowid for vec0 virtual tables (require literal integer, not parameterized)
 // Trim incomplete UTF-8 multi-byte sequences at chunk boundaries.
@@ -651,13 +655,21 @@ export class RAGKnowledgeGraphManager {
   // 무변경 upsert 나 dedup-only add 가 **정상 벡터를 지우고 재임베딩도 안 해서**
   // 검색 품질만 깎는다(advisor 구현리뷰 r1 발견 1, 실행 재현).
   // 반환값 = 실제로 변경이 있었는가.
-  private mutateEntityAndInvalidate(entityId: string, mutate: () => boolean | void): boolean {
+  private mutateEntityAndInvalidate(entityId: string, mutate: (kg: CitedEvidence) => boolean | void): boolean {
     let changed = false;
     const tx = this.db!.transaction(() => {
-      changed = mutate() !== false;
+      // D2③ (kg-relation-evidence): the fifth obligation — evidence chunks citing a changed observation
+      // go in the same transaction. Collected before the mutation (purge deletes the rows they name).
+      const marked = new Set<number>();
+      const kg: CitedEvidence = {
+        collect: (ids) => collectEvidenceRowidsCitingObservations(this.db!, ids),
+        mark: (rowids) => { for (const r of rowids) marked.add(r); },
+      };
+      changed = mutate(kg) !== false;
       if (!changed) return;
       rebuildProjection(this.db!, entityId);
       this.invalidateDerivedForEntity(entityId);
+      deleteKgChunkRows(this.db!, [...marked]);
     });
     tx();
     if (changed) this.coordinator?.invalidateCoverage();
@@ -1117,7 +1129,7 @@ export class RAGKnowledgeGraphManager {
       // entity INSERT 도 같은 트랜잭션 안이다. 밖에 두면 lifecycle INSERT 가
       // 실패할 때 entity 행만 남는 split state 가 생긴다
       // (advisor 구현리뷰 r1 발견 2, 실행 재현).
-      const changed = this.mutateEntityAndInvalidate(entityId, () => {
+      const changed = this.mutateEntityAndInvalidate(entityId, (kg) => {
         created = insertStmt.run(entityId, entity.name, entity.entityType, '{}').changes > 0;
 
         if (!created && entity.entityType && entity.entityType !== 'CONCEPT') {
@@ -1143,7 +1155,14 @@ export class RAGKnowledgeGraphManager {
           const dupId = activeByBare.get(bare);
           if (dupId) {
             // 같은 사실이 다른 출처에서 다시 왔다 = evidence 추가, 새 revision 아님.
-            if (entity.sources?.length) sourcesAdded += linkSources(this.db!, dupId, entity.sources, ts);
+            // D2③: a new source row changes the cited observation's source list (a fingerprint input):
+            // collect before linking, drop only if a row was actually added.
+            if (entity.sources?.length) {
+              const cited = kg.collect([dupId]);
+              const added = linkSources(this.db!, dupId, entity.sources, ts);
+              if (added > 0) kg.mark(cited);
+              sourcesAdded += added;
+            }
             ids.push(null);
             continue;
           }
@@ -1250,13 +1269,19 @@ export class RAGKnowledgeGraphManager {
       const added: string[] = [];
 
       let sourcesAdded = 0;
-      const changed = this.mutateEntityAndInvalidate(entityId, () => {
+      const changed = this.mutateEntityAndInvalidate(entityId, (kg) => {
         for (const raw of obs.contents) {
           const content = this._timestampObservation(raw);
           const bare = stripDate(content);
           const dupId = activeByBare.get(bare);
           if (dupId) {
-            if (obs.sources?.length) sourcesAdded += linkSources(this.db!, dupId, obs.sources, ts);
+            // D2③: see createEntities — collect before linking, drop only if a source row was added.
+            if (obs.sources?.length) {
+              const cited = kg.collect([dupId]);
+              const added = linkSources(this.db!, dupId, obs.sources, ts);
+              if (added > 0) kg.mark(cited);
+              sourcesAdded += added;
+            }
             ids.push(null);
             continue;
           }
@@ -1296,11 +1321,13 @@ export class RAGKnowledgeGraphManager {
 
     let newId = '';
     const ts = new Date().toISOString();
-    this.mutateEntityAndInvalidate(row.entity_id, () => {
+    this.mutateEntityAndInvalidate(row.entity_id, (kg) => {
+      const cited = kg.collect([observationId]);
       newId = correctRevision(this.db!, {
         observationId, content: this._timestampObservation(content),
         changeKind, reason: reason ?? null, ts
       });
+      kg.mark(cited);
     });
     await this.tryEmbedEntity(row.entity_id, 'bulk');
     return newId;
@@ -1316,8 +1343,10 @@ export class RAGKnowledgeGraphManager {
       .get(observationId) as { entity_id: string } | undefined;
     if (!row) throw new Error(`observation ${observationId} not found`);
     const ts = new Date().toISOString();
-    this.mutateEntityAndInvalidate(row.entity_id, () => {
+    this.mutateEntityAndInvalidate(row.entity_id, (kg) => {
+      const cited = kg.collect([observationId]);
       transitionStatus(this.db!, { observationId, event, reason: reason ?? null, ts });
+      kg.mark(cited);
     });
     await this.tryEmbedEntity(row.entity_id, 'bulk');
   }
@@ -1362,13 +1391,14 @@ export class RAGKnowledgeGraphManager {
     if (!row) return { purged: 0 };
 
     let purged = 0;
-    this.mutateEntityAndInvalidate(row.entity_id, () => {
+    this.mutateEntityAndInvalidate(row.entity_id, (kg) => {
       // newest-first so each DELETE has no successor referencing it
       const victims = this.db!.prepare(
         `SELECT observation_id FROM entity_observations
          WHERE root_id = ? AND revision_no >= ?
          ORDER BY revision_no DESC`
       ).all(row.root_id, row.revision_no) as Array<{ observation_id: string }>;
+      const cited = kg.collect(victims.map(v => v.observation_id));
       for (const v of victims) {
         this.db!.prepare(
           `DELETE FROM observation_events WHERE from_id = ? OR to_id = ?`)
@@ -1376,6 +1406,7 @@ export class RAGKnowledgeGraphManager {
         purged += this.db!.prepare(`DELETE FROM entity_observations WHERE observation_id = ?`)
           .run(v.observation_id).changes;
       }
+      if (purged > 0) kg.mark(cited);
       return purged > 0;
     });
     await this.tryEmbedEntity(row.entity_id, 'bulk');
@@ -1409,6 +1440,10 @@ export class RAGKnowledgeGraphManager {
           `).get(eid);
 
           if (!entityExists) return false;
+
+          // D2③: evidence chunks of ANY relationship may cite this entity's observations; collect them
+          // before the FK CASCADE takes the observation rows (step 3).
+          const citedEvidence = collectEvidenceRowidsCitingOwnerEntity(this.db!, eid);
 
           // Step 0: Delete entity embeddings
           const embeddingMetadata = this.db!.prepare(`
@@ -1459,6 +1494,7 @@ export class RAGKnowledgeGraphManager {
           // deletion unless swept here (same fail-closed rationale as deleteStaleKgChunks).
           deleteStaleKgChunks(this.db!, eid);
           deleteKgRelationshipChunks(this.db!, relIds.map(r => r.id));
+          deleteKgChunkRows(this.db!, citedEvidence);
 
           // Step 3: Finally delete the entity itself (FK CASCADE takes observation lifecycle rows)
           const entity = this.db!.prepare(`
@@ -1548,6 +1584,8 @@ export class RAGKnowledgeGraphManager {
     if (touched.length > 0) {
       const tx = this.db.transaction(() => {
         for (const p of touched) {
+          // D2③: this shim does not go through mutateEntityAndInvalidate, so it owes the evidence step itself.
+          const citedEvidence = collectEvidenceRowidsCitingObservations(this.db!, p.ids);
           for (const id of p.ids) {
             transitionStatus(this.db!, { observationId: id, event: 'retract',
                                          reason: 'deleteObservations (deprecated shim)', ts });
@@ -1562,6 +1600,7 @@ export class RAGKnowledgeGraphManager {
               .run(p.entityId);
           }
           deleteStaleKgChunks(this.db!, p.entityId);
+          deleteKgChunkRows(this.db!, citedEvidence);
         }
       });
       tx();
@@ -2925,6 +2964,9 @@ export class RAGKnowledgeGraphManager {
           (snap !== undefined && now !== undefined && now.content === snap.content &&
            now.metadata === snap.metadata && now.chunking_signature === snap.chunking_signature);
         if (!same) throw new SyncCasConflictError(documentId);
+        // D2③: collect evidence citing this document before its chunks are replaced; delete it below,
+        // in this transaction (no separate deletion moment).
+        const citedEvidence = collectEvidenceRowidsCitingDocument(db, documentId);
 
         const existing = db.prepare(`SELECT rowid FROM chunk_metadata WHERE document_id = ?`).all(documentId) as { rowid: number }[];
         for (const ch of existing) {
@@ -2932,6 +2974,7 @@ export class RAGKnowledgeGraphManager {
           db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(ch.rowid)}`);
         }
         db.prepare(`DELETE FROM chunk_metadata WHERE document_id = ?`).run(documentId);
+        deleteKgChunkRows(db, citedEvidence);
         db.prepare(`DELETE FROM documents WHERE id = ?`).run(documentId);
         db.prepare(`INSERT INTO documents (id, content, metadata, chunking_signature) VALUES (?, ?, ?, ?)`)
           .run(documentId, content, JSON.stringify(metadata), signature);
@@ -3003,15 +3046,20 @@ export class RAGKnowledgeGraphManager {
     // never chunked still gets overwritten here, and reporting that as a fresh write would be a lie.
     const existed = this.db.prepare(`SELECT 1 FROM documents WHERE id = ?`).get(id) !== undefined;
 
-    // Clean up existing document
-    const cleaned = await this.cleanupDocument(id);
+    // D2③ + R-B (2_ RESULT-T7-TXN-2_): serialise first, then ONE synchronous transaction = cleanup
+    // (collect citing evidence, delete chunks and evidence) + the documents REPLACE. With an await
+    // between the two, another call could publish evidence on this document after the collection, and a
+    // failing REPLACE left the chunks and evidence already deleted.
+    const metadataJson = JSON.stringify(metadata);
+    const cleaned = this.db.transaction(() => {
+      const c = this.cleanupDocument(id);
+      this.db!.prepare(`
+        INSERT OR REPLACE INTO documents (id, content, metadata)
+        VALUES (?, ?, ?)
+      `).run(id, content, metadataJson);
+      return c;
+    })();
 
-    // Store document
-    this.db.prepare(`
-      INSERT OR REPLACE INTO documents (id, content, metadata)
-      VALUES (?, ?, ?)
-    `).run(id, content, JSON.stringify(metadata));
-    
     console.error(`✅ Document stored: ${id}`);
     return { id, stored: true, replaced: existed, deletedChunks: cleaned.deletedChunks };
   }
@@ -3032,46 +3080,53 @@ export class RAGKnowledgeGraphManager {
 
     console.error(`🔪 Chunking document: ${documentId} (maxTokens: ${maxTokens}, chunker: c1)`);
     
-    // Clean up existing chunks
-    await this.cleanupDocument(documentId);
-    
-    // Create chunks
+    // Create chunks. D2③ + R-B (2_ RESULT-T7-TXN-2_): chunking is synchronous and runs BEFORE anything
+    // is deleted, so a chunker failure deletes nothing.
     const chunks = this.chunkStructured(document.content, maxTokens);
-    const resultChunks = [];
-    
-    for (const chunk of chunks) {
-      const chunkId = `${documentId}_chunk_${chunk.chunk_index}`;
+    const resultChunks: Array<{ id: string; text: string; startPos: number | null; endPos: number | null; startToken: number | null; endToken: number | null }> = [];
 
-      // Store chunk metadata (no embedding yet)
-      this.db.prepare(`
-        INSERT INTO chunk_metadata (
-          chunk_id, document_id, chunk_index, text, start_pos, end_pos, start_token, end_token
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        chunkId,
-        documentId,
-        chunk.chunk_index,
-        chunk.text,
-        chunk.start_pos,
-        chunk.end_pos,
-        chunk.start_token,
-        chunk.end_token
-      );
+    // ONE synchronous transaction = cleanup (collect evidence citing this document, delete its chunks and
+    // that evidence) + every new chunk INSERT + the signature UPDATE. A re-chunk reuses the ordinal chunk
+    // ids, so with an await between cleanup and the INSERTs another call could cite the new D_chunk_0
+    // after the collection; and a failure after cleanup lost the old chunks for good.
+    this.db.transaction(() => {
+      this.cleanupDocument(documentId);
 
-      resultChunks.push({
-        id: chunkId,
-        text: chunk.text,
-        startPos: chunk.start_pos,
-        endPos: chunk.end_pos,
-        startToken: chunk.start_token,
-        endToken: chunk.end_token
-      });
-    }
-    
+      for (const chunk of chunks) {
+        const chunkId = `${documentId}_chunk_${chunk.chunk_index}`;
+
+        // Store chunk metadata (no embedding yet)
+        this.db!.prepare(`
+          INSERT INTO chunk_metadata (
+            chunk_id, document_id, chunk_index, text, start_pos, end_pos, start_token, end_token
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          chunkId,
+          documentId,
+          chunk.chunk_index,
+          chunk.text,
+          chunk.start_pos,
+          chunk.end_pos,
+          chunk.start_token,
+          chunk.end_token
+        );
+
+        resultChunks.push({
+          id: chunkId,
+          text: chunk.text,
+          startPos: chunk.start_pos,
+          endPos: chunk.end_pos,
+          startToken: chunk.start_token,
+          endToken: chunk.end_token
+        });
+      }
+
+      // spec §7.1: 두 번째 chunk 생성 경로 — 스탬프를 안 박으면 §5.1 관측이 조용히 샌다.
+      this.db!.prepare(`UPDATE documents SET chunking_signature = ? WHERE id = ?`)
+        .run(effectiveSignature(maxTokens), documentId);
+    })();
+
     console.error(`✅ Document chunked: ${chunks.length} chunks created`);
-    // spec §7.1: 두 번째 chunk 생성 경로 — 스탬프를 안 박으면 §5.1 관측이 조용히 샌다.
-    this.db.prepare(`UPDATE documents SET chunking_signature = ? WHERE id = ?`)
-      .run(effectiveSignature(maxTokens), documentId);
     // Indirect missing-row producer (spec §5): freshly chunked rows have no
     // vectors yet — let the coordinator recover them without a restart.
     this.coordinator?.invalidateCoverage();
@@ -3530,44 +3585,51 @@ export class RAGKnowledgeGraphManager {
   // that replaces a document could not tell from the return value that anything was deleted
   // (2026-08-05 field report from a deployed project: "{stored:true} came back and I did not know
   // what I had just wiped"). Silent destruction is the defect; the numbers are free.
-  private async cleanupDocument(documentId: string): Promise<{ deletedChunks: number; deletedAssociations: number; deletedVectors: number }> {
+  private cleanupDocument(documentId: string): { deletedChunks: number; deletedAssociations: number; deletedVectors: number } {
     if (!this.db) return { deletedChunks: 0, deletedAssociations: 0, deletedVectors: 0 };
     
     console.error(`🧹 Cleaning up document: ${documentId}`);
-    
-    // Get existing chunks
-    const existingChunks = this.db.prepare(`
-      SELECT rowid FROM chunk_metadata WHERE document_id = ?
-    `).all(documentId) as { rowid: number }[];
-    
-    let deletedAssociations = 0;
-    let deletedVectors = 0;
-    
-    // Delete associations and vectors
-    for (const chunk of existingChunks) {
-      // Delete chunk-entity associations
-      const associations = this.db.prepare(`
-        DELETE FROM chunk_entities WHERE chunk_rowid = ?
-      `).run(chunk.rowid);
-      deletedAssociations += associations.changes;
 
-      // Delete vector embeddings (vec0 needs literal integer, not parameterized)
-      this.db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(chunk.rowid)}`);
-      deletedVectors++;
-    }
+    // D2③ (kg-relation-evidence): collect -> delete chunks -> invalidate citing evidence in ONE
+    // transaction. 6.4.0 ran these statements one by one in autocommit. Used by storeDocument,
+    // chunkDocument (re-chunk that reuses ordinal ids) and deleteDocument(s).
+    // R-B (2_ RESULT-T7-TXN-2_): SYNCHRONOUS — results and exceptions reach the caller in the same
+    // tick. Every caller runs it inside its own transaction together with the source change, so this
+    // transaction nests as a savepoint and the caller's final SQL is inside the same rollback scope.
+    return this.db.transaction(() => {
+      const db = this.db!;
+      const citedEvidence = collectEvidenceRowidsCitingDocument(db, documentId);
+      const existingChunks = db.prepare(`
+        SELECT rowid FROM chunk_metadata WHERE document_id = ?
+      `).all(documentId) as { rowid: number }[];
 
-    // Delete chunk metadata
-    const metadata = this.db.prepare(`
-      DELETE FROM chunk_metadata WHERE document_id = ?
-    `).run(documentId);
-    
-    if (existingChunks.length > 0) {
-      console.error(`  ├─ Deleted ${deletedAssociations} entity associations`);
-      console.error(`  ├─ Deleted ${deletedVectors} vector embeddings`);
-      console.error(`  └─ Deleted ${metadata.changes} chunk metadata records`);
-    }
+      let deletedAssociations = 0;
+      let deletedVectors = 0;
 
-    return { deletedChunks: existingChunks.length, deletedAssociations, deletedVectors };
+      for (const chunk of existingChunks) {
+        const associations = db.prepare(`
+          DELETE FROM chunk_entities WHERE chunk_rowid = ?
+        `).run(chunk.rowid);
+        deletedAssociations += associations.changes;
+
+        // Delete vector embeddings (vec0 needs literal integer, not parameterized)
+        db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(chunk.rowid)}`);
+        deletedVectors++;
+      }
+
+      const metadata = db.prepare(`
+        DELETE FROM chunk_metadata WHERE document_id = ?
+      `).run(documentId);
+      deleteKgChunkRows(db, citedEvidence);
+
+      if (existingChunks.length > 0) {
+        console.error(`  ├─ Deleted ${deletedAssociations} entity associations`);
+        console.error(`  ├─ Deleted ${deletedVectors} vector embeddings`);
+        console.error(`  └─ Deleted ${metadata.changes} chunk metadata records`);
+      }
+
+      return { deletedChunks: existingChunks.length, deletedAssociations, deletedVectors };
+    })();
   }
 
   async deleteDocument(documentId: string): Promise<{ documentId: string; deleted: boolean }> {
@@ -3586,13 +3648,16 @@ export class RAGKnowledgeGraphManager {
         return { documentId, deleted: false };
       }
       
-      // Clean up all associated data
-      await this.cleanupDocument(documentId);
-      
-      // Delete the document itself
-      const result = this.db.prepare(`
-        DELETE FROM documents WHERE id = ?
-      `).run(documentId);
+      // D2③ + R-B (2_ RESULT-T7-TXN-2_): cleanup (collect evidence citing this document, delete its
+      // chunks and that evidence) and the document DELETE are ONE synchronous transaction — no await
+      // between them, so no evidence can be published on this document after the collection, and a
+      // failing DELETE rolls the cleanup back.
+      const result = this.db.transaction(() => {
+        this.cleanupDocument(documentId);
+        return this.db!.prepare(`
+          DELETE FROM documents WHERE id = ?
+        `).run(documentId);
+      })();
       
       if (result.changes > 0) {
         console.error(`✅ Document '${documentId}' deleted successfully`);
@@ -3820,6 +3885,11 @@ export class RAGKnowledgeGraphManager {
       console.error('🗑️ Cleared existing data for full import');
     }
 
+    // D2③ (kg-relation-evidence): import is an observation AND a document writer. Evidence citing an
+    // observation that gains a source row, or a document this import replaces, is collected before the
+    // row is written and deleted at the end of this transaction.
+    const citedEvidence = new Set<number>();
+
     // Import entities using INSERT OR IGNORE
     if (data.entities && Array.isArray(data.entities)) {
       const stmt = this.db!.prepare(`
@@ -3876,6 +3946,7 @@ export class RAGKnowledgeGraphManager {
         VALUES (?, ?, ?, ?)
       `);
       for (const doc of data.documents) {
+        if (typeof doc?.id === 'string') for (const r of collectEvidenceRowidsCitingDocument(this.db!, doc.id)) citedEvidence.add(r);
         const result = stmt.run(
           doc.id,
           doc.content,
@@ -3982,6 +4053,7 @@ export class RAGKnowledgeGraphManager {
                 `${so.observation_id}/${so.source_kind}/${so.source_ref} differs from the existing row`);
             continue;
           }
+          for (const r of collectEvidenceRowidsCitingObservations(this.db!, [so.observation_id])) citedEvidence.add(r);
           this.db!.prepare(`INSERT INTO observation_sources
             (observation_id, source_kind, source_ref, source_hash, recorded_at) VALUES (?, ?, ?, ?, ?)`)
             .run(so.observation_id, so.source_kind, so.source_ref, so.source_hash ?? null, so.recorded_at);
@@ -4023,6 +4095,8 @@ export class RAGKnowledgeGraphManager {
       });
       tx();
     }
+
+    deleteKgChunkRows(this.db!, [...citedEvidence]);
 
     // projection 재합성 + 파생 상태 무효화.
     // 무효화가 없으면 이미 있던 entity 를 덮어쓴 뒤에도 옛 벡터·옛 KG chunk 가
