@@ -114,6 +114,13 @@ export function compileFtsLiteralQuery(q: string): string | null {
   return terms.map(t => `"${t}"`).join(' OR ');
 }
 
+// Test-only seam for the real model loader: replaces `pipeline` so a test can see the exact
+// arguments buildRealLoader passes (same rule as setSyncFaultPoint: an argument, never an env var).
+let __pipelineImpl: typeof pipeline = pipeline;
+export function setPipelineImpl(fn: ((...args: any[]) => Promise<any>) | null): void {
+  __pipelineImpl = (fn ?? pipeline) as typeof pipeline;
+}
+
 // Configure Hugging Face transformers for better compatibility
 if (env.backends?.onnx?.wasm) {
   env.backends.onnx.wasm.wasmPaths = './node_modules/@huggingface/transformers/dist/';
@@ -162,6 +169,12 @@ const IS_DEFAULT_MODEL_CONFIG = !process.env.EMBEDDING_MODEL || process.env.EMBE
 // on 'main' (their vectors are never auto-grandfathered anyway).
 const MODEL_REVISION = IS_DEFAULT_MODEL_CONFIG ? '4de13258303883538bd53b696b452bf8099f0858' : 'main';
 const MODEL_DTYPE = 'fp16';
+// ONNX session options for the embedding model. The CPU memory arena is off: with it on, one long
+// input (12,000 chars = 5,774 tokens) left the process holding its peak (footprint 1.4 → 8.0 GB,
+// measured 2026-10-31 on transformers 3.8.1 and 4.3.2) and every MCP client runs its own engine.
+// Arena off returned to 1.5-2.4 GB with byte-identical vectors; the cost is per-call allocation
+// (query 29 → 33 ms, 484-token chunk 574 → 639 ms on 4.3.2). Not part of the cache artifact key.
+export const MODEL_SESSION_OPTIONS = Object.freeze({ enableCpuMemArena: false });
 // Entity embedding text builder version — mixed into entity input hashes so a
 // builder change re-backfills entities without touching chunk vectors (spec §6c).
 const TEXT_BUILDER_VERSION = 'tb1';
@@ -543,8 +556,9 @@ export class RAGKnowledgeGraphManager {
       env.allowRemoteModels = true;
       env.allowLocalModels = true;
       console.error(`🤖 Loading embedding model: ${EMBEDDING_MODEL} (1024-dim, cache=${cacheDir})...`);
-      const model = await pipeline('feature-extraction', EMBEDDING_MODEL,
-        { revision: MODEL_REVISION, dtype: MODEL_DTYPE, cache_dir: cacheDir } as any);
+      const model = await __pipelineImpl('feature-extraction', EMBEDDING_MODEL,
+        { revision: MODEL_REVISION, dtype: MODEL_DTYPE, cache_dir: cacheDir,
+          session_options: { ...MODEL_SESSION_OPTIONS } } as any);
       // dims fail-fast (spec §2 / beta B8): probe the ACTUAL output length — a
       // 384/768-dim custom model must fail here with a clear message, not at
       // every subsequent vector write.
