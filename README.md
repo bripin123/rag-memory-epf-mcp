@@ -154,6 +154,19 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### v6.4.2 (2026-10-31)
+
+- **Fixed — the engine no longer keeps the peak memory of its largest embedding.** The ONNX session is opened with
+  the CPU memory arena off. With it on, one long input (12,000 characters, 5,774 tokens) left the process at about
+  8 GB until it exited (1.4 GB after model load), and every MCP client runs its own engine. With it off the same
+  input left 1.5-2.4 GB in a probe and 2.7-3.2 GB in the full engine (one Mac, one run each). Vectors are
+  byte-identical with the arena on and off. The transient peak while a long input is being embedded is not lowered.
+- **Changed — `@huggingface/transformers` 4.3.2** (was `^3.5.1`; onnxruntime-node 1.30.0). The model cache layout is
+  unchanged and an existing cache loads without a re-download. Vectors differ from 3.x only in the last bits (cosine
+  0.9999995 or higher on 5 inputs); the embedding profile is unchanged, so nothing is re-embedded. Measured on one
+  Mac: a 30-character query 128 ms -> 33 ms, a 484-token chunk 739 ms -> 639 ms (3.8.1 with the arena on vs 4.3.2
+  with it off). Not measured: fixed-query ranking of existing document vectors against new query vectors, Windows.
+
 ### v6.4.1 (2026-10-16)
 
 - **Changed — new opt-in manager method `generateRelationEvidenceChunks(items, { formatVersion: 'evidence-v1' })`.**

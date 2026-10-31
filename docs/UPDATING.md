@@ -108,6 +108,13 @@ path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
 is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
 the next start becomes a clean download owner.
 
+## v6.4.2 (schema v14, unchanged): CPU memory arena off, transformers 4.3.2
+
+**What changes for an existing database.** Nothing is migrated and nothing is re-embedded (the embedding profile —
+model, revision, dtype, dimensions, pooling, normalize — is unchanged). The model cache is reused as is. What changes
+is the engine process: after a long embedding it returns to about 2-3 GB instead of holding about 8 GB. An engine that
+is already running keeps the old behaviour until it is restarted on 6.4.2. Details: README changelog.
+
 ## v6.4.1 (schema v14, unchanged): evidence-backed relationship chunks (opt-in), KG lifecycle fixes, faster oversize split
 
 **What changes for an existing database.** Nothing is migrated and search defaults are unchanged (the 113-query
