@@ -514,6 +514,48 @@ export class RAGKnowledgeGraphManager {
           `for history integrity; refusing to run migrations without it.`);
       }
     }
+    // Write-sequence baseline for THIS connection (see noteWrites). A fresh connection starts
+    // its own total_changes() count, so the baseline is reset on every open; the announced
+    // sequence itself never goes back.
+    this.tcBase = this.totalChanges();
+  }
+
+  // --- Write-sequence signal (test/write-seq.test.mjs) ------------------------------------
+  // One stderr line per observation that THIS connection changed rows:
+  //   [rag-memory] write-seq <N>   (N = 1, 2, 3, … for the life of the process)
+  // The framework launcher (mcp-proxy.cjs) records "the DB state this machine left" only
+  // after such a line. Before this signal it recorded whenever the file changed and went
+  // quiet — which also fired when a cloud sync client swapped the other machine's file in
+  // under an idle engine, and that record then refused a correct DB (measured 2026-11-02).
+  // total_changes() counts rows changed by this connection (vec0 shadow tables included);
+  // reads and other connections do not move it. It is read outside a transaction only, so a
+  // statement still inside one is announced after it ends. It also counts rows of a
+  // transaction that was rolled back: a line means "this connection's change count went up",
+  // not "a commit happened". The launcher consumes a pending sequence once the file it last
+  // recorded is still there, the WAL is empty and the file is stable; until then a sequence that
+  // came from a rollback can still publish a file another writer or a sync client changed, and
+  // that period has no fixed upper bound (hub session 251 review r1 M1 · r3. r2: a WAL-size
+  // test was tried and removed — a header-only WAL looks non-empty and another connection's
+  // checkpoint hides a real commit).
+  // Written with fs.writeSync: the last call runs inside process 'exit', where an async
+  // stderr pipe write (macOS) can be lost.
+  writeSeq = 0;
+  private tcBase = 0;
+
+  private totalChanges(): number {
+    if (!this.db) return 0;
+    return Number(this.db.prepare('select total_changes()').pluck().get());
+  }
+
+  noteWrites(): void {
+    try {
+      if (!this.db || this.db.inTransaction) return;
+      const tc = this.totalChanges();
+      if (tc <= this.tcBase) return;
+      this.tcBase = tc;
+      this.writeSeq += 1;
+      fsSync.writeSync(2, `[rag-memory] write-seq ${this.writeSeq}\n`);
+    } catch { /* a dead handle is the reopen path's business; the next tick tries again */ }
   }
 
   // Upsert the stored-vector compatibility profile (spec §6c layer 2) and record
@@ -996,6 +1038,7 @@ export class RAGKnowledgeGraphManager {
       console.error(`⚠️ reopen storm (${REOPEN_STORM_MAX} in ${REOPEN_STORM_WINDOW_MS / 1000}s) — watch paused, reason=${reason}`);
       return false;
     }
+    this.noteWrites();   // rows changed on the old connection are announced before its count is gone
     const old = this.db;
     // Salvage: frames committed to the old WAL after the last checkpoint (≤1 s) go to the main
     // file if the old descriptor is still readable. An I/O error here just means they are gone.
@@ -1079,13 +1122,14 @@ export class RAGKnowledgeGraphManager {
     this.walTimer = setInterval(() => {
       try { this.walTick(); } catch (e) { console.error(`⚠️ wal tick: ${(e as Error).message}`); }
       this.checkpointWal();
+      this.noteWrites();
     }, tickMs);
     this.walTimer.unref();
   }
 
   noteActivity(delayMs = 200) {
     if (this.walSoon) return;
-    this.walSoon = setTimeout(() => { this.walSoon = null; this.checkpointWal(); }, delayMs);
+    this.walSoon = setTimeout(() => { this.walSoon = null; this.checkpointWal(); this.noteWrites(); }, delayMs);
     this.walSoon.unref();
   }
 
@@ -1102,6 +1146,7 @@ export class RAGKnowledgeGraphManager {
       // close() folds the WAL only for the last connection; with other engines attached it
       // would leave every frame behind.
       this.checkpointWal();
+      this.noteWrites();
       this.db.close();
       this.db = null;
     }
@@ -5479,6 +5524,7 @@ async function main() {
       // Synchronously, before anything is awaited: a host may SIGKILL before the settle
       // sequence below completes (codex: ~185 ms after SIGTERM).
       ragKgManager.checkpointWal();
+      ragKgManager.noteWrites();
       void (async () => {
         try { await server.close(); } catch { /* transport already gone */ }
         try { process.stdin.pause(); process.stdin.unref?.(); } catch { /* best-effort */ }
