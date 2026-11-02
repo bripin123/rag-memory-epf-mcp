@@ -355,10 +355,12 @@ writer must preserve them.
 6. **Same-rowid vector rewrites go through `writeVector` (`src/vecSlots.ts`), never DELETE + INSERT** (measured
    2026-11-02, sqlite-vec 0.1.7): vec0 only fills free slots of the latest 1,024-slot chunk, so DELETE + INSERT of a row
    in an older chunk leaks a slot (the hub DB reached 93.5% empty slots). `writeVector` = valid → UPDATE (same slot) ·
-   absent → INSERT · validity 0 → `InvalidSlotError` (vec0 refuses to DELETE such a row for most bit layouts; only the
-   verified rebuild `rebuildVecTable` removes it). Entity re-embed keeps its metadata rowid. Real deletes stay deletes
-   but go through `deleteVector` (valid → DELETE · validity 0 → left for the rebuild · absent → nothing): a raw
-   `DELETE FROM chunks|entity_embeddings WHERE rowid = …` fails on a validity-0 row and aborts the caller's transaction.
+   absent → INSERT · validity 0 or shared → verified inline rebuild (`rebuildVecTable` in the caller's transaction)
+   first, then INSERT (`InvalidSlotError` only if the slot is still not writable after that repair). Entity re-embed
+   keeps its metadata rowid. Real deletes stay deletes but go through `deleteVector` (valid → DELETE, after an inline
+   repair if its chunk holds a validity-0 or shared row · validity 0 / shared → the inline repair drops it · absent →
+   nothing): vec0 refuses to DELETE a validity-0 row for most bit layouts, so a raw
+   `DELETE FROM chunks|entity_embeddings WHERE rowid = …` fails on such a row and aborts the caller's transaction.
    Entity metadata whose vector row is gone is normalized to missing, not deleted (keeps the rowid). A validity-0 slot
    looks free to vec0, so a later insert can share it with the old rowid (`slotState` = `shared`, owned by neither).
    `writeVector`/`deleteVector` repair the table inline (verified rebuild in the caller's transaction) before touching
