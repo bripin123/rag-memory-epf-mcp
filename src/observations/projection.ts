@@ -1,3 +1,4 @@
+import { deleteVector } from '../vecSlots.js';
 import type Database from 'better-sqlite3';
 
 // active 행을 projection_order 순으로 모아 entities.observations 를 재작성한다.
@@ -30,7 +31,7 @@ export function deleteStaleKgChunks(db: Database.Database, entityId: string): nu
   ).all(entityId) as Array<{ rowid: number }>;
   let n = 0;
   for (const c of chunks) {
-    db.exec(`DELETE FROM chunks WHERE rowid = ${Number(c.rowid)}`);
+    deleteVector(db, 'chunks', Number(c.rowid));
     db.prepare(`DELETE FROM chunk_metadata WHERE rowid = ?`).run(c.rowid);
     n++;
   }
@@ -48,7 +49,7 @@ export function deleteKgRelationshipChunks(db: Database.Database, relationshipId
       `SELECT rowid FROM chunk_metadata WHERE chunk_type = 'relationship' AND relationship_id = ?`
     ).all(rid) as Array<{ rowid: number }>;
     for (const c of chunks) {
-      db.exec(`DELETE FROM chunks WHERE rowid = ${Number(c.rowid)}`);
+      deleteVector(db, 'chunks', Number(c.rowid));
       db.prepare(`DELETE FROM chunk_metadata WHERE rowid = ?`).run(c.rowid);
       n++;
     }
@@ -68,7 +69,7 @@ export function deleteKgChunkRows(db: Database.Database, rowids: number[]): numb
     if (!Number.isInteger(rowid) || rowid < 0) throw new Error(`Invalid rowid: ${raw}`);
     const row = db.prepare(`SELECT chunk_type FROM chunk_metadata WHERE rowid = ?`).get(rowid) as { chunk_type: string | null } | undefined;
     if (!row || (row.chunk_type !== 'entity' && row.chunk_type !== 'relationship')) continue;
-    db.exec(`DELETE FROM chunks WHERE rowid = ${rowid}`);
+    deleteVector(db, 'chunks', rowid);
     db.prepare(`DELETE FROM chunk_entities WHERE chunk_rowid = ?`).run(rowid);
     n += db.prepare(`DELETE FROM chunk_metadata WHERE rowid = ?`).run(rowid).changes;
   }
