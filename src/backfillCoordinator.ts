@@ -16,6 +16,7 @@
 // first is never downgraded (6R note 3).
 
 import type Database from 'better-sqlite3';
+import { searchableVectorSql, VecSlotError, deleteVector } from './vecSlots.js';
 
 
 // A handle closed by the engine's reopen (wal-sidecar-guard), or an I/O error from a sidecar the
@@ -30,8 +31,10 @@ function isConnectionLoss(e: unknown): boolean {
 export type ReconState = 'pending' | 'running' | 'complete' | 'failed' | 'deferred' | 'n/a';
 
 export interface CoverageSnapshot {
-  chunk: { total: number; embedded: number; verified: number; legacy_assumed: number };
-  entity: { total: number; embedded: number; verified: number; legacy_assumed: number };
+  // embedded = searchable vectors only (vec-slot-reuse D1c): a _rowids row with validity 0 is missing.
+  // error = the slot map of that table could not be resolved; the counts are then not reported.
+  chunk: { total: number; embedded: number; verified: number; legacy_assumed: number; error?: string };
+  entity: { total: number; embedded: number; verified: number; legacy_assumed: number; error?: string };
 }
 
 export interface CoordinatorDeps {
@@ -69,6 +72,14 @@ export class BackfillCoordinator {
   private shuttingDown = false;
   private connLossReruns = 0;
   private scanning = false;
+  // vec-slot-reuse: rows whose vec0 slot has validity 0 cannot be rewritten in place (sqlite-vec refuses
+  // to DELETE many of them); the backfill skips them and asks for the verified rebuild instead.
+  private repairWanted = false;
+  readonly slotErrors = new Map<string, string>();     // table -> unresolvable slot map message
+  repairRequestedAt = 0;
+  requestRepair(): void { if (!this.repairWanted) this.repairRequestedAt = Date.now(); this.repairWanted = true; }
+  takeRepairRequest(): boolean { const w = this.repairWanted; this.repairWanted = false; return w; }
+  get repairRequested(): boolean { return this.repairWanted; }
   private scanPromise: Promise<void> | null = null;
   private rerunRequested = false;
   private snapshot: CoverageSnapshot | null = null;
@@ -76,6 +87,8 @@ export class BackfillCoordinator {
   constructor(private readonly deps: CoordinatorDeps) {}
 
   get reconState(): ReconState { return this.recon; }
+  // vec-slot-reuse D1b: the idle vector rebuild must not overlap a backfill scan or a reconciliation pass.
+  get busy(): boolean { return this.scanning || !!this.scanPromise || this.reconActive || this.recon === 'running'; }
   get reconLastError(): string | undefined { return this.reconError; }
 
   // Shared eligibility barrier (spec §3): vector search AND automatic backfill.
@@ -90,12 +103,12 @@ export class BackfillCoordinator {
   // metadata split states, and neither must be miscounted as reconciled work.
   private countNullWithVector(db: Database.Database): number {
     const ent = db.prepare(
-      `SELECT COUNT(*) c FROM entity_embedding_metadata m JOIN entity_embeddings v ON v.rowid = m.rowid
-       WHERE m.provenance_state IS NULL`
+      `SELECT COUNT(*) c FROM entity_embedding_metadata m
+       WHERE m.provenance_state IS NULL AND ${searchableVectorSql('entity_embeddings', 'm.rowid')}`
     ).get() as { c: number };
     const chk = db.prepare(
-      `SELECT COUNT(*) c FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid
-       WHERE m.provenance_state IS NULL`
+      `SELECT COUNT(*) c FROM chunk_metadata m
+       WHERE m.provenance_state IS NULL AND ${searchableVectorSql('chunks', 'm.rowid')}`
     ).get() as { c: number };
     return ent.c + chk.c;
   }
@@ -104,7 +117,9 @@ export class BackfillCoordinator {
   // NULL rows exist, so profile changes and legacy split states are repaired
   // before vector eligibility can open:
   //   1. entity vectors without metadata (orphans)      -> delete vector
-  //   2. entity metadata without vector (split state)   -> delete metadata (row becomes a backfill target)
+  //   2. stamped entity metadata whose vector row is gone -> normalized to missing, NOT deleted: the row keeps
+  //      its rowid and becomes a backfill target (vec-slot-reuse r3 M2; validity-0 vector rows are repaired
+  //      inline by deleteVector/writeVector or by the idle rebuild, never DELETEd here)
   //   3. provenance-stamped rows whose compatibility profile != current
   //      (old engine/model profile)                     -> delete-to-missing
   //   4. chunk metadata stamped but vectorless          -> normalize to missing (NULL provenance)
@@ -115,12 +130,14 @@ export class BackfillCoordinator {
     const profileId = this.deps.currentProfileId();
     const q = (sql: string, ...args: unknown[]) => (db.prepare(sql).get(...args) as { c: number }).c;
     return this.countNullWithVector(db)
-      + q(`SELECT COUNT(*) c FROM entity_embeddings WHERE rowid NOT IN (SELECT rowid FROM entity_embedding_metadata)`)
-      + q(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE rowid NOT IN (SELECT rowid FROM entity_embeddings)`)
+      // vec-slot-reuse r3 M2: searchable orphans only (validity-0 rows belong to the rebuild); vectorless
+      // metadata counts only while still stamped (it is normalized to missing, not deleted, to keep its rowid).
+      + q(`SELECT COUNT(*) c FROM entity_embeddings_rowids m WHERE m.rowid NOT IN (SELECT rowid FROM entity_embedding_metadata) AND ${searchableVectorSql('entity_embeddings', 'm.rowid')}`)
+      + q(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE provenance_state IS NOT NULL AND rowid NOT IN (SELECT rowid FROM entity_embeddings_rowids)`)
       + q(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE provenance_state IS NOT NULL AND profile_id IS NOT ?`, profileId)
-      + q(`SELECT COUNT(*) c FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ?`, profileId)
+      + q(`SELECT COUNT(*) c FROM chunk_metadata m WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ? AND m.rowid IN (SELECT rowid FROM chunks_rowids)`, profileId)
       // stamped chunk metadata whose vector is gone (beta 3R M3)
-      + q(`SELECT COUNT(*) c FROM chunk_metadata WHERE provenance_state IS NOT NULL AND rowid NOT IN (SELECT rowid FROM chunks)`);
+      + q(`SELECT COUNT(*) c FROM chunk_metadata WHERE provenance_state IS NOT NULL AND rowid NOT IN (SELECT rowid FROM chunks_rowids)`);
   }
 
   // Batched (beta 2R residual): each batch commits its own transaction and
@@ -142,16 +159,30 @@ export class BackfillCoordinator {
         await new Promise(r => setImmediate(r));
       }
     };
+    // 1. searchable entity vectors without metadata -> delete (validity-0 orphans are left to the rebuild:
+    //    vec0 refuses to DELETE most of them, vec-slot-reuse r3 M2)
+    for (;;) {
+      if (this.shuttingDown) throw new Error('shutdown during sanitation');
+      const orphans = db.prepare(
+        `SELECT m.rowid FROM entity_embeddings_rowids m
+         WHERE m.rowid NOT IN (SELECT rowid FROM entity_embedding_metadata) AND ${searchableVectorSql('entity_embeddings', 'm.rowid')} LIMIT ${RECON_BATCH}`
+      ).all() as Array<{ rowid: number }>;
+      if (orphans.length === 0) break;
+      batchTx(() => { for (const r of orphans) { deleteVector(db, 'entity_embeddings', r.rowid); touched++; } });
+      if (orphans.length < RECON_BATCH) break;
+      await new Promise(r => setImmediate(r));
+    }
+    // 2. stamped entity metadata whose vector row is gone -> normalize to missing (was: delete). Keeping the
+    //    row keeps its rowid, so the backfill re-inserts at the same rowid (r3 M2 case C: restart after repair).
     await batchedRun(
-      `DELETE FROM entity_embeddings WHERE rowid IN (
-         SELECT rowid FROM entity_embeddings WHERE rowid NOT IN (SELECT rowid FROM entity_embedding_metadata) LIMIT ${RECON_BATCH})`);
-    await batchedRun(
-      `DELETE FROM entity_embedding_metadata WHERE rowid IN (
-         SELECT rowid FROM entity_embedding_metadata WHERE rowid NOT IN (SELECT rowid FROM entity_embeddings) LIMIT ${RECON_BATCH})`);
+      `UPDATE entity_embedding_metadata SET input_hash = NULL, profile_id = NULL, provenance_state = NULL
+       WHERE rowid IN (
+         SELECT rowid FROM entity_embedding_metadata
+         WHERE provenance_state IS NOT NULL AND rowid NOT IN (SELECT rowid FROM entity_embeddings_rowids) LIMIT ${RECON_BATCH})`);
     await batchedRun(
       `UPDATE chunk_metadata SET input_hash = NULL, profile_id = NULL, provenance_state = NULL
        WHERE rowid IN (
-         SELECT rowid FROM chunk_metadata WHERE provenance_state IS NOT NULL AND rowid NOT IN (SELECT rowid FROM chunks) LIMIT ${RECON_BATCH})`);
+         SELECT rowid FROM chunk_metadata WHERE provenance_state IS NOT NULL AND rowid NOT IN (SELECT rowid FROM chunks_rowids) LIMIT ${RECON_BATCH})`);
     // Old-profile rows: row deletes in bounded batches with yields.
     for (;;) {
       if (this.shuttingDown) throw new Error('shutdown during sanitation');
@@ -162,8 +193,8 @@ export class BackfillCoordinator {
       if (staleEnt.length === 0) break;
       batchTx(() => {
         for (const r of staleEnt) {
-          db.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(r.rowid)}`);
-          db.prepare(`DELETE FROM entity_embedding_metadata WHERE rowid = ?`).run(r.rowid);
+          deleteVector(db, 'entity_embeddings', r.rowid);   // validity-0: left to the rebuild
+          db.prepare(`UPDATE entity_embedding_metadata SET input_hash = NULL, profile_id = NULL, provenance_state = NULL WHERE rowid = ?`).run(r.rowid);
           touched++;
         }
       });
@@ -172,13 +203,13 @@ export class BackfillCoordinator {
     for (;;) {
       if (this.shuttingDown) throw new Error('shutdown during sanitation');
       const staleChunk = db.prepare(
-        `SELECT m.rowid FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid
-         WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ? LIMIT ${RECON_BATCH}`
+        `SELECT m.rowid FROM chunk_metadata m
+         WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ? AND m.rowid IN (SELECT rowid FROM chunks_rowids) LIMIT ${RECON_BATCH}`
       ).all(profileId) as Array<{ rowid: number }>;
       if (staleChunk.length === 0) break;
       batchTx(() => {
         for (const r of staleChunk) {
-          db.exec(`DELETE FROM chunks WHERE rowid = ${Number(r.rowid)}`);
+          deleteVector(db, 'chunks', r.rowid);   // validity-0: left to the rebuild
           db.prepare(`UPDATE chunk_metadata SET input_hash = NULL, profile_id = NULL, provenance_state = NULL WHERE rowid = ?`).run(r.rowid);
           touched++;
         }
@@ -193,9 +224,14 @@ export class BackfillCoordinator {
   // to 'n/a'. Row-level errors are fail-closed (vector deleted -> missing);
   // systemic errors transition to 'failed' and keep eligibility shut.
   runReconciliation(): Promise<void> {
-    if (!this.reconPromise) this.reconPromise = this.reconcileOnce();
+    if (!this.reconPromise) {
+      // r3 M4: busy for the whole pass (sanitize included), not only while recon === 'running'.
+      this.reconActive = true;
+      this.reconPromise = this.reconcileOnce().finally(() => { this.reconActive = false; });
+    }
     return this.reconPromise;
   }
+  private reconActive = false;
 
   private async reconcileOnce(): Promise<void> {
     const db = this.deps.db();
@@ -265,8 +301,7 @@ export class BackfillCoordinator {
       // sanitize().
       const rows = db.prepare(
         `SELECT m.rowid, m.entity_id, m.embedding_text FROM entity_embedding_metadata m
-         JOIN entity_embeddings v ON v.rowid = m.rowid
-         WHERE m.provenance_state IS NULL LIMIT ${RECON_BATCH}`
+         WHERE m.provenance_state IS NULL AND ${searchableVectorSql('entity_embeddings', 'm.rowid')} LIMIT ${RECON_BATCH}`
       ).all() as Array<{ rowid: number; entity_id: string; embedding_text: string | null }>;
       if (rows.length === 0) return;
       for (const row of rows) {
@@ -277,7 +312,7 @@ export class BackfillCoordinator {
             `SELECT provenance_state FROM entity_embedding_metadata WHERE rowid = ?`
           ).get(row.rowid) as { provenance_state: string | null } | undefined;
           if (!cur || cur.provenance_state !== null) return;
-          db.exec(`DELETE FROM entity_embeddings WHERE rowid = ${row.rowid}`);
+          deleteVector(db, 'entity_embeddings', row.rowid);
           db.prepare(`DELETE FROM entity_embedding_metadata WHERE rowid = ?`).run(row.rowid);
         });
         const stampTx = db.transaction((hash: string) => {
@@ -328,8 +363,8 @@ export class BackfillCoordinator {
     for (;;) {
       if (this.shuttingDown) throw new Error('shutdown during reconciliation');
       const rows = db.prepare(
-        `SELECT m.rowid, m.text FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid
-         WHERE m.provenance_state IS NULL LIMIT ${RECON_BATCH}`
+        `SELECT m.rowid, m.text FROM chunk_metadata m
+         WHERE m.provenance_state IS NULL AND ${searchableVectorSql('chunks', 'm.rowid')} LIMIT ${RECON_BATCH}`
       ).all() as Array<{ rowid: number; text: string | null }>;
       if (rows.length === 0) return;
       for (const row of rows) {
@@ -340,7 +375,7 @@ export class BackfillCoordinator {
           // Vector removed; provenance stays NULL. The barrier only protects
           // VECTOR-BEARING NULL rows — vectorless rows are always legitimate
           // backfill targets (spec §6c "벡터 없음").
-          db.exec(`DELETE FROM chunks WHERE rowid = ${row.rowid}`);
+          deleteVector(db, 'chunks', row.rowid);
           db.prepare(`UPDATE chunk_metadata SET input_hash = NULL, profile_id = NULL WHERE rowid = ?`)
             .run(row.rowid);
         });
@@ -462,14 +497,30 @@ export class BackfillCoordinator {
       };
 
       // Phase 1: chunks.
-      const chunkRows = db.prepare(
-        `SELECT m.rowid, m.text, m.input_hash, m.profile_id, m.provenance_state,
-                EXISTS(SELECT 1 FROM chunks v WHERE v.rowid = m.rowid) AS has_vec
-         FROM chunk_metadata m WHERE m.text IS NOT NULL`
-      ).all() as Array<{ rowid: number; text: string; input_hash: string | null; profile_id: number | null; provenance_state: string | null; has_vec: number }>;
+      let sawInvalid = false;
+      const errorsBefore = JSON.stringify([...this.slotErrors]);
+      const slotErrorsChanged = () => JSON.stringify([...this.slotErrors]) !== errorsBefore;
+      // has_vec = searchable (D1c) · has_row = a _rowids row exists (valid or validity 0).
+      // An unresolvable slot map stops only this phase; the entity phase still runs.
+      type ChunkScanRow = { rowid: number; text: string; input_hash: string | null; profile_id: number | null; provenance_state: string | null; has_vec: number; has_row: number };
+      let chunkRows: ChunkScanRow[] = [];
+      try {
+        chunkRows = db.prepare(
+          `SELECT m.rowid, m.text, m.input_hash, m.profile_id, m.provenance_state,
+                  ${searchableVectorSql('chunks', 'm.rowid')} AS has_vec,
+                  EXISTS(SELECT 1 FROM chunks_rowids r WHERE r.rowid = m.rowid) AS has_row
+           FROM chunk_metadata m WHERE m.text IS NOT NULL`
+        ).all() as ChunkScanRow[];
+        this.slotErrors.delete('chunks');
+      } catch (e) {
+        if (!(e instanceof VecSlotError) && !String((e as Error).message).includes('vec0 slot')) throw e;
+        this.slotErrors.set('chunks', (e as Error).message);
+        console.error(`⚠️ backfill: chunk slot map unresolvable, chunk phase held: ${(e as Error).message}`);
+      }
       let processed = 0;
       for (const row of chunkRows) {
         if (this.shuttingDown || !this.eligible) return;
+        if (row.has_row && !row.has_vec) { this.requestRepair(); sawInvalid = true; continue; }   // validity 0 -> rebuild
         const currentHash = this.deps.chunkInputHash(row.text);
         const isTarget = !row.has_vec
           || (row.provenance_state !== null && (row.profile_id !== profileId || row.input_hash !== currentHash));
@@ -483,13 +534,24 @@ export class BackfillCoordinator {
       }
 
       // Phase 2: entities.
-      const entityRows = db.prepare(
-        `SELECT e.id, m.input_hash, m.profile_id, m.provenance_state, m.rowid AS meta_rowid,
-                CASE WHEN m.rowid IS NOT NULL AND EXISTS(SELECT 1 FROM entity_embeddings v WHERE v.rowid = m.rowid) THEN 1 ELSE 0 END AS has_vec
-         FROM entities e LEFT JOIN entity_embedding_metadata m ON m.entity_id = e.id`
-      ).all() as Array<{ id: string; input_hash: string | null; profile_id: number | null; provenance_state: string | null; meta_rowid: number | null; has_vec: number }>;
+      type EntityScanRow = { id: string; input_hash: string | null; profile_id: number | null; provenance_state: string | null; meta_rowid: number | null; has_vec: number; has_row: number };
+      let entityRows: EntityScanRow[] = [];
+      try {
+        entityRows = db.prepare(
+          `SELECT e.id, m.input_hash, m.profile_id, m.provenance_state, m.rowid AS meta_rowid,
+                  CASE WHEN m.rowid IS NOT NULL AND ${searchableVectorSql('entity_embeddings', 'm.rowid')} THEN 1 ELSE 0 END AS has_vec,
+                  CASE WHEN m.rowid IS NOT NULL AND EXISTS(SELECT 1 FROM entity_embeddings_rowids r WHERE r.rowid = m.rowid) THEN 1 ELSE 0 END AS has_row
+           FROM entities e LEFT JOIN entity_embedding_metadata m ON m.entity_id = e.id`
+        ).all() as EntityScanRow[];
+        this.slotErrors.delete('entity_embeddings');
+      } catch (e) {
+        if (!(e instanceof VecSlotError) && !String((e as Error).message).includes('vec0 slot')) throw e;
+        this.slotErrors.set('entity_embeddings', (e as Error).message);
+        console.error(`⚠️ backfill: entity slot map unresolvable, entity phase held: ${(e as Error).message}`);
+      }
       for (const row of entityRows) {
         if (this.shuttingDown || !this.eligible) return;
+        if (row.has_row && !row.has_vec) { this.requestRepair(); sawInvalid = true; continue; }   // validity 0 -> rebuild
         const currentHash = this.deps.buildEntityInputHash(row.id);
         if (currentHash === null) continue;                      // malformed entity: leave to explicit repair
         // Vector existence checked explicitly (beta B3): metadata alone is not
@@ -504,6 +566,7 @@ export class BackfillCoordinator {
         if (++processed % 8 === 0) await new Promise(r => setImmediate(r));
       }
 
+      if (sawInvalid || slotErrorsChanged()) this.snapshot = null;   // r3 M3: coverage reflects what the scan saw
       if (processed > 0) {
         this.snapshot = null;
         console.error(`✅ backfill pass complete (${processed} rows examined for re-embedding)`);
@@ -521,15 +584,24 @@ export class BackfillCoordinator {
                       entity: { total: 0, embedded: 0, verified: 0, legacy_assumed: 0 } };
     if (this.snapshot) return this.snapshot;
     const chunkTotal = (db.prepare(`SELECT COUNT(*) c FROM chunk_metadata`).get() as { c: number }).c;
-    const chunkBy = db.prepare(
-      `SELECT m.provenance_state s, COUNT(*) c FROM chunk_metadata m JOIN chunks v ON v.rowid = m.rowid
-       GROUP BY m.provenance_state`).all() as Array<{ s: string | null; c: number }>;
+    // Searchable only (D1c). A slot map error is reported per table instead of a count.
+    const byState = (sql: string): { rows: Array<{ s: string | null; c: number }>; error?: string } => {
+      try { return { rows: db.prepare(sql).all() as Array<{ s: string | null; c: number }> }; }
+      catch (e) {
+        if (!(e instanceof VecSlotError) && !String((e as Error).message).includes('vec0 slot')) throw e;
+        return { rows: [], error: (e as Error).message };
+      }
+    };
+    const chunkQ = byState(
+      `SELECT m.provenance_state s, COUNT(*) c FROM chunk_metadata m
+       WHERE ${searchableVectorSql('chunks', 'm.rowid')} GROUP BY m.provenance_state`);
+    const chunkBy = chunkQ.rows;
     const entTotal = (db.prepare(`SELECT COUNT(*) c FROM entities`).get() as { c: number }).c;
     // Vector-join (beta B3): metadata without an actual vector is missing, not embedded.
-    const entBy = db.prepare(
+    const entQ = byState(
       `SELECT m.provenance_state s, COUNT(*) c FROM entity_embedding_metadata m
-       JOIN entity_embeddings v ON v.rowid = m.rowid GROUP BY m.provenance_state`
-    ).all() as Array<{ s: string | null; c: number }>;
+       WHERE ${searchableVectorSql('entity_embeddings', 'm.rowid')} GROUP BY m.provenance_state`);
+    const entBy = entQ.rows;
     const pick = (rows: Array<{ s: string | null; c: number }>, s: string) =>
       rows.find(r => r.s === s)?.c ?? 0;
     // Searchable = verified + legacy_assumed. NULL rows (pre-reconciliation or
@@ -539,8 +611,10 @@ export class BackfillCoordinator {
     const entVerified = pick(entBy, 'verified');
     const entLegacy = pick(entBy, 'legacy_assumed');
     this.snapshot = {
-      chunk: { total: chunkTotal, embedded: chunkVerified + chunkLegacy, verified: chunkVerified, legacy_assumed: chunkLegacy },
-      entity: { total: entTotal, embedded: entVerified + entLegacy, verified: entVerified, legacy_assumed: entLegacy },
+      chunk: { total: chunkTotal, embedded: chunkVerified + chunkLegacy, verified: chunkVerified, legacy_assumed: chunkLegacy,
+               ...(chunkQ.error ? { error: chunkQ.error } : {}) },
+      entity: { total: entTotal, embedded: entVerified + entLegacy, verified: entVerified, legacy_assumed: entLegacy,
+                ...(entQ.error ? { error: entQ.error } : {}) },
     };
     return this.snapshot;
   }

@@ -49,6 +49,8 @@ import { EmbeddingGate, GateNotReadyError, GateDisabledError, TerminalConfigErro
 import type { EmbedFn, EmbedPriority } from './src/embeddingGate.js';
 import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock, handleLoaderFailure } from './src/modelCache.js';
 import { BackfillCoordinator } from './src/backfillCoordinator.js';
+import { writeVector, deleteVector, registerVecSlotFunctions, InvalidSlotError, slotSummary, rebuildVecTable, rebuildReason, DEFAULT_REBUILD_POLICY, VecSlotError } from './src/vecSlots.js';
+import type { SlotSummary, RebuildResult, VecTable } from './src/vecSlots.js';
 import { calendarDate, resolveCalendarTimeZone, stampDatePrefix, stripDatePrefix } from './src/observations/date-prefix.js';
 import os from 'node:os';
 import { createHash } from 'crypto';
@@ -484,6 +486,7 @@ export class RAGKnowledgeGraphManager {
   private openConnection(forceFkOff = false) {
     this.db = new Database(DB_FILE_PATH);
     sqliteVec.load(this.db);
+    registerVecSlotFunctions(this.db);   // vec_slot_valid() for the D1c searchability predicate
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('busy_timeout = 5000');
@@ -542,6 +545,68 @@ export class RAGKnowledgeGraphManager {
   writeSeq = 0;
   private tcBase = 0;
 
+  // ---- vec-slot-reuse D1b: idle verified rebuild of the vec0 tables -------------------------------
+  // Initial operating values (2_ s253 r2 Q3: starting values, not optima): look at most every 10 min,
+  // only after 60 s without a tool call or an own-connection write, never while a tool call, a backfill
+  // scan or a reconciliation is running. A repair request (validity-0 rows seen) skips the 10-min wait.
+  // The saving threshold and the live-vector cap live in DEFAULT_REBUILD_POLICY (src/vecSlots.ts).
+  private lastActivityAt = Date.now();
+  private lastWriteAt = 0;
+  private lastSlotCheckAt = 0;
+  // Last attempt per table. Process memory only: unknown after a restart (stats says so).
+  readonly vectorSlotLast: Partial<Record<VecTable, RebuildResult & { at: string }>> = {};
+  private static slotCheckMs = Number(process.env.RAG_MEMORY_SLOT_CHECK_MS ?? 600_000);
+  private static slotQuietMs = Number(process.env.RAG_MEMORY_SLOT_QUIET_MS ?? 60_000);
+
+  maybeRebuildVectors(now = Date.now()): RebuildResult[] | null {
+    if (!this.db || this.shuttingDown || this.inFlight > 0 || this.db.inTransaction) return null;
+    if (this.coordinator?.busy) return null;
+    if (now - Math.max(this.lastActivityAt, this.lastWriteAt) < RAGKnowledgeGraphManager.slotQuietMs) return null;
+    // A repair request skips the 10-min wait once: only if it arrived after the last check (r3 M5 — otherwise
+    // a busy / failed / over-cap attempt would be retried on every 1 s tick).
+    const repair = this.coordinator?.repairRequested ?? false;
+    const freshRepair = repair && (this.coordinator?.repairRequestedAt ?? 0) > this.lastSlotCheckAt;
+    if (!freshRepair && now - this.lastSlotCheckAt < RAGKnowledgeGraphManager.slotCheckMs) return null;
+    this.lastSlotCheckAt = now;
+    const results: RebuildResult[] = [];
+    for (const table of ['chunks', 'entity_embeddings'] as const) {
+      const r = rebuildVecTable(this.db, table);
+      this.vectorSlotLast[table] = { ...r, at: new Date(now).toISOString() };
+      results.push(r);
+      if (r.status === 'rebuilt') {
+        console.error(`🧹 vec0 ${table} rebuilt (${r.reason}): chunks ${r.before?.chunks} -> ${r.after?.chunks}, ` +
+          `valid ${r.after?.valid}, dropped validity-0 ${r.before?.invalid}, shared-slot ${r.before?.aliased}, ${r.ms} ms`);
+      } else if (r.status !== 'not-needed') {
+        console.error(`⚠️ vec0 ${table} rebuild ${r.status}${r.error ? `: ${r.error}` : ''}`);
+      }
+    }
+    if (repair && results.every(r => r.status === 'rebuilt' || r.status === 'not-needed')) this.coordinator?.takeRepairRequest();
+    if (results.some(r => r.status === 'rebuilt')) {
+      this.coordinator?.invalidateCoverage();
+      this.noteWrites();
+      this.coordinator?.kick();          // rows dropped as validity-0 are now missing -> re-embedded at their rowid
+    }
+    return results;
+  }
+
+  vectorSlotStats(): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const table of ['chunks', 'entity_embeddings'] as const) {
+      let summary: SlotSummary | { error: string };
+      try { summary = slotSummary(this.db!, table); }
+      catch (e) { summary = { error: (e as Error).message }; }
+      const pending = 'error' in summary ? 'position-error'
+        : (summary.valid > DEFAULT_REBUILD_POLICY.maxLive ? 'over-cap' : (rebuildReason(summary) ?? null));
+      const last = this.vectorSlotLast[table];
+      out[table] = { ...summary, due: pending,
+        last_attempt: last ? { at: last.at, status: last.status, reason: last.reason ?? null, ms: last.ms, error: last.error ?? null }
+                           : 'unknown (process memory; none since start)' };
+    }
+    out.policy = { ...DEFAULT_REBUILD_POLICY, check_ms: RAGKnowledgeGraphManager.slotCheckMs, quiet_ms: RAGKnowledgeGraphManager.slotQuietMs,
+      repair_requested: this.coordinator?.repairRequested ?? false, vacuum: 'never (maintenance script only)' };
+    return out;
+  }
+
   private totalChanges(): number {
     if (!this.db) return 0;
     return Number(this.db.prepare('select total_changes()').pluck().get());
@@ -553,6 +618,7 @@ export class RAGKnowledgeGraphManager {
       const tc = this.totalChanges();
       if (tc <= this.tcBase) return;
       this.tcBase = tc;
+      this.lastWriteAt = Date.now();
       this.writeSeq += 1;
       fsSync.writeSync(2, `[rag-memory] write-seq ${this.writeSeq}\n`);
     } catch { /* a dead handle is the reopen path's business; the next tick tries again */ }
@@ -744,7 +810,7 @@ export class RAGKnowledgeGraphManager {
     const meta = this.db!.prepare(`SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?`)
       .get(entityId) as { rowid: number } | undefined;
     if (meta) {
-      this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(meta.rowid)}`);
+      deleteVector(this.db!, 'entity_embeddings', Number(meta.rowid));
       this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`).run(entityId);
     }
     deleteStaleKgChunks(this.db!, entityId);
@@ -758,7 +824,7 @@ export class RAGKnowledgeGraphManager {
       .get(entityId) as { rowid: number } | undefined;
     if (!meta) return;
     const tx = this.db.transaction(() => {
-      this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(meta.rowid)}`);
+      deleteVector(this.db!, 'entity_embeddings', Number(meta.rowid));
       this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`).run(entityId);
     });
     tx();
@@ -783,8 +849,7 @@ export class RAGKnowledgeGraphManager {
       if (sha256Utf8(cur.text) !== captured.text_sha256) return false;              // body changed
       if (captured.cmp === null || kgComparisonValue(cur) !== captured.cmp) return false;  // inputs changed
       if (this.currentProfileId !== captured.profile_id) return false;              // profile changed during inference
-      this.db!.exec(`DELETE FROM chunks WHERE rowid = ${rowid}`);
-      this.db!.prepare(`INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)`).run(Buffer.from(embedding.buffer));
+      writeVector(this.db!, 'chunks', rowid, Buffer.from(embedding.buffer));      // same slot when valid (vec-slot-reuse)
       this.db!.prepare(`UPDATE chunk_metadata SET input_hash = ?, profile_id = ?, provenance_state = 'verified' WHERE rowid = ?`)
         .run(captured.text_sha256, captured.profile_id, rowid);
       const meta = parseEvidenceMetadata(cur.metadata);
@@ -796,7 +861,9 @@ export class RAGKnowledgeGraphManager {
       this.db!.prepare(`DELETE FROM embedding_backfill_failures WHERE kind = 'chunk' AND target_id = ?`).run(String(rowid));
       return true;
     });
-    const written = tx();
+    let written: boolean;
+    try { written = tx(); }
+    catch (e) { if (e instanceof InvalidSlotError) { this.coordinator?.requestRepair(); return false; } throw e; }
     this.coordinator?.invalidateCoverage();
     return written;
   }
@@ -830,14 +897,15 @@ export class RAGKnowledgeGraphManager {
       const tx = this.db.transaction((): boolean => {
         const cur = this.db!.prepare(`SELECT text FROM chunk_metadata WHERE rowid = ?`).get(rowid) as { text: string | null } | undefined;
         if (!cur || cur.text !== row.text) return false;       // superseded — discard
-        this.db!.exec(`DELETE FROM chunks WHERE rowid = ${safe}`);
-        this.db!.prepare(`INSERT INTO chunks (rowid, embedding) VALUES (${safe}, ?)`).run(Buffer.from(embedding.buffer));
+        writeVector(this.db!, 'chunks', safe, Buffer.from(embedding.buffer));
         this.db!.prepare(`UPDATE chunk_metadata SET input_hash = ?, profile_id = ?, provenance_state = 'verified' WHERE rowid = ?`)
           .run(hash, this.currentProfileId, rowid);
         this.db!.prepare(`DELETE FROM embedding_backfill_failures WHERE kind = 'chunk' AND target_id = ?`).run(String(rowid));
         return true;
       });
-      const written = tx();
+      let written: boolean;
+      try { written = tx(); }
+      catch (e) { if (e instanceof InvalidSlotError) { this.coordinator?.requestRepair(); return false; } throw e; }
       this.coordinator?.invalidateCoverage();
       return written;
     } catch (e) {
@@ -1121,6 +1189,7 @@ export class RAGKnowledgeGraphManager {
     if (this.walTimer) return;
     this.walTimer = setInterval(() => {
       try { this.walTick(); } catch (e) { console.error(`⚠️ wal tick: ${(e as Error).message}`); }
+      try { this.maybeRebuildVectors(); } catch (e) { console.error(`⚠️ vec0 rebuild check: ${(e as Error).message}`); }
       this.checkpointWal();
       this.noteWrites();
     }, tickMs);
@@ -1128,6 +1197,7 @@ export class RAGKnowledgeGraphManager {
   }
 
   noteActivity(delayMs = 200) {
+    this.lastActivityAt = Date.now();
     if (this.walSoon) return;
     this.walSoon = setTimeout(() => { this.walSoon = null; this.checkpointWal(); this.noteWrites(); }, delayMs);
     this.walSoon.unref();
@@ -1511,15 +1581,13 @@ export class RAGKnowledgeGraphManager {
           `).get(eid) as { rowid: number } | undefined;
 
           if (embeddingMetadata) {
-            const embeddings = this.db!.prepare(`
-              DELETE FROM entity_embeddings WHERE rowid = ?
-            `).run(embeddingMetadata.rowid);
+            const vecState = deleteVector(this.db!, 'entity_embeddings', Number(embeddingMetadata.rowid));
 
             const metadata = this.db!.prepare(`
               DELETE FROM entity_embedding_metadata WHERE entity_id = ?
             `).run(eid);
 
-            if (embeddings.changes > 0 || metadata.changes > 0) {
+            if (vecState === 'valid' || metadata.changes > 0) {
               console.error(`  ├─ Removed entity embeddings for '${name}'`);
             }
           }
@@ -1659,7 +1727,7 @@ export class RAGKnowledgeGraphManager {
             `SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?`)
             .get(p.entityId) as { rowid: number } | undefined;
           if (meta) {
-            this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(meta.rowid)}`);
+            deleteVector(this.db!, 'entity_embeddings', Number(meta.rowid));
             this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`)
               .run(p.entityId);
           }
@@ -2404,19 +2472,32 @@ export class RAGKnowledgeGraphManager {
           SELECT rowid FROM entity_embedding_metadata WHERE entity_id = ?
         `).get(entityId) as { rowid: number } | undefined;
         if (existingMetadata) {
-          this.db!.exec(`DELETE FROM entity_embeddings WHERE rowid = ${Number(existingMetadata.rowid)}`);
-          this.db!.prepare(`DELETE FROM entity_embedding_metadata WHERE entity_id = ?`).run(entityId);
+          // vec-slot-reuse: keep the rowid and rewrite the vector in place (DELETE + INSERT with a new
+          // rowid leaked one vec0 slot per re-embed). The metadata row is updated, not replaced.
+          writeVector(this.db!, 'entity_embeddings', Number(existingMetadata.rowid), Buffer.from(embedding.buffer));
+          this.db!.prepare(`
+            UPDATE entity_embedding_metadata
+               SET embedding_text = ?, input_hash = ?, profile_id = ?, provenance_state = 'verified'
+             WHERE rowid = ?
+          `).run(embeddingText, inputHash, this.currentProfileId, existingMetadata.rowid);
+          return true;
         }
-        const result = this.db!.prepare(`
-          INSERT INTO entity_embeddings (embedding) VALUES (?)
-        `).run(Buffer.from(embedding.buffer));
+        // r4 M2: metadata rows can now outlive their vector (kept unstamped to keep the rowid), so the vec0
+        // auto rowid could collide with one. Allocate past both tables, in this transaction.
+        const nextRowid = BigInt((this.db!.prepare(`SELECT MAX(r) m FROM (
+            SELECT MAX(rowid) r FROM entity_embedding_metadata UNION ALL SELECT MAX(rowid) r FROM entity_embeddings_rowids)`)
+          .safeIntegers(true).get() as { m: bigint | null }).m ?? 0n) + 1n;
+        writeVector(this.db!, 'entity_embeddings', nextRowid, Buffer.from(embedding.buffer));
+        const result = { lastInsertRowid: nextRowid };
         this.db!.prepare(`
           INSERT INTO entity_embedding_metadata (rowid, entity_id, embedding_text, input_hash, profile_id, provenance_state)
           VALUES (?, ?, ?, ?, ?, 'verified')
         `).run(result.lastInsertRowid, entityId, embeddingText, inputHash, this.currentProfileId);
         return true;
       });
-      const written = writeTx();
+      let written: boolean;
+      try { written = writeTx(); }
+      catch (e) { if (e instanceof InvalidSlotError) { this.coordinator?.requestRepair(); return false; } throw e; }
       if (!written) {
         console.error(`⏭️ discarded superseded embedding for ${entityId} (entity changed during inference)`);
       }
@@ -2649,7 +2730,7 @@ export class RAGKnowledgeGraphManager {
 
     for (const chunk of existingChunks) {
       // Delete vector embeddings (vec0 needs literal integer, not parameterized)
-      this.db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(chunk.rowid)}`);
+      deleteVector(this.db, 'chunks', safeRowid(chunk.rowid));
       deletedVectors++;
 
       const associations = this.db.prepare(`
@@ -3035,7 +3116,7 @@ export class RAGKnowledgeGraphManager {
         const existing = db.prepare(`SELECT rowid FROM chunk_metadata WHERE document_id = ?`).all(documentId) as { rowid: number }[];
         for (const ch of existing) {
           db.prepare(`DELETE FROM chunk_entities WHERE chunk_rowid = ?`).run(ch.rowid);
-          db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(ch.rowid)}`);
+          deleteVector(db, 'chunks', safeRowid(ch.rowid));
         }
         db.prepare(`DELETE FROM chunk_metadata WHERE document_id = ?`).run(documentId);
         deleteKgChunkRows(db, citedEvidence);
@@ -3050,8 +3131,12 @@ export class RAGKnowledgeGraphManager {
           `).run(chunkId, documentId, seg.chunk_index, seg.text, seg.start_pos, seg.end_pos, seg.start_token, seg.end_token);
           const rowid = Number(info.lastInsertRowid);
           if (vec) {
-            db.prepare(`INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)`).run(vec);
-            db.prepare(`UPDATE chunk_metadata SET input_hash = ?, profile_id = ?, provenance_state = ? WHERE rowid = ?`)
+            // A validity-0 row left at a reused rowid cannot be written over (vec-slot-reuse): the chunk then stays
+            // vectorless (missing) until the idle rebuild drops that row and the backfill embeds it.
+            let wrote = true;
+            try { writeVector(db, 'chunks', rowid, vec); }
+            catch (e) { if (e instanceof InvalidSlotError) { wrote = false; this.coordinator?.requestRepair(); } else throw e; }
+            if (wrote) db.prepare(`UPDATE chunk_metadata SET input_hash = ?, profile_id = ?, provenance_state = ? WHERE rowid = ?`)
               .run(shaHex(seg.text), this.currentProfileId, provenance, rowid);
           }
         }
@@ -3227,16 +3312,14 @@ export class RAGKnowledgeGraphManager {
       // Store in vector table (+ verified provenance, §6a-2 atomic)
       try {
         const tx = this.db.transaction(() => {
-          this.db!.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(rowid)}`);
-          this.db!.prepare(`
-            INSERT INTO chunks (rowid, embedding) VALUES (${rowid}, ?)
-          `).run(Buffer.from(embedding.buffer));
+          writeVector(this.db!, 'chunks', safeRowid(rowid), Buffer.from(embedding.buffer));
           this.db!.prepare(`UPDATE chunk_metadata SET input_hash = ?, profile_id = ?, provenance_state = 'verified' WHERE rowid = ?`)
             .run(createHash('sha256').update(chunk.text).digest('hex'), this.currentProfileId, rowid);
         });
         tx();
         embeddedCount++;
       } catch (error) {
+        if (error instanceof InvalidSlotError) this.coordinator?.requestRepair();
         const errMsg = `chunk ${chunk.chunk_id} (rowid=${rowid}, type=${typeof chunk.rowid}): ${error instanceof Error ? error.message : String(error)}`;
         console.error(`Failed to embed ${errMsg}`);
         errors.push(errMsg);
@@ -3680,7 +3763,7 @@ export class RAGKnowledgeGraphManager {
         deletedAssociations += associations.changes;
 
         // Delete vector embeddings (vec0 needs literal integer, not parameterized)
-        db.exec(`DELETE FROM chunks WHERE rowid = ${safeRowid(chunk.rowid)}`);
+        deleteVector(db, 'chunks', safeRowid(chunk.rowid));
         deletedVectors++;
       }
 
@@ -3966,11 +4049,12 @@ export class RAGKnowledgeGraphManager {
         `SELECT rowid FROM chunk_metadata WHERE chunk_type IN ('entity','relationship')`)
         .all() as Array<{ rowid: number }>;
       for (const c of orphanChunks) {
-        this.db!.exec(`DELETE FROM chunks WHERE rowid = ${Number(c.rowid)}`);
+        deleteVector(this.db!, 'chunks', Number(c.rowid));
         this.db!.prepare(`DELETE FROM chunk_metadata WHERE rowid = ?`).run(c.rowid);
       }
-      this.db!.exec(
-        `DELETE FROM entity_embeddings WHERE rowid IN (SELECT rowid FROM entity_embedding_metadata)`);
+      for (const m of this.db!.prepare(`SELECT rowid FROM entity_embedding_metadata`).all() as Array<{ rowid: number }>) {
+        deleteVector(this.db!, 'entity_embeddings', Number(m.rowid));   // validity-0 rows are left to the rebuild
+      }
       this.db!.exec(`DELETE FROM entity_embedding_metadata`);
       console.error('🗑️ Cleared existing data for full import');
     }
@@ -4943,9 +5027,17 @@ export class RAGKnowledgeGraphManager {
         reconciliation_state: this.coordinator?.reconState ?? 'n/a',
         reconciliation_last_error: this.coordinator?.reconLastError ?? null,
         coverage: cov ? {
-          chunk: { total: cov.chunk.total, embedded: cov.chunk.embedded, verified: cov.chunk.verified, legacy_assumed: cov.chunk.legacy_assumed, missing: cov.chunk.total - cov.chunk.embedded },
-          entity: { total: cov.entity.total, embedded: cov.entity.embedded, verified: cov.entity.verified, legacy_assumed: cov.entity.legacy_assumed, missing: cov.entity.total - cov.entity.embedded },
+          // vec-slot-reuse D1c: an unresolvable slot map is reported as error with missing = null, not as a count.
+          chunk: cov.chunk.error
+            ? { total: cov.chunk.total, embedded: null, verified: null, legacy_assumed: null, missing: null, error: cov.chunk.error }
+            : { total: cov.chunk.total, embedded: cov.chunk.embedded, verified: cov.chunk.verified, legacy_assumed: cov.chunk.legacy_assumed, missing: cov.chunk.total - cov.chunk.embedded },
+          entity: cov.entity.error
+            ? { total: cov.entity.total, embedded: null, verified: null, legacy_assumed: null, missing: null, error: cov.entity.error }
+            : { total: cov.entity.total, embedded: cov.entity.embedded, verified: cov.entity.verified, legacy_assumed: cov.entity.legacy_assumed, missing: cov.entity.total - cov.entity.embedded },
         } : null,
+        // vec-slot-reuse: per vec0 table = slots, searchable, validity-0 rows, reclaimable chunks, why a rebuild
+        // is (not) due, and the last attempt of this process. Read-only: computing it writes nothing.
+        vector_slots: this.db ? this.vectorSlotStats() : null,
       }
     };
   }

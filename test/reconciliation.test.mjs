@@ -98,15 +98,23 @@ const nullChunk = db.prepare(`
 assert.equal(nullEnt + nullChunk, 0, 'complete invariant violated (DoD 21)');
 console.log('  OK: complete invariant - zero unreconciled vectors');
 
-// (a2) split-state sanitation (beta B3): metadata-only row removed, orphan vector removed
-assert.equal(db.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE entity_id='entity_e_meta_only'`).get().c, 0,
-  'metadata-without-vector not sanitized');
+// (a2) split-state sanitation (beta B3 · vec-slot-reuse r3 M2): a metadata-only row is no longer deleted — it is
+// kept unstamped (missing) so the backfill re-inserts its vector at the same rowid; orphan vectors are removed.
+const metaOnly = db.prepare(`SELECT rowid, provenance_state FROM entity_embedding_metadata WHERE entity_id='entity_e_meta_only'`).get();
+assert.ok(metaOnly && metaOnly.rowid === 99991 && metaOnly.provenance_state === null,
+  'metadata-without-vector must stay as an unstamped (missing) row at its rowid');
+assert.equal(mgr.coordinator.coverage().entity.embedded,
+  db.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata m JOIN entity_embeddings_rowids r ON r.rowid = m.rowid`).get().c,
+  'the metadata-only row is not counted as embedded');
 assert.equal(db.prepare(`SELECT COUNT(*) c FROM entity_embeddings WHERE rowid NOT IN (SELECT rowid FROM entity_embedding_metadata)`).get().c, 0,
   'orphan vectors not sanitized');
-console.log('  OK: split-state sanitation (meta-only removed, orphans removed)');
+console.log('  OK: split-state sanitation (meta-only kept as missing at its rowid, orphans removed)');
 
 // (a3) old-profile sanitation (beta B4): previous-profile verified vectors deleted-to-missing
-assert.equal(db.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE entity_id='entity_e_oldprof'`).get().c, 0,
+// vec-slot-reuse r3 M2: the vector is deleted; the metadata row stays unstamped (missing) so the rowid is kept.
+const oldProf = db.prepare(`SELECT rowid, provenance_state, profile_id FROM entity_embedding_metadata WHERE entity_id='entity_e_oldprof'`).get();
+assert.ok(oldProf && oldProf.provenance_state === null && oldProf.profile_id === null
+  && db.prepare(`SELECT COUNT(*) c FROM entity_embeddings_rowids WHERE rowid = ?`).get(oldProf.rowid).c === 0,
   'old-profile entity vector still searchable');
 assert.equal(db.prepare(`SELECT COUNT(*) c FROM chunks WHERE rowid=${coldRowid}`).get().c, 0,
   'old-profile chunk vector still searchable');

@@ -352,6 +352,23 @@ writer must preserve them.
    intact; no partial replacement is published (`test/kg-embed-cas.test.mjs`, `test/kg-evidence-cas.test.mjs`).
 5. `getDetailedContext` branches on `chunk_type`; `full_context_available` means "body resolvable", not "evidence
    verified" (`evidence_status`) (`test/kg-detail-context.test.mjs`).
+6. **Same-rowid vector rewrites go through `writeVector` (`src/vecSlots.ts`), never DELETE + INSERT** (measured
+   2026-11-02, sqlite-vec 0.1.7): vec0 only fills free slots of the latest 1,024-slot chunk, so DELETE + INSERT of a row
+   in an older chunk leaks a slot (the hub DB reached 93.5% empty slots). `writeVector` = valid → UPDATE (same slot) ·
+   absent → INSERT · validity 0 → `InvalidSlotError` (vec0 refuses to DELETE such a row for most bit layouts; only the
+   verified rebuild `rebuildVecTable` removes it). Entity re-embed keeps its metadata rowid. Real deletes stay deletes
+   but go through `deleteVector` (valid → DELETE · validity 0 → left for the rebuild · absent → nothing): a raw
+   `DELETE FROM chunks|entity_embeddings WHERE rowid = …` fails on a validity-0 row and aborts the caller's transaction.
+   Entity metadata whose vector row is gone is normalized to missing, not deleted (keeps the rowid). A validity-0 slot
+   looks free to vec0, so a later insert can share it with the old rowid (`slotState` = `shared`, owned by neither).
+   `writeVector`/`deleteVector` repair the table inline (verified rebuild in the caller's transaction) before touching
+   a validity-0 or shared slot or deleting next to one; new entity rowids are allocated past both the metadata and the
+   vec0 rowids.
+   "Has a vector" means **searchable**: use `searchableVectorSql(table, rowidExpr)` (LEFT JOIN `_rowids`/`_chunks` +
+   the `vec_slot_valid()` function registered in `openConnection`), not `JOIN <table> ON rowid` — that join is true for
+   validity-0 rows. An unresolvable slot position raises (`VecSlotError`); it is never counted as missing or embedded.
+   The idle rebuild (`maybeRebuildVectors`, WAL keeper tick) and its limits are in `specs/changes/vec-slot-reuse`
+   (`test/vec-slot-reuse.test.mjs`, `test/vec-rebuild.test.mjs`).
 The no-argument `generateKnowledgeGraphChunks()` keeps the previous entity/triplet bodies, IDs, metadata and counts
 (the fixes above still apply); calling it replaces existing evidence relationship chunks with triplet chunks
 (`test/kg-defaults.test.mjs`).
