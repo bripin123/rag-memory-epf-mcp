@@ -154,6 +154,30 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### v6.4.3 (2026-11-02)
+
+- **Fixed — re-embedding no longer leaks vector slots.** sqlite-vec puts a new row only into a free slot of the latest
+  1,024-slot chunk, so the old DELETE + INSERT of the same rowid left a hole whenever the row sat in an older chunk (one
+  project DB reached 84 chunks for 5,578 vectors, 93.5% empty, 337 of 439 MB). Same-rowid re-embeds (document chunks,
+  KG chunks, bulk `embedChunks`, entities) now rewrite the vector in place; entity re-embeds keep their rowid.
+- **Added — idle verified rebuild of the vector tables.** When the engine is idle (no tool call, backfill or
+  reconciliation; 60 s quiet; checked at most every 10 min) and a table has at least 8 reclaimable chunks that outweigh
+  its live vectors, or holds damaged slots, it is rebuilt in one transaction keeping every searchable rowid and its
+  exact vector bytes (verified before commit; rolled back otherwise). Skipped at once if another connection holds the
+  write lock. Automatic only up to 20,000 live vectors per table (measured on one Mac: 5,600 = 0.44 s, 20,000 =
+  1.24 s and +267 MB transient). No VACUUM: the file stops growing; it shrinks only through a VACUUM.
+- **Fixed — coverage counts only searchable vectors.** A row whose slot validity bit is 0 (invisible to search) was
+  counted as embedded; it is now missing and is repaired: writes and deletes that meet such a slot, or a slot shared by
+  two rowids, rebuild the table first in the same transaction, then the backfill re-embeds at the original rowid.
+  An unresolvable slot position is reported as an error (`missing: null`), never as a count.
+- **Added — `getKnowledgeGraphStats().server.vector_slots`**: per table slots, valid, validity-0, shared, empty,
+  reclaimable chunks, whether a rebuild is due and why, and this process's last attempt.
+- **Added — write-seq signal** (`[rag-memory] write-seq N` on stderr when the engine's own connection changed rows),
+  used by the framework launcher to record a DB handoff only after the engine wrote.
+- **Changed — an entity metadata row whose vector row is gone is kept unstamped (missing) instead of deleted**, so the
+  backfill re-inserts at the same rowid; new entity rowids are allocated past both tables.
+- Not measured: Windows, Drive-synced DBs under two machines, tables above 20,000 vectors.
+
 ### v6.4.2 (2026-10-31)
 
 - **Fixed — the engine no longer keeps the peak memory of its largest embedding.** The ONNX session is opened with

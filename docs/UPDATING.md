@@ -108,6 +108,16 @@ path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
 is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
 the next start becomes a clean download owner.
 
+## v6.4.3 (schema v14, unchanged): vector slots rewritten in place, idle rebuild, searchable-only coverage
+
+**What changes for an existing database.** Nothing is migrated and nothing is re-embedded. Re-embeds stop leaving empty
+vector slots. On the first idle check after start (about 60 s quiet, then at most every 10 min) a table with many empty
+slots or with damaged slots is rebuilt once in place (rowids and vector bytes kept, verified before commit); the DB file
+does not shrink until a VACUUM (`scripts/rag-maintenance/compact-vectors.mjs` in the framework does build + VACUUM).
+Coverage may now report a few `missing` vectors that 6.4.2 counted as embedded (invisible validity-0 rows); the backfill
+fills them. `server.vector_slots` shows the state. An engine that is already running keeps the old behaviour until it
+restarts on 6.4.3.
+
 ## v6.4.2 (schema v14, unchanged): CPU memory arena off, transformers 4.3.2
 
 **What changes for an existing database.** Nothing is migrated and nothing is re-embedded (the embedding profile —
