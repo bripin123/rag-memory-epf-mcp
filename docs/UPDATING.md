@@ -108,6 +108,14 @@ path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
 is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
 the next start becomes a clean download owner.
 
+## v6.4.4 (schema v14, unchanged): real cosine similarity in default search, chunk orphan vectors cleaned
+
+**What changes for an existing database.** Nothing is migrated and nothing is re-embedded. On the first reconciliation
+after start, searchable chunk vectors that have no metadata row are deleted (the count shows as
+`coverage.chunk.orphan_vectors` before, 0 after). Similarity numbers shown by `searchNodes` and the default
+`hybridSearch` change to real cosine values; their order does not. `useGraph: true` and summaries-on results stay as in
+6.4.3. An engine that is already running keeps the old behaviour until it restarts on 6.4.4.
+
 ## v6.4.3 (schema v14, unchanged): vector slots rewritten in place, idle rebuild, searchable-only coverage
 
 **What changes for an existing database.** Nothing is migrated and nothing is re-embedded. Re-embeds stop leaving empty

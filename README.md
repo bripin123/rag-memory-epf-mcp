@@ -154,6 +154,24 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### v6.4.4 (2026-11-07)
+
+- **Fixed — the similarity numbers are real cosine similarities.** The vec0 tables use the default L2 metric and the
+  embeddings are unit-normalized, so cosine similarity = 1 − d²/2. The engine used 1 − d/2 (L2 read as a cosine
+  distance): `searchNodes` `similarity` and the default `hybridSearch` `vector_similarity` were too low above cos 0.5
+  (cos 0.8 showed ≈0.684) and too high below it (orthogonal vectors showed ≈0.293 instead of 0). Ranking of the default
+  search is unchanged (rank fusion uses ranks only).
+- **Unchanged on purpose — the legacy paths keep the 6.3.2 score.** `hybridSearch` with `useGraph: true` or with
+  summaries on, and the graph-seed threshold (`> 0.4`, about cosine 0.28), stay byte-identical to 6.3.2 for evaluation
+  comparability; that score is named `legacyL2AsCosineScore` and is not a cosine.
+- **Fixed — chunk vectors without metadata are cleaned up.** Reconciliation now deletes searchable chunk vectors that
+  have no `chunk_metadata` row (same rule and batching as entity orphans; off mode only classifies it as deferred).
+  `importGraph` no longer creates them: a full replace (`merge: false`) and a same-id document replace delete that
+  document's chunk vectors first. Rowids past 2^53 are kept exact.
+- **Added — `getKnowledgeGraphStats().server.coverage.{chunk,entity}.orphan_vectors`**: searchable vectors with no
+  metadata row (`null` when the slot map cannot be resolved). `missing` keeps its meaning.
+- Not measured: Windows, Drive-synced DBs under two machines.
+
 ### v6.4.3 (2026-11-02)
 
 - **Fixed — re-embedding no longer leaks vector slots.** sqlite-vec puts a new row only into a free slot of the latest
