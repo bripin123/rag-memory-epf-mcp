@@ -49,6 +49,7 @@ import { EmbeddingGate, GateNotReadyError, GateDisabledError, TerminalConfigErro
 import type { EmbedFn, EmbedPriority } from './src/embeddingGate.js';
 import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock, handleLoaderFailure } from './src/modelCache.js';
 import { BackfillCoordinator } from './src/backfillCoordinator.js';
+import { l2ToCosineSimilarity, legacyL2AsCosineScore } from './src/vecSimilarity.js';
 import { writeVector, deleteVector, registerVecSlotFunctions, InvalidSlotError, slotSummary, rebuildVecTable, rebuildReason, DEFAULT_REBUILD_POLICY, VecSlotError } from './src/vecSlots.js';
 import type { SlotSummary, RebuildResult, VecTable } from './src/vecSlots.js';
 import { calendarDate, resolveCalendarTimeZone, stampDatePrefix, stripDatePrefix } from './src/observations/date-prefix.js';
@@ -2109,7 +2110,7 @@ export class RAGKnowledgeGraphManager {
       name: result.name,
       entityType: result.entityType,
       observations: JSON.parse(result.observations),
-      similarity: Math.max(0, 1 - result.distance / 2) // Convert cosine distance (0-2) to similarity (1-0)
+      similarity: l2ToCosineSimilarity(result.distance) // vec0 L2 distance of unit vectors -> cosine similarity
     }));
 
     // hybrid-partial (spec §4): entities without vectors must not vanish from
@@ -4039,12 +4040,18 @@ export class RAGKnowledgeGraphManager {
       this.db!.exec(`DELETE FROM entity_observations`);
       this.db!.exec(`DELETE FROM observation_roots`);
       this.db!.exec(`DELETE FROM entities`);
+      // documents → chunk_metadata is a CASCADE, but vec0 has no FK: delete the document chunk vectors first,
+      // or they stay searchable-less orphans (IN-42 · same order as storeDocument's replace path).
+      // rowids stay BigInt end to end (2_ r1 R1: a Number cast past 2^53 deletes the wrong vector)
+      for (const c of this.db!.prepare(`SELECT rowid FROM chunk_metadata WHERE document_id IS NOT NULL`).safeIntegers(true).all() as Array<{ rowid: bigint }>) {
+        deleteVector(this.db!, 'chunks', c.rowid);
+      }
       this.db!.exec(`DELETE FROM documents`);
       // entities 를 지워도 파생 데이터는 따라오지 않는다: chunk_metadata 에는
       // entities 로 가는 FK 가 없고 entity_embedding_metadata.entity_id 는 UNIQUE 일
       // 뿐이다. 그래서 replace-import 뒤에 **사라진 entity 의 벡터와 KG chunk 가
-      // 검색에 남았다**(advisor beta 발견 2). document chunk 는 documents 의
-      // CASCADE 로 이미 정리되므로 여기서는 entity·relationship chunk 만 지운다.
+      // 검색에 남았다**(advisor beta 발견 2). document chunk 메타는 documents 의
+      // CASCADE 로 정리되고 그 벡터는 위에서 먼저 지웠다(IN-42) — 여기서는 entity·relationship chunk 만 지운다.
       const orphanChunks = this.db!.prepare(
         `SELECT rowid FROM chunk_metadata WHERE chunk_type IN ('entity','relationship')`)
         .all() as Array<{ rowid: number }>;
@@ -4122,6 +4129,10 @@ export class RAGKnowledgeGraphManager {
       for (const doc of data.documents) {
         // doc.id is a string here (checked above, before any write).
         for (const r of collectEvidenceRowidsCitingDocument(this.db!, doc.id)) citedEvidence.add(r);
+        // REPLACE deletes an existing row → its chunk_metadata goes by CASCADE, the vec0 vectors would not (IN-42).
+        for (const c of this.db!.prepare(`SELECT rowid FROM chunk_metadata WHERE document_id = ?`).safeIntegers(true).all(doc.id) as Array<{ rowid: bigint }>) {
+          deleteVector(this.db!, 'chunks', c.rowid);
+        }
         const result = stmt.run(
           doc.id,
           doc.content,
@@ -4306,7 +4317,7 @@ export class RAGKnowledgeGraphManager {
 
   /**
    * Diagnostic seam for the graph re-ranker (evaluation change graph-role-evaluation, R2).
-   * Returns the seed entities (query-vector matched, similarity > 0.4, top-10 per variant) and the
+   * Returns the seed entities (query-vector matched, legacy score > 0.4 = cosine ≈0.28, top-10 per variant) and the
    * 1-hop connected entities exactly as hybridSearch(useGraph:true) computes them, plus edge detail
    * that hybridSearch itself does not use (edge id, type, direction, confidence). It never generates
    * candidates and never changes ranking; hybridSearch consumes only the name sets.
@@ -4362,7 +4373,7 @@ export class RAGKnowledgeGraphManager {
             WHERE r.source_entity = ? OR r.target_entity = ?
             ORDER BY r.id`);
       for (const entity of similar) {
-        const similarity = Math.max(0, 1 - entity.distance / 2);
+        const similarity = legacyL2AsCosineScore(entity.distance);   // legacy seed score, pinned (4ac3155) — not a cosine
         if (similarity > 0.4) {
           seeds.push({ entity_id: entity.entity_id, name: entity.name, similarity });
           for (const row of edgeStmt.all(entity.entity_id, entity.entity_id, entity.entity_id, entity.entity_id, entity.entity_id) as any[]) {
@@ -4745,7 +4756,8 @@ export class RAGKnowledgeGraphManager {
         ));
       }
       
-      const vectorSimilarity = Math.max(0, 1 - result.distance / 2);
+      // default (rank fusion) = real cosine · legacy paths (useGraph:true or summaries on) keep the pinned 6.3.2 score
+      const vectorSimilarity = rankFusion ? l2ToCosineSimilarity(result.distance) : legacyL2AsCosineScore(result.distance);
       const ftsBoost = ftsBoostMap.get(result.chunk_id) || 0;   // = 1/(60 + FTS rank), 0 if not an FTS hit
       const vectorRank = vectorRankOf.get(result.chunk_id);
       const finalScore = rankFusion
@@ -5029,11 +5041,11 @@ export class RAGKnowledgeGraphManager {
         coverage: cov ? {
           // vec-slot-reuse D1c: an unresolvable slot map is reported as error with missing = null, not as a count.
           chunk: cov.chunk.error
-            ? { total: cov.chunk.total, embedded: null, verified: null, legacy_assumed: null, missing: null, error: cov.chunk.error }
-            : { total: cov.chunk.total, embedded: cov.chunk.embedded, verified: cov.chunk.verified, legacy_assumed: cov.chunk.legacy_assumed, missing: cov.chunk.total - cov.chunk.embedded },
+            ? { total: cov.chunk.total, embedded: null, verified: null, legacy_assumed: null, missing: null, orphan_vectors: null, error: cov.chunk.error }
+            : { total: cov.chunk.total, embedded: cov.chunk.embedded, verified: cov.chunk.verified, legacy_assumed: cov.chunk.legacy_assumed, missing: cov.chunk.total - cov.chunk.embedded, orphan_vectors: cov.chunk.orphan_vectors ?? null },
           entity: cov.entity.error
-            ? { total: cov.entity.total, embedded: null, verified: null, legacy_assumed: null, missing: null, error: cov.entity.error }
-            : { total: cov.entity.total, embedded: cov.entity.embedded, verified: cov.entity.verified, legacy_assumed: cov.entity.legacy_assumed, missing: cov.entity.total - cov.entity.embedded },
+            ? { total: cov.entity.total, embedded: null, verified: null, legacy_assumed: null, missing: null, orphan_vectors: null, error: cov.entity.error }
+            : { total: cov.entity.total, embedded: cov.entity.embedded, verified: cov.entity.verified, legacy_assumed: cov.entity.legacy_assumed, missing: cov.entity.total - cov.entity.embedded, orphan_vectors: cov.entity.orphan_vectors ?? null },
         } : null,
         // vec-slot-reuse: per vec0 table = slots, searchable, validity-0 rows, reclaimable chunks, why a rebuild
         // is (not) due, and the last attempt of this process. Read-only: computing it writes nothing.

@@ -33,8 +33,9 @@ export type ReconState = 'pending' | 'running' | 'complete' | 'failed' | 'deferr
 export interface CoverageSnapshot {
   // embedded = searchable vectors only (vec-slot-reuse D1c): a _rowids row with validity 0 is missing.
   // error = the slot map of that table could not be resolved; the counts are then not reported.
-  chunk: { total: number; embedded: number; verified: number; legacy_assumed: number; error?: string };
-  entity: { total: number; embedded: number; verified: number; legacy_assumed: number; error?: string };
+  // orphan_vectors = searchable vectors with no metadata row (sanitation deletes them · not part of missing).
+  chunk: { total: number; embedded: number; verified: number; legacy_assumed: number; orphan_vectors?: number; error?: string };
+  entity: { total: number; embedded: number; verified: number; legacy_assumed: number; orphan_vectors?: number; error?: string };
 }
 
 export interface CoordinatorDeps {
@@ -133,6 +134,8 @@ export class BackfillCoordinator {
       // vec-slot-reuse r3 M2: searchable orphans only (validity-0 rows belong to the rebuild); vectorless
       // metadata counts only while still stamped (it is normalized to missing, not deleted, to keep its rowid).
       + q(`SELECT COUNT(*) c FROM entity_embeddings_rowids m WHERE m.rowid NOT IN (SELECT rowid FROM entity_embedding_metadata) AND ${searchableVectorSql('entity_embeddings', 'm.rowid')}`)
+      // IN-42: searchable chunk vectors without chunk_metadata (same rule as entity orphans)
+      + q(`SELECT COUNT(*) c FROM chunks_rowids m WHERE m.rowid NOT IN (SELECT rowid FROM chunk_metadata) AND ${searchableVectorSql('chunks', 'm.rowid')}`)
       + q(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE provenance_state IS NOT NULL AND rowid NOT IN (SELECT rowid FROM entity_embeddings_rowids)`)
       + q(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE provenance_state IS NOT NULL AND profile_id IS NOT ?`, profileId)
       + q(`SELECT COUNT(*) c FROM chunk_metadata m WHERE m.provenance_state IS NOT NULL AND m.profile_id IS NOT ? AND m.rowid IN (SELECT rowid FROM chunks_rowids)`, profileId)
@@ -169,6 +172,18 @@ export class BackfillCoordinator {
       ).all() as Array<{ rowid: number }>;
       if (orphans.length === 0) break;
       batchTx(() => { for (const r of orphans) { deleteVector(db, 'entity_embeddings', r.rowid); touched++; } });
+      if (orphans.length < RECON_BATCH) break;
+      await new Promise(r => setImmediate(r));
+    }
+    // 1b. searchable chunk vectors without metadata -> delete (IN-42 · same batching and validity rule as 1)
+    for (;;) {
+      if (this.shuttingDown) throw new Error('shutdown during sanitation');
+      const orphans = db.prepare(
+        `SELECT m.rowid FROM chunks_rowids m
+         WHERE m.rowid NOT IN (SELECT rowid FROM chunk_metadata) AND ${searchableVectorSql('chunks', 'm.rowid')} LIMIT ${RECON_BATCH}`
+      ).safeIntegers(true).all() as Array<{ rowid: bigint }>;
+      if (orphans.length === 0) break;
+      batchTx(() => { for (const r of orphans) { deleteVector(db, 'chunks', r.rowid); touched++; } });
       if (orphans.length < RECON_BATCH) break;
       await new Promise(r => setImmediate(r));
     }
@@ -216,7 +231,10 @@ export class BackfillCoordinator {
       });
       await new Promise(r => setImmediate(r));
     }
-    if (touched > 0) console.error(`🧾 provenance sanitation: ${touched} split-state/old-profile rows invalidated`);
+    if (touched > 0) {
+      this.snapshot = null;   // cached coverage (incl. orphan_vectors) is stale — also on the legacy=0 early return (2_ r1 R2)
+      console.error(`🧾 provenance sanitation: ${touched} split-state/old-profile/orphan rows invalidated`);
+    }
     return touched;
   }
 
@@ -602,6 +620,12 @@ export class BackfillCoordinator {
       `SELECT m.provenance_state s, COUNT(*) c FROM entity_embedding_metadata m
        WHERE ${searchableVectorSql('entity_embeddings', 'm.rowid')} GROUP BY m.provenance_state`);
     const entBy = entQ.rows;
+    const orphanQ = (t: 'chunks' | 'entity_embeddings', meta: string): number | undefined => {
+      try { return (db.prepare(`SELECT COUNT(*) c FROM ${t}_rowids m WHERE m.rowid NOT IN (SELECT rowid FROM ${meta}) AND ${searchableVectorSql(t, 'm.rowid')}`).get() as { c: number }).c; }
+      catch (e) { if (!(e instanceof VecSlotError) && !String((e as Error).message).includes('vec0 slot')) throw e; return undefined; }
+    };
+    const chunkOrphans = orphanQ('chunks', 'chunk_metadata');
+    const entOrphans = orphanQ('entity_embeddings', 'entity_embedding_metadata');
     const pick = (rows: Array<{ s: string | null; c: number }>, s: string) =>
       rows.find(r => r.s === s)?.c ?? 0;
     // Searchable = verified + legacy_assumed. NULL rows (pre-reconciliation or
@@ -611,9 +635,9 @@ export class BackfillCoordinator {
     const entVerified = pick(entBy, 'verified');
     const entLegacy = pick(entBy, 'legacy_assumed');
     this.snapshot = {
-      chunk: { total: chunkTotal, embedded: chunkVerified + chunkLegacy, verified: chunkVerified, legacy_assumed: chunkLegacy,
+      chunk: { total: chunkTotal, embedded: chunkVerified + chunkLegacy, verified: chunkVerified, legacy_assumed: chunkLegacy, orphan_vectors: chunkOrphans,
                ...(chunkQ.error ? { error: chunkQ.error } : {}) },
-      entity: { total: entTotal, embedded: entVerified + entLegacy, verified: entVerified, legacy_assumed: entLegacy,
+      entity: { total: entTotal, embedded: entVerified + entLegacy, verified: entVerified, legacy_assumed: entLegacy, orphan_vectors: entOrphans,
                 ...(entQ.error ? { error: entQ.error } : {}) },
     };
     return this.snapshot;

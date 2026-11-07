@@ -16,6 +16,10 @@ const { manager: mgr, dbPath, cleanup } = await makeManager();
 process.on('uncaughtException', (e) => { try { cleanup(); } catch {} console.error(e); process.exit(1); });
 process.on('unhandledRejection', (e) => { try { cleanup(); } catch {} console.error(e); process.exit(1); });
 installFakeEmbedder(mgr);
+// A real engine reconciles the empty DB at boot (single-flight: later calls return n/a). Do that first so the
+// metadata-less filler vectors stay a test device: reconciled later, the orphan-vector sanitation (IN-42) would
+// delete them and the chunk-side repair rebuild under test (Contract 4) would never be reached.
+{ const mode = mgr.embeddingsMode; mgr.embeddingsMode = 'lazy'; await mgr.startReconciliation(); mgr.embeddingsMode = mode; }
 const db = mgr.db;
 let failed = 0;
 const check = (cond, msg) => { if (cond) console.log(`  OK: ${msg}`); else { failed++; console.log(`  FAIL: ${msg}`); } };
