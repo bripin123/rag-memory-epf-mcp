@@ -32,8 +32,8 @@ Same process, inside `EmbeddingGate`, which already owns the model lifecycle. A 
 
 ## Definition of done
 
-- Unit (fake loaders): `test/model-on-demand.test.mjs`, wired into `verify:engine`; 14 mutants of the new code all fail it.
-- Real model, published-engine harness on a DB copy (`measure/e2e2.json`): boot leaves the model out (171 MB); from idle, 143 frozen queries give the same top-10 order as 6.4.4 for `hybridSearch` and `searchNodes`, all `hybrid`; idle 523-579 MB over 10 unload/reload cycles with no growth; reload-and-search 1.7-2.2 s; a write from idle is `embedded`.
+- Unit (fake loaders): `test/model-on-demand.test.mjs`, wired into `verify:engine`; 17 mutants of the new code all fail it.
+- Real model, published-engine harness on a DB copy (`measure/e2e3.json`): boot leaves the model out (171 MB); from idle, 143 frozen queries give the same top-10 order as 6.4.4 for `hybridSearch` and `searchNodes`, all `hybrid`; idle 524-587 MB over 10 unload/reload cycles with no growth; reload-and-search 1.7-2.8 s; a write from idle is `embedded`.
 - `npm test` passes on the final tree.
 
 ## Not measured

@@ -123,6 +123,10 @@ export function compileFtsLiteralQuery(q: string): string | null {
 // reclaims on a collection, and an idle server allocates nothing that would trigger one (measured
 // 2026-11-09: a real idle engine stayed at 1.4-1.8 GB without this). Two passes with a gap let
 // the finalizers of the first pass run.
+async function disposeModel(model: any): Promise<void> {
+  try { await model.dispose(); } finally { await collectGarbageNow(); }
+}
+
 export async function collectGarbageNow(): Promise<void> {
   try {
     v8.setFlagsFromString('--expose-gc');
@@ -685,6 +689,7 @@ export class RAGKnowledgeGraphManager {
     // Shutdown aborts the lock wait via the gate's AbortController (spec §3).
     console.error('⏳ acquiring model download lock...'); // deterministic lock-wait marker (5R test residual)
     const role = await lock.acquireOrWait({ timeoutMs: 10 * 60_000, signal: this.gate.abort.signal });
+    let created: unknown = null;       // built but not yet handed to the gate
     try {
       if (!this.modelFilesOnDisk()) this.gate.markDownloading();
       env.allowRemoteModels = true;
@@ -693,6 +698,7 @@ export class RAGKnowledgeGraphManager {
       const model = await __pipelineImpl('feature-extraction', EMBEDDING_MODEL,
         { revision: MODEL_REVISION, dtype: MODEL_DTYPE, cache_dir: cacheDir,
           session_options: { ...MODEL_SESSION_OPTIONS } } as any);
+      created = model;
       // dims fail-fast (spec §2 / beta B8): probe the ACTUAL output length — a
       // 384/768-dim custom model must fail here with a clear message, not at
       // every subsequent vector write.
@@ -708,7 +714,7 @@ export class RAGKnowledgeGraphManager {
       if (role === 'owner') lock.markComplete();
       console.error(`✅ ${EMBEDDING_MODEL} model loaded (${MODEL_DTYPE})`);
       const embed: LoadedModel = makeEmbedFn(model as any, IS_DEFAULT_MODEL_CONFIG);
-      embed.dispose = async () => { await (model as any).dispose(); await collectGarbageNow(); };
+      embed.dispose = () => disposeModel(model);
       return embed;
     } catch (e) {
       // Cache policy by CAUSE and ROLE (beta 2R B3 -> 4R M1 -> 5R M1), unit-
@@ -723,6 +729,7 @@ export class RAGKnowledgeGraphManager {
       if (action === 'quarantined') console.error('🧹 cache-integrity failure (owner) — model cache quarantined');
       else if (action === 'marker-invalidated') console.error('… cache-integrity failure (reader) — marker dropped, next retry re-proves as locked owner');
       else if (!(e instanceof TerminalConfigError)) console.error('… non-integrity load failure — model cache preserved');
+      if (created) await disposeModel(created).catch(() => { /* the load failure is what the caller needs */ });
       throw e;
     } finally {
       lock.release();
@@ -911,7 +918,8 @@ export class RAGKnowledgeGraphManager {
         const embedding = await this.generateEmbedding(row.text, 1024, false, 'backfill', `profile:${captured.profile_id}`);
         return this.writeKgVectorIfCurrent(captured, embedding);
       } catch (e) {
-        if (e instanceof GateNotReadyError || e instanceof GateDisabledError) return false;
+        // MODEL_NOT_READY propagates: the backfill must not charge it against this row.
+        if (e instanceof GateDisabledError) return false;
         throw e;
       }
     }
@@ -937,7 +945,7 @@ export class RAGKnowledgeGraphManager {
       this.coordinator?.invalidateCoverage();
       return written;
     } catch (e) {
-      if (e instanceof GateNotReadyError || e instanceof GateDisabledError) return false;
+      if (e instanceof GateDisabledError) return false;
       throw e;
     }
   }
@@ -3081,7 +3089,23 @@ export class RAGKnowledgeGraphManager {
         if (cmCount > 0 && embCount < cmCount) {
           // v3.6 (spec §5b M12): identical content with incomplete/stale vectors keeps the
           // document, chunks, rowids and entity links — only missing vectors are re-queued.
-          console.error(`♻️ syncDocumentFromFile: ${documentId} unchanged but ${cmCount - embCount} vectors missing — re-queued (chunks preserved)`);
+          console.error(`♻️ syncDocumentFromFile: ${documentId} unchanged but ${cmCount - embCount} vectors missing — repairing (chunks preserved)`);
+          if (await this.gate.ensureReady()) {
+            const missing = this.db.prepare(`
+              SELECT m.rowid FROM chunk_metadata m
+              WHERE m.document_id = ? AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.rowid = m.rowid AND (m.provenance_state IS NULL OR m.profile_id = ?))
+            `).all(documentId, this.currentProfileId) as Array<{ rowid: number }>;
+            let repaired = 0;
+            try {
+              for (const r of missing) if (await this.reembedChunkByRowid(r.rowid)) repaired++;
+            } catch (e) {
+              if (!(e instanceof GateNotReadyError)) throw e;
+            }
+            if (repaired === missing.length) {
+              return { documentId, bytes, chunks: cmCount, embeddedChunks: embCount + repaired, linkedEntities: linked,
+                       skipped: true, reason: 'unchanged-revectorizing', embedding_status: 'embedded', ...zero, queuedChunks: 0 };
+            }
+          }
           this.coordinator?.kick();
           return { documentId, bytes, chunks: cmCount, embeddedChunks: embCount, linkedEntities: linked,
                    skipped: true, reason: 'unchanged-revectorizing',

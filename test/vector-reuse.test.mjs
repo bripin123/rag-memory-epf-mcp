@@ -136,7 +136,7 @@ try {
   db.exec('DELETE FROM chunks');
   const r11b = await manager.syncDocumentFromFile(file, 'd1', {});
   assert.equal(r11b.reason, 'unchanged-revectorizing');
-  assert.ok(r11b.queuedChunks > 0 && r11b.reusedChunks === 0 && r11b.deletedChunks === 0, 'revectorizing additive 필드');
+  assert.ok(r11b.queuedChunks === 0 && r11b.reusedChunks === 0 && r11b.deletedChunks === 0, 'revectorizing additive 필드');
 
   // [12] failure predicate: kind='chunk' 만 지운다
   {

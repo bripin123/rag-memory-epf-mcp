@@ -37,7 +37,7 @@ try {
   const fourth = await manager.syncDocumentFromFile(file, 'doc1', {});
   assert(fourth.skipped === true && fourth.reason === 'unchanged-revectorizing',
     `hash-match + missing vectors re-queues instead of re-chunking (got ${fourth.reason})`);
-  assert(fourth.embedding_status === 'queued', 'revectorizing reports queued');
+  assert(fourth.embedding_status === 'embedded', 'revectorizing repairs the vectors before returning');
   const rowidsAfter = db.prepare('SELECT rowid FROM chunk_metadata WHERE document_id = ? ORDER BY rowid').all('doc1').map(r => r.rowid);
   assert(JSON.stringify(rowidsAfter) === JSON.stringify(rowidsBefore), 'chunk rowids preserved (no re-chunk churn)');
 

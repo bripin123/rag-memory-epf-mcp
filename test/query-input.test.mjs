@@ -22,7 +22,7 @@ try {
   assert(seen[0] === '질문 하나' && seen[1] === '문서 조각' && seen[2] === `${L}question one`, `stub model received raw / raw / legacy-instructed input (${JSON.stringify(seen)})`);
   assert(v instanceof Float32Array && v.length === 1024, 'embed function returns a Float32Array of the requested dims');
   const dist = readFileSync(new URL('../dist/index.js', import.meta.url), 'utf8');
-  assert(/= makeEmbedFn\(model, IS_DEFAULT_MODEL_CONFIG\)/.test(dist), 'the real loader builds on makeEmbedFn(model, IS_DEFAULT_MODEL_CONFIG)');
+  assert(/const embed = makeEmbedFn\(model, IS_DEFAULT_MODEL_CONFIG\);[\s\S]{0,300}?return embed;/.test(dist), 'the real loader returns the makeEmbedFn(model, IS_DEFAULT_MODEL_CONFIG) function');
   const row = m.db.prepare(`SELECT value FROM server_meta WHERE key='query_prefix_version'`).get();
   assert(row?.value === '2', `init marker query_prefix_version = 2 for the default model (${row?.value})`);
   console.log(process.exitCode ? 'query-input: FAIL' : 'query-input: ALL PASS');

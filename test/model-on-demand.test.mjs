@@ -3,7 +3,8 @@
 // FTS is only for "the files are not on this machine yet" and "loading really failed".
 // Fake loaders only — no model, no network.
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+import { rmSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { makeManager } from './helpers/engine-test-db.mjs';
 
 const { manager: mgr, dir } = await makeManager();
@@ -232,6 +233,21 @@ const P = { priority: 'interactive' };
   console.log('  OK: prefetchIfMissing');
 }
 
+{ // model files on disk: the weights decide, not the completion marker
+  const { modelFilesPresent } = await import('../dist/src/modelCache.js');
+  const root = join(dir, 'cache-check');
+  const put = (rel, body) => { const f = join(root, rel); mkdirSync(join(f, '..'), { recursive: true }); writeFileSync(f, body); };
+  assert.equal(modelFilesPresent(root, 'Org/m', 'abc', 'fp16'), false, 'absent weights reported present');
+  put('Org/m/abc/onnx/model_fp16.onnx', '');
+  assert.equal(modelFilesPresent(root, 'Org/m', 'abc', 'fp16'), false, 'empty weights reported present');
+  put('Org/m/abc/onnx/model_fp16.onnx', 'x');
+  assert.equal(modelFilesPresent(root, 'Org/m', 'abc', 'fp16'), true, 'weights without a marker must count as present');
+  assert.equal(modelFilesPresent(root, 'Org/m', 'other', 'fp16'), false, 'another revision reported present');
+  put('Org/m/onnx/model_fp16.onnx', 'x');
+  assert.equal(modelFilesPresent(root, 'Org/m', 'main', 'fp16'), true, 'main revision path');
+  console.log('  OK: modelFilesPresent follows the weights file');
+}
+
 // ---- Engine paths -------------------------------------------------------------------------
 
 mgr.embeddingsMode = 'lazy';
@@ -300,6 +316,23 @@ assert.equal(mgr.coordinator.reconState, 'n/a');
   }
 }
 
+{ // identical content with a missing vector: the repair finishes before the call returns
+  cur = install();
+  const s0 = await mgr.syncDocumentFromFile('/nonexistent-d.md', 'doc-d', { content: 'content whose vector will go missing' });
+  assert.equal(s0.embeddedChunks, 1);
+  const row = mgr.db.prepare(`SELECT rowid FROM chunk_metadata WHERE document_id='doc-d'`).get();
+  mgr.db.prepare(`DELETE FROM chunks WHERE rowid = ?`).run(BigInt(row.rowid));
+  cur = install();
+  const s = await mgr.syncDocumentFromFile('/nonexistent-d.md', 'doc-d', { content: 'content whose vector will go missing' });
+  assert.equal(s.reason, 'unchanged-revectorizing');
+  assert.equal(s.embedding_status, 'embedded', `repair queued on an idle gate (${s.embedding_status})`);
+  assert.equal(s.embeddedChunks, 1);
+  assert.equal(s.queuedChunks, 0);
+  assert.equal(cur.c.loads, 1);
+  assert.equal(mgr.db.prepare(`SELECT COUNT(*) c FROM chunks WHERE rowid = ?`).get(BigInt(row.rowid)).c, 1, 'vector not restored');
+  console.log('  OK: unchanged document with a missing vector is repaired before returning');
+}
+
 { // files missing: FTS at once, marked, nothing recorded as a data failure
   cur = install({ isModelCached: () => false }, { beforeLoad: () => new Promise(() => {}) });
   const r = await mgr.hybridSearch('alpha', 5, false);
@@ -310,6 +343,12 @@ assert.equal(mgr.coordinator.reconState, 'n/a');
   assert.equal(n.search_mode, 'fts-only');
   const e = await mgr.createEntities([{ name: 'Download Entity', entityType: 'CONCEPT', observations: ['during download'] }]);
   assert.equal(e[0].embedding_status, 'queued');
+  // a document chunk and a KG chunk left without vectors reach the chunk callbacks of the backfill
+  const pend = await mgr.syncDocumentFromFile('/nonexistent-e.md', 'doc-e', { content: 'pending document chunk during download' });
+  assert.equal(pend.embedding_status, 'queued');
+  await mgr.generateKnowledgeGraphChunks();
+  const kgMissing = mgr.db.prepare(`SELECT COUNT(*) c FROM chunk_metadata m WHERE m.chunk_type IN ('entity','relationship') AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.rowid = m.rowid)`).get().c;
+  assert.ok(kgMissing > 0, 'fixture must leave KG chunks without vectors');
   const before = mgr.db.prepare(`SELECT COUNT(*) c FROM embedding_backfill_failures`).get().c;
   await mgr.coordinator.scanAndBackfill();
   const after = mgr.db.prepare(`SELECT COUNT(*) c FROM embedding_backfill_failures`).get().c;
@@ -318,7 +357,7 @@ assert.equal(mgr.coordinator.reconState, 'n/a');
 }
 
 { // the backfill wakes the model only when there is work
-  cur = install();                                  // Download Entity above still has no vector
+  cur = install();                                  // the rows left above still have no vector
   await mgr.coordinator.scanAndBackfill();
   assert.equal(cur.c.loads, 1, 'pending work did not load the model');
   const vecs = mgr.db.prepare(`SELECT COUNT(*) c FROM entity_embedding_metadata WHERE entity_id = 'entity_download_entity'`).get().c;
@@ -327,6 +366,19 @@ assert.equal(mgr.coordinator.reconState, 'n/a');
   await mgr.coordinator.scanAndBackfill();
   assert.equal(cur.c.loads, 0, 'nothing to do but the model was loaded');
   console.log('  OK: backfill loads the model only when there is work');
+}
+
+{ // a KG chunk reached first by the backfill is not charged either (the scan stops at the first not-ready row)
+  cur = install();
+  await mgr.generateKnowledgeGraphChunks();
+  const docMissing = mgr.db.prepare(`SELECT COUNT(*) c FROM chunk_metadata m WHERE m.chunk_type = 'document' AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.rowid = m.rowid)`).get().c;
+  assert.equal(docMissing, 0, 'fixture must leave only KG chunks without vectors');
+  cur = install({ isModelCached: () => false }, { beforeLoad: () => new Promise(() => {}) });
+  const before = mgr.db.prepare(`SELECT COUNT(*) c FROM embedding_backfill_failures`).get().c;
+  await mgr.coordinator.scanAndBackfill();
+  const after = mgr.db.prepare(`SELECT COUNT(*) c FROM embedding_backfill_failures`).get().c;
+  assert.equal(after, before, 'not-ready on a KG chunk recorded as a per-row failure');
+  console.log('  OK: not-ready on a KG chunk is not charged to the row');
 }
 
 { // a real load failure: marked FTS
