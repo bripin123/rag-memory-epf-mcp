@@ -79,7 +79,7 @@ src/tools/              MCP tool *declarations* only (no behaviour)
   types.ts              ToolDefinition · ToolCapabilityInfo · ToolRegistrationDescription
 
 src/backup/preflight.ts   pre-migration backup (Online Backup API) into the next free recovery slot; verified (quick_check + FTS5 integrity-check), published no-clobber via link(), bounded, fails closed when full
-src/embeddingGate.ts      embedding admission control
+src/embeddingGate.ts      embedding model lifecycle: on-demand load, idle unload, serial inference queue
 src/backfillCoordinator.ts  background embedding backfill
 src/modelCache.ts         version-independent model cache (v3.6)
 src/chunkerC.ts           document chunking — structure-anchored chunker "c1" (there is no src/chunkText.ts) · an oversize block that reaches the fallback is split by a verified token window, with the previous linear scan kept when no candidate verifies (signature fallback=cp-window-N; a cp-exact-N stamp stays current format)
@@ -325,6 +325,14 @@ by a reopen reruns itself (≤3). A reopen waits
 for running tool calls, and never runs while shutting down. Known limit: writes acknowledged ≤1 s
 before a swap can be lost if the old file is unreadable (one TRUNCATE on the old handle is tried
 first). `test/wal-sidecar-guard.test.mjs`.
+
+**The embedding model is in memory only while it is used (`EmbeddingGate`, `specs/changes/model-on-demand`).** `embed()`
+on an idle gate loads and waits; `lazy` does not load at boot; `RAG_MEMORY_MODEL_IDLE_MS` unloads it. `coordinator.eligible`
+means "reconciliation settled and the gate can serve", not "model loaded" — do not re-add a readiness check to a search
+or write path, or it silently falls to FTS/`queued`. `disposing` alone does not return the memory: the weights also sit in
+JS-owned buffers, and an idle server allocates nothing that would trigger a collection, so the loader's `dispose` runs
+`collectGarbageNow()` (measured: idle 1.4-1.8 GB without it, 0.52-0.58 GB with it). Faking "model down" in a test means
+state `failed`, because `idle` now loads. `test/model-on-demand.test.mjs`.
 
 **Tool declarations carry no logic.** `src/tools/*` is descriptions and zod schemas; behaviour is a
 manager method. Keep it that way — `validateToolArgs` is the only bridge.

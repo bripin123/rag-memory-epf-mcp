@@ -12,13 +12,15 @@ const { EmbeddingGate } = await import('../dist/src/embeddingGate.js');
 // Controllable fake gate: starts NOT-ready; test flips to ready later.
 const inferences = [];
 let failTexts = new Set();
-const gate = new EmbeddingGate({ mode: 'lazy', loadModel: async () => async (text) => {
+// Not-ready here means the model files are still being fetched; an idle gate would simply load.
+let releaseLoad; const loadGate = new Promise(r => { releaseLoad = r; });
+const gate = new EmbeddingGate({ mode: 'lazy', isModelCached: () => false, loadModel: async () => { await loadGate; return async (text) => {
   if ([...failTexts].some(t => text.includes(t))) throw new Error(`forced failure for ${text.slice(0, 20)}`);
   inferences.push(text.slice(0, 40));
   const v = new Float32Array(1024);
   for (let i = 0; i < text.length; i++) v[i % 1024] += text.charCodeAt(i) / 1000;
   return v;
-}});
+}; }});
 mgr.gate = gate;                 // idle (not ready)
 mgr.embeddingsMode = 'lazy';
 const db = mgr.db;
@@ -50,6 +52,7 @@ assert.ok(ftsHit >= 1, 'lazy-synced chunk not in FTS');
 console.log('  OK: lazy sync -> document+chunks+FTS stored, zero vectors');
 
 // ---- (d) post-ready automatic recovery WITHOUT restart (DoD 4) -------------
+releaseLoad();
 await gate.start();              // model becomes ready -> onReady wiring is external; kick manually like main() would
 assert.equal(mgr.coordinator.reconState, 'pending');
 await mgr.startReconciliation(); // fresh rows only -> 'n/a'

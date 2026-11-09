@@ -51,12 +51,17 @@ preserves this customization).
 
 `RAG_MEMORY_EMBEDDINGS` = `lazy` (default) | `eager` | `off`
 
-- `lazy` — MCP connects instantly; FTS5 search, graph and CRUD work from the
-  first second. The model loads/downloads in the background; hybrid search
-  turns on automatically (search responses carry `search_mode` /
-  `degradation_reason` so you can see why vector search is off).
+- `lazy` — MCP connects instantly and the model stays out of memory until
+  something needs it. A search or write that needs it waits for it (about 2.5 s
+  on a warm disk) and still runs the vector path. After
+  `RAG_MEMORY_MODEL_IDLE_MS` (default 180000, `0` = keep it resident) without
+  use it leaves memory; `model_state` then reads `idle`, which is normal.
+  If the model files are not on the machine yet they are fetched in the
+  background from boot, and until they arrive — or if loading really fails, or
+  a caller has waited 45 s — search answers from FTS5 and says so
+  (`search_mode` / `degradation_reason`) and writes report `queued`.
 - `eager` — pre-3.6 behavior: boot waits for the model (and provenance
-  reconciliation) before connecting.
+  reconciliation) before connecting, and the model stays resident.
 - `off` — never loads the model. Zero download, FTS5-only, permanently.
   Responses report `embedding_status: "disabled"` (not `"queued"` — nothing
   will backfill in this mode).
@@ -85,13 +90,13 @@ back to the default, the stored vectors cannot be attributed reliably. Run
 - Concurrent servers: measured 2026-07-18 on the reference machine — 7 idle
   MCP server processes coexist (idle servers swap out to a few MB RSS). Each
   server that actually loads the model needs bge-m3 fp16 resident memory
-  (~1.5–2GB while active). Keep concurrently *model-active* servers to a
-  handful; sessions that don't need semantic search should run
-  `RAG_MEMORY_EMBEDDINGS=off`. Note that **lazy mode still starts the model
-  load in the background right after connect** (so hybrid search becomes
-  available without any tool call) — `off` is the only zero-load mode. When
-  restarting many CLIs at once, the shared cache download happens once (lock),
-  but each process that finishes loading holds its own model memory.
+  (~1.5–2GB while active). `lazy` servers hold it only while in use and for
+  the idle period after; several servers searching at the same moment still
+  each hold their own copy. After an unload a process stays above a
+  model-less server (measured 2026-11-09, macOS: about 0.55 GB idle, against
+  about 2 GB resident before, and 0.13-0.2 GB with `RAG_MEMORY_EMBEDDINGS=off`).
+  When restarting many CLIs at once, the shared cache download happens once
+  (lock).
 
 ## Shutdown semantics
 

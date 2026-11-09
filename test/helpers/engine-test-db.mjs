@@ -44,7 +44,7 @@ export function installFakeEmbedder(manager) {
 
 export function simulateModelDown(manager) {
   const gate = manager.gate;
-  gate.state = 'idle';           // not-ready: gate.embed rejects GateNotReadyError
+  gate.state = 'failed';         // a real load failure: gate.embed rejects GateNotReadyError (idle now loads on demand)
   gate.embedFn = null;
   manager.embeddingCache = new Map(); // drop cached query embeddings so the down path is actually exercised
 }

@@ -10,6 +10,8 @@
 export type ModelState = 'disabled' | 'idle' | 'loading' | 'downloading' | 'ready' | 'failed';
 export type EmbedPriority = 'interactive' | 'bulk' | 'backfill';
 export type EmbedFn = (text: string, dims: number, isQuery: boolean) => Promise<Float32Array>;
+// A loaded model may expose dispose(): the gate calls it when the model leaves memory.
+export type LoadedModel = EmbedFn & { dispose?: () => Promise<unknown> };
 
 export class GateDisabledError extends Error {
   readonly code = 'EMBEDDINGS_DISABLED';
@@ -41,6 +43,20 @@ export class TerminalConfigError extends Error {
 
 const PRIO: Record<EmbedPriority, number> = { interactive: 0, bulk: 1, backfill: 2 };
 const DEFAULT_BACKOFF_MS = [30_000, 120_000, 600_000, 3_600_000];
+// A caller stops waiting before the MCP SDK's default 60 s request timeout, so it still gets an
+// answer that says what happened. The load itself carries on.
+const DEFAULT_LOAD_WAIT_MS = 45_000;
+
+// Three minutes. In one measured tool-call timeline the short gaps ended at 146 s and the next
+// began at 547 s, so five minutes kept the model longer without saving a reload.
+export const DEFAULT_MODEL_IDLE_MS = 180_000;
+
+// 0 means never unload; anything unparsable falls back to the default.
+export function resolveModelIdleMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_MODEL_IDLE_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_MODEL_IDLE_MS;
+}
 
 interface Job {
   text: string;
@@ -55,15 +71,18 @@ interface Job {
 
 export interface GateOptions {
   mode: 'lazy' | 'eager' | 'off';
-  loadModel: () => Promise<EmbedFn>;
+  loadModel: () => Promise<LoadedModel>;
   onReady?: () => void;
   onStateChange?: (s: ModelState) => void;
   backoffMs?: number[];
+  idleMs?: number;                 // lazy only; 0 or absent = stays loaded
+  loadWaitMs?: number;             // how long one caller waits for a load
+  isModelCached?: () => boolean;   // false = the files must be fetched first
 }
 
 export class EmbeddingGate {
   private state: ModelState;
-  private embedFn: EmbedFn | null = null;
+  private embedFn: LoadedModel | null = null;
   private startPromise: Promise<void> | null = null;
   private queue: Job[] = [];
   private running = false;
@@ -85,10 +104,16 @@ export class EmbeddingGate {
   private lastError?: string;
   private retryAt?: string;
   private readonly backoff: number[];
+  private readonly idleMs: number;
+  private readonly loadWaitMs: number;
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private unloading: Promise<void> | null = null;
 
   constructor(private readonly opts: GateOptions) {
     this.backoff = opts.backoffMs ?? DEFAULT_BACKOFF_MS;
     this.state = opts.mode === 'off' ? 'disabled' : 'idle';
+    this.idleMs = opts.mode === 'lazy' ? Math.max(0, opts.idleMs ?? 0) : 0;
+    this.loadWaitMs = opts.loadWaitMs ?? DEFAULT_LOAD_WAIT_MS;
   }
 
   get status() {
@@ -96,6 +121,8 @@ export class EmbeddingGate {
   }
   get isReady() { return this.state === 'ready'; }
   get isDisabled() { return this.state === 'disabled'; }
+  // True while a caller can expect a model: loaded, or loadable by waiting.
+  get canServe() { return this.state === 'ready' || this.state === 'idle' || this.state === 'loading'; }
 
   private setState(s: ModelState) {
     if (this.state !== s) {
@@ -119,6 +146,8 @@ export class EmbeddingGate {
 
   private async loadOnce(): Promise<void> {
     this.setState('loading');
+    // Never two models in memory: a load that follows an unload waits for it to finish.
+    if (this.unloading) await this.unloading;
     try {
       this.embedFn = await this.opts.loadModel();
       this.attempt = 0;
@@ -160,13 +189,66 @@ export class EmbeddingGate {
     this.retryTimer.unref?.();
   }
 
-  embed(text: string, o: { dims?: number; isQuery?: boolean; priority: EmbedPriority }): Promise<Float32Array> {
-    if (this.state === 'disabled') return Promise.reject(new GateDisabledError());
-    if (this.shuttingDown) return Promise.reject(new GateNotReadyError(this.state));
-    if (this.state !== 'ready') {
-      const retryAfterMs = this.retryAt ? Math.max(0, Date.parse(this.retryAt) - Date.now()) : undefined;
-      return Promise.reject(new GateNotReadyError(this.state, retryAfterMs));
+  private notReady(): GateNotReadyError {
+    const retryAfterMs = this.retryAt ? Math.max(0, Date.parse(this.retryAt) - Date.now()) : undefined;
+    return new GateNotReadyError(this.state, retryAfterMs);
+  }
+
+  private isCached(): boolean {
+    return this.opts.isModelCached ? this.opts.isModelCached() : true;
+  }
+
+  // Fetch the model at boot only when its files are absent, so the first real use finds it.
+  prefetchIfMissing(): void {
+    if (this.state === 'disabled' || this.isCached()) return;
+    void this.start().catch(() => { /* surfaced via state */ });
+  }
+
+  // Resolves once the model is in memory. Rejects only when waiting cannot help: the files are
+  // not on this machine yet, the load really failed, or the bounded wait ran out.
+  private async awaitReady(): Promise<void> {
+    if (this.state === 'disabled') throw new GateDisabledError();
+    if (this.shuttingDown) throw this.notReady();
+    if (this.state === 'ready') return;
+    if (this.state === 'failed' || this.state === 'downloading') throw this.notReady();
+    if (!this.isCached()) {
+      void this.start().catch(() => { /* surfaced via state */ });
+      throw this.notReady();
     }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const limit = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('load wait exceeded')), this.loadWaitMs);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([this.start(), limit]);
+    } catch {
+      throw this.notReady();
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    if (!this.isReady) throw this.notReady();
+  }
+
+  // For callers that must decide before they start work (document sync).
+  async ensureReady(): Promise<boolean> {
+    try {
+      await this.awaitReady();
+      return true;
+    } catch (e) {
+      if (e instanceof GateNotReadyError || e instanceof GateDisabledError) return false;
+      throw e;
+    }
+  }
+
+  embed(text: string, o: { dims?: number; isQuery?: boolean; priority: EmbedPriority }): Promise<Float32Array> {
+    if (this.state === 'ready' && !this.shuttingDown) return this.enqueue(text, o);
+    return this.awaitReady().then(() => this.enqueue(text, o));
+  }
+
+  private enqueue(text: string, o: { dims?: number; isQuery?: boolean; priority: EmbedPriority }): Promise<Float32Array> {
+    if (this.shuttingDown) return Promise.reject(this.notReady());
+    this.clearIdleTimer();
     return new Promise<Float32Array>((resolve, reject) => {
       this.queue.push({
         text, dims: o.dims ?? 1024, isQuery: o.isQuery ?? false,
@@ -177,10 +259,42 @@ export class EmbeddingGate {
     });
   }
 
+  private clearIdleTimer(): void {
+    if (this.idleTimer) { clearTimeout(this.idleTimer); this.idleTimer = null; }
+  }
+
+  private armIdleTimer(): void {
+    this.clearIdleTimer();
+    if (this.idleMs <= 0 || this.state !== 'ready' || this.shuttingDown) return;
+    this.idleTimer = setTimeout(() => this.unloadIdle(), this.idleMs);
+    this.idleTimer.unref?.();
+  }
+
+  private unloadIdle(): void {
+    this.idleTimer = null;
+    if (this.state !== 'ready') return;
+    const model = this.embedFn;
+    this.embedFn = null;
+    this.startPromise = null;
+    this.readySince = undefined;
+    this.setState('idle');
+    this.release(model);
+    console.error(`💤 embedding model unloaded after ${this.idleMs} ms idle`);
+  }
+
+  private release(model: LoadedModel | null): void {
+    if (!model?.dispose) return;
+    this.unloading = Promise.resolve()
+      .then(() => model.dispose!())
+      .then(() => undefined)
+      .catch(e => { console.error(`⚠️ model dispose failed: ${e instanceof Error ? e.message : e}`); })
+      .finally(() => { this.unloading = null; });
+  }
+
   private pump(): void {
     if (this.running || !this.embedFn) return;
     const job = this.queue.shift();
-    if (!job) return;
+    if (!job) { this.armIdleTimer(); return; }
     this.running = true;
     void this.embedFn(job.text, job.dims, job.isQuery)
       .then(v => {
@@ -198,6 +312,7 @@ export class EmbeddingGate {
         this.failedInputs.add(`${job.text}|${job.dims}|${job.isQuery}`);
         if (this.failedInputs.size >= 3 && this.state === 'ready' && !this.shuttingDown) {
           this.lastError = e instanceof Error ? e.message : String(e);
+          this.release(this.embedFn);
           this.embedFn = null;
           this.startPromise = null;
           this.failedInputs.clear();
@@ -227,6 +342,7 @@ export class EmbeddingGate {
     this.shuttingDown = true;
     this.generation++;
     this.abort.abort();
+    this.clearIdleTimer();
     if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
     for (const j of this.queue.splice(0)) j.reject(new Error('gate shutdown'));
     const deadline = Date.now() + deadlineMs;

@@ -41,8 +41,8 @@ export interface CoverageSnapshot {
 export interface CoordinatorDeps {
   db: () => Database.Database | null;
   // Gate access is late-bound: tests swap manager.gate after initialize.
-  gateIsReady: () => boolean;
   gateIsDisabled: () => boolean;
+  gateCanServe: () => boolean;
   mode: () => 'lazy' | 'eager' | 'off';
   grandfatherAllowed: () => boolean;
   currentProfileId: () => number;
@@ -95,7 +95,8 @@ export class BackfillCoordinator {
   // Shared eligibility barrier (spec §3): vector search AND automatic backfill.
   // 'n/a' (fresh DB — nothing to reconcile) counts as satisfied (6R note 1).
   get eligible(): boolean {
-    return this.deps.gateIsReady() && (this.recon === 'complete' || this.recon === 'n/a');
+    // A model that is merely out of memory does not close this: whoever needs it waits for it.
+    return this.deps.gateCanServe() && (this.recon === 'complete' || this.recon === 'n/a');
   }
 
   // "Unreconciled vector" = a row that actually HAS a vector and no provenance.
@@ -484,6 +485,7 @@ export class BackfillCoordinator {
       const FAIL_CAP = 5;
       let consecutive = 0;
       let lastFailedTarget: string | null = null;
+      let modelUnavailable = false;
 
       const shouldSkip = (kind: string, targetId: string, currentHash: string | null): boolean => {
         const f = capStmt.get(kind, targetId) as { attempts: number; input_hash: string | null; profile_id: number | null } | undefined;
@@ -507,6 +509,9 @@ export class BackfillCoordinator {
           failStmt.run(kind, targetId, currentHash, profileId, 'reembed returned false');
         } catch (e) {
           if (this.shuttingDown) return 'abort';
+          // Download in progress or a failed load is not this row's fault: stop the scan, charge
+          // nothing against FAIL_CAP. onReady kicks a new scan.
+          if ((e as { code?: string })?.code === 'MODEL_NOT_READY') { modelUnavailable = true; return 'abort'; }
           failStmt.run(kind, targetId, currentHash, profileId,
             e instanceof Error ? e.message.slice(0, 300) : String(e));
         }
@@ -547,7 +552,7 @@ export class BackfillCoordinator {
         if (shouldSkip('chunk', targetId, currentHash)) continue;
         const outcome = await recordResult('chunk', targetId, currentHash,
           () => this.deps.reembedChunk(row.rowid));
-        if (outcome === 'abort') { console.error('⚠️ backfill aborted: 3 consecutive distinct-target failures (systemic)'); return; }
+        if (outcome === 'abort') { if (!modelUnavailable) console.error('⚠️ backfill aborted: 3 consecutive distinct-target failures (systemic)'); return; }
         if (++processed % 8 === 0) await new Promise(r => setImmediate(r));
       }
 
@@ -580,7 +585,7 @@ export class BackfillCoordinator {
         if (shouldSkip('entity', row.id, currentHash)) continue;
         const outcome = await recordResult('entity', row.id, currentHash,
           () => this.deps.reembedEntity(row.id));
-        if (outcome === 'abort') { console.error('⚠️ backfill aborted: 3 consecutive distinct-target failures (systemic)'); return; }
+        if (outcome === 'abort') { if (!modelUnavailable) console.error('⚠️ backfill aborted: 3 consecutive distinct-target failures (systemic)'); return; }
         if (++processed % 8 === 0) await new Promise(r => setImmediate(r));
       }
 

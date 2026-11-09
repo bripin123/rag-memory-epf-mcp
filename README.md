@@ -148,11 +148,23 @@ storeDocument(id, content, metadata)
 | `DB_FILE_PATH` | `rag-memory.db` (server dir) | Path to project-local SQLite database. A **relative** path resolves against the server's working directory (since 6.3.0; before that it resolved against the package install directory, which under `npx` is the npm cache) |
 | `RAG_MEMORY_MMAP_SIZE` | `0` | SQLite `mmap_size` in bytes. **Off by default since 6.3.0** — with mmap on, one writer + two readers on a Google Drive folder (Windows) produced `database disk image is malformed` reads; set e.g. `268435456` to restore the previous behaviour. The applied value is printed in the boot banner (`| mmap <n>`) |
 | `EMBEDDING_MODEL` | `Xenova/bge-m3` | HuggingFace model ID for embeddings |
-| `RAG_MEMORY_EMBEDDINGS` | `lazy` | Boot mode: `lazy` (connect instantly, model loads in background), `eager` (wait for model + reconciliation, pre-3.6 behavior), `off` (never load the model — FTS5-only, zero download) |
+| `RAG_MEMORY_EMBEDDINGS` | `lazy` | Boot mode: `lazy` (connect instantly; the model enters memory when something needs it and leaves after `RAG_MEMORY_MODEL_IDLE_MS`), `eager` (wait for model + reconciliation and keep it resident, pre-3.6 behavior), `off` (never load the model — FTS5-only, zero download) |
+| `RAG_MEMORY_MODEL_IDLE_MS` | `180000` | `lazy` only: unload the embedding model after this many ms without use. `0` keeps it resident |
 | `RAG_MEMORY_MODEL_CACHE_DIR` | OS user cache | Version-independent model cache location (see `docs/UPDATING.md`) |
 | `RAG_MEMORY_TRUST_LEGACY_VECTORS` | unset | Set `1` to grandfather pre-existing vectors under a **custom** `EMBEDDING_MODEL` (default model configs grandfather automatically) |
 
 ## Changelog
+
+### Unreleased
+
+- **Changed — the embedding model is in memory only while it is being used.** `lazy` no longer loads it at boot. The
+  first search or write that needs it loads it and waits (about 2 s on a warm disk) and still runs the vector path;
+  after `RAG_MEMORY_MODEL_IDLE_MS` (default 180000, `0` = keep resident) without use it leaves memory. Measured on
+  macOS: an idle engine holds about 0.55 GB instead of about 2 GB, with the same top-10 order on 143 frozen queries.
+  `model_state` now normally reads `idle`.
+- **Changed — when search answers from FTS5 only.** A model that is merely out of memory no longer causes it. It now
+  happens when the model files are not on the machine yet, when loading really failed or a caller has waited 45 s, with
+  `RAG_MEMORY_EMBEDDINGS=off`, and during a legacy DB's reconciliation. `eager` keeps the model resident.
 
 ### v6.4.4 (2026-11-07)
 
