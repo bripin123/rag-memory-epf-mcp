@@ -45,15 +45,17 @@ import { chunkStructured as chunkStructuredText, effectiveSignature, isCurrentFo
 import { migrations } from './src/migrations/migrations.js';
 
 // v3.6 lite install: model lifecycle + version-independent cache (A′ boundary)
-import { EmbeddingGate, GateNotReadyError, GateDisabledError, TerminalConfigError } from './src/embeddingGate.js';
-import type { EmbedFn, EmbedPriority } from './src/embeddingGate.js';
-import { resolveModelCacheDir, preflightCacheDir, artifactKey, ModelDownloadLock, handleLoaderFailure } from './src/modelCache.js';
+import { EmbeddingGate, GateNotReadyError, GateDisabledError, TerminalConfigError, resolveModelIdleMs } from './src/embeddingGate.js';
+import type { LoadedModel, EmbedPriority } from './src/embeddingGate.js';
+import { resolveModelCacheDir, preflightCacheDir, artifactKey, modelFilesPresent, ModelDownloadLock, handleLoaderFailure } from './src/modelCache.js';
 import { BackfillCoordinator } from './src/backfillCoordinator.js';
 import { l2ToCosineSimilarity, legacyL2AsCosineScore } from './src/vecSimilarity.js';
 import { writeVector, deleteVector, registerVecSlotFunctions, InvalidSlotError, slotSummary, rebuildVecTable, rebuildReason, DEFAULT_REBUILD_POLICY, VecSlotError } from './src/vecSlots.js';
 import type { SlotSummary, RebuildResult, VecTable } from './src/vecSlots.js';
 import { calendarDate, resolveCalendarTimeZone, stampDatePrefix, stripDatePrefix } from './src/observations/date-prefix.js';
 import os from 'node:os';
+import v8 from 'node:v8';
+import vm from 'node:vm';
 import { createHash } from 'crypto';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
@@ -115,6 +117,26 @@ export function compileFtsLiteralQuery(q: string): string | null {
   const terms = sanitized.split(/\s+/).filter(t => t.length > 0);
   if (terms.length === 0) return null;
   return terms.map(t => `"${t}"`).join(' OR ');
+}
+
+// dispose() releases the ONNX session, but the weights also sit in JS-owned buffers that V8 only
+// reclaims on a collection, and an idle server allocates nothing that would trigger one (measured
+// 2026-11-09: a real idle engine stayed at 1.4-1.8 GB without this). Two passes with a gap let
+// the finalizers of the first pass run.
+async function disposeModel(model: any): Promise<void> {
+  try { await model.dispose(); } finally { await collectGarbageNow(); }
+}
+
+export async function collectGarbageNow(): Promise<void> {
+  try {
+    v8.setFlagsFromString('--expose-gc');
+    const gc = vm.runInNewContext('gc') as () => void;
+    gc();
+    await new Promise(r => setTimeout(r, 1000).unref?.());
+    gc();
+  } catch (e) {
+    console.error(`⚠️ post-unload GC unavailable: ${e instanceof Error ? e.message : e}`);
+  }
 }
 
 // Test-only seam for the real model loader: replaces `pipeline` so a test can see the exact
@@ -460,13 +482,15 @@ export class RAGKnowledgeGraphManager {
       mode: this.embeddingsMode,
       loadModel: () => this.buildRealLoader(),
       onReady: () => this.coordinator?.kick(),
+      idleMs: resolveModelIdleMs(process.env.RAG_MEMORY_MODEL_IDLE_MS),
+      isModelCached: () => this.modelFilesOnDisk(),
     });
 
     // Late-bound deps (closures): tests swap manager.gate / flip the guard.
     this.coordinator = new BackfillCoordinator({
       db: () => this.db,
-      gateIsReady: () => this.gate.isReady,
       gateIsDisabled: () => this.gate.isDisabled,
+      gateCanServe: () => this.gate.canServe,
       mode: () => this.embeddingsMode,
       grandfatherAllowed: () => this.grandfatherAllowed,
       currentProfileId: () => this.currentProfileId,
@@ -651,7 +675,12 @@ export class RAGKnowledgeGraphManager {
   // Real model loader used by the gate: version-independent cache dir with a
   // cross-process download lock. Preflight failure throws (gate -> failed);
   // silently falling back to the package-internal cache is forbidden (spec §7).
-  private async buildRealLoader(): Promise<EmbedFn> {
+  private modelFilesOnDisk(): boolean {
+    return modelFilesPresent(resolveModelCacheDir(process.env, process.platform, os.homedir()),
+      EMBEDDING_MODEL, MODEL_REVISION, MODEL_DTYPE);
+  }
+
+  private async buildRealLoader(): Promise<LoadedModel> {
     const cacheDir = resolveModelCacheDir(process.env, process.platform, os.homedir());
     const pf = preflightCacheDir(cacheDir);
     if (!pf.ok) throw new Error(`model cache dir not writable (${cacheDir}): ${pf.error}`);
@@ -660,14 +689,16 @@ export class RAGKnowledgeGraphManager {
     // Shutdown aborts the lock wait via the gate's AbortController (spec §3).
     console.error('⏳ acquiring model download lock...'); // deterministic lock-wait marker (5R test residual)
     const role = await lock.acquireOrWait({ timeoutMs: 10 * 60_000, signal: this.gate.abort.signal });
+    let created: unknown = null;       // built but not yet handed to the gate
     try {
-      this.gate.markDownloading();
+      if (!this.modelFilesOnDisk()) this.gate.markDownloading();
       env.allowRemoteModels = true;
       env.allowLocalModels = true;
       console.error(`🤖 Loading embedding model: ${EMBEDDING_MODEL} (1024-dim, cache=${cacheDir})...`);
       const model = await __pipelineImpl('feature-extraction', EMBEDDING_MODEL,
         { revision: MODEL_REVISION, dtype: MODEL_DTYPE, cache_dir: cacheDir,
           session_options: { ...MODEL_SESSION_OPTIONS } } as any);
+      created = model;
       // dims fail-fast (spec §2 / beta B8): probe the ACTUAL output length — a
       // 384/768-dim custom model must fail here with a clear message, not at
       // every subsequent vector write.
@@ -682,7 +713,9 @@ export class RAGKnowledgeGraphManager {
       }
       if (role === 'owner') lock.markComplete();
       console.error(`✅ ${EMBEDDING_MODEL} model loaded (${MODEL_DTYPE})`);
-      return makeEmbedFn(model as any, IS_DEFAULT_MODEL_CONFIG);
+      const embed: LoadedModel = makeEmbedFn(model as any, IS_DEFAULT_MODEL_CONFIG);
+      embed.dispose = () => disposeModel(model);
+      return embed;
     } catch (e) {
       // Cache policy by CAUSE and ROLE (beta 2R B3 -> 4R M1 -> 5R M1), unit-
       // tested in modelCache: config errors touch nothing; integrity errors
@@ -696,6 +729,7 @@ export class RAGKnowledgeGraphManager {
       if (action === 'quarantined') console.error('🧹 cache-integrity failure (owner) — model cache quarantined');
       else if (action === 'marker-invalidated') console.error('… cache-integrity failure (reader) — marker dropped, next retry re-proves as locked owner');
       else if (!(e instanceof TerminalConfigError)) console.error('… non-integrity load failure — model cache preserved');
+      if (created) await disposeModel(created).catch(() => { /* the load failure is what the caller needs */ });
       throw e;
     } finally {
       lock.release();
@@ -884,7 +918,8 @@ export class RAGKnowledgeGraphManager {
         const embedding = await this.generateEmbedding(row.text, 1024, false, 'backfill', `profile:${captured.profile_id}`);
         return this.writeKgVectorIfCurrent(captured, embedding);
       } catch (e) {
-        if (e instanceof GateNotReadyError || e instanceof GateDisabledError) return false;
+        // MODEL_NOT_READY propagates: the backfill must not charge it against this row.
+        if (e instanceof GateDisabledError) return false;
         throw e;
       }
     }
@@ -910,7 +945,7 @@ export class RAGKnowledgeGraphManager {
       this.coordinator?.invalidateCoverage();
       return written;
     } catch (e) {
-      if (e instanceof GateNotReadyError || e instanceof GateDisabledError) return false;
+      if (e instanceof GateDisabledError) return false;
       throw e;
     }
   }
@@ -3054,7 +3089,23 @@ export class RAGKnowledgeGraphManager {
         if (cmCount > 0 && embCount < cmCount) {
           // v3.6 (spec §5b M12): identical content with incomplete/stale vectors keeps the
           // document, chunks, rowids and entity links — only missing vectors are re-queued.
-          console.error(`♻️ syncDocumentFromFile: ${documentId} unchanged but ${cmCount - embCount} vectors missing — re-queued (chunks preserved)`);
+          console.error(`♻️ syncDocumentFromFile: ${documentId} unchanged but ${cmCount - embCount} vectors missing — repairing (chunks preserved)`);
+          if (await this.gate.ensureReady()) {
+            const missing = this.db.prepare(`
+              SELECT m.rowid FROM chunk_metadata m
+              WHERE m.document_id = ? AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.rowid = m.rowid AND (m.provenance_state IS NULL OR m.profile_id = ?))
+            `).all(documentId, this.currentProfileId) as Array<{ rowid: number }>;
+            let repaired = 0;
+            try {
+              for (const r of missing) if (await this.reembedChunkByRowid(r.rowid)) repaired++;
+            } catch (e) {
+              if (!(e instanceof GateNotReadyError)) throw e;
+            }
+            if (repaired === missing.length) {
+              return { documentId, bytes, chunks: cmCount, embeddedChunks: embCount + repaired, linkedEntities: linked,
+                       skipped: true, reason: 'unchanged-revectorizing', embedding_status: 'embedded', ...zero, queuedChunks: 0 };
+            }
+          }
           this.coordinator?.kick();
           return { documentId, bytes, chunks: cmCount, embeddedChunks: embCount, linkedEntities: linked,
                    skipped: true, reason: 'unchanged-revectorizing',
@@ -3081,15 +3132,17 @@ export class RAGKnowledgeGraphManager {
       }
 
       // 임베딩/재사용 — 트랜잭션 밖, ready 경로 한정 (N2: not-ready 계약 불변).
-      const lazySync = !this.gate.isReady;
+      // The model comes in only if some chunk actually needs a new vector.
+      const reusable = segments.map(seg => selectReusableVector(byHash.get(shaHex(seg.text)) ?? [], seg.text, this.currentProfileId, shaHex));
+      const lazySync = this.gate.isDisabled || (reusable.some(hit => !hit) && !(await this.gate.ensureReady()));
       type Slot = { seg: Chunk; vec: Buffer | null; provenance: 'verified' | 'legacy_assumed' | null };
       const slots: Slot[] = [];
       let reusedChunks = 0, newlyEmbeddedChunks = 0;
       if (lazySync) {
         for (const seg of segments) slots.push({ seg, vec: null, provenance: null });
       } else {
-        for (const seg of segments) {
-          const hit = selectReusableVector(byHash.get(shaHex(seg.text)) ?? [], seg.text, this.currentProfileId, shaHex);
+        for (const [i, seg] of segments.entries()) {
+          const hit = reusable[i];
           if (hit) { slots.push({ seg, vec: hit.vec, provenance: hit.provenance }); reusedChunks++; }
           else {
             const embedding = await this.generateEmbedding(seg.text, 1024, false, 'bulk');
@@ -4831,10 +4884,10 @@ export class RAGKnowledgeGraphManager {
   // v3.6 (spec §5c / 6R note 2): why is vector search degraded right now?
   degradationReason(): 'disabled' | 'model_not_ready' | 'reconciling' | 'reconciliation_failed' | undefined {
     if (this.gate.isDisabled) return 'disabled';
-    if (!this.gate.isReady) return 'model_not_ready';
     const rs = this.coordinator?.reconState;
     if (rs === 'failed') return 'reconciliation_failed';
     if (rs && rs !== 'complete' && rs !== 'n/a') return 'reconciling';
+    if (!this.gate.isReady) return 'model_not_ready';
     return undefined;
   }
 
@@ -5605,9 +5658,9 @@ async function main() {
     console.error("🚀 Enhanced RAG Knowledge Graph MCP Server running on stdio");
 
     if (ragKgManager.embeddingsMode === 'lazy') {
-      // Background: model load + provenance reconciliation run in parallel.
-      // Failures surface via gate/coordinator state, never as rejections.
-      void ragKgManager.gate.start().catch(() => {});
+      // The model stays out of memory until something needs it (IN-46); only missing files are
+      // fetched now. Reconciliation needs no model. Failures surface via state, never rejections.
+      ragKgManager.gate.prefetchIfMissing();
       void ragKgManager.startReconciliation().catch(() => {});
     } else if (ragKgManager.embeddingsMode === 'off') {
       // off mode still CLASSIFIES reconciliation state (deferred vs n/a) so

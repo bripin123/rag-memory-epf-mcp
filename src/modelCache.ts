@@ -8,7 +8,7 @@
 // Lock/marker keys use ONLY cache-artifact fields (model id, revision, dtype) —
 // never retrieval config (spec §6c layer 1).
 
-import { mkdirSync, writeFileSync, readFileSync, unlinkSync, existsSync, renameSync, rmSync, readdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, unlinkSync, existsSync, renameSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 
@@ -40,6 +40,13 @@ export function preflightCacheDir(dir: string): { ok: boolean; error?: string } 
 
 export function artifactKey(modelId: string, revision: string, dtype: string): string {
   return createHash('sha1').update(`${modelId}@${revision}#${dtype}`).digest('hex').slice(0, 12);
+}
+
+// Whether a caller can wait for a local load, or the weights must be fetched first. The completion
+// marker does not decide this: a cache without one still loads locally (and the loader then writes it).
+export function modelFilesPresent(cacheDir: string, modelId: string, revision: string, dtype: string): boolean {
+  const file = join(cacheDir, modelId, ...(revision === 'main' ? [] : [revision]), 'onnx', `model_${dtype}.onnx`);
+  try { return statSync(file).size > 0; } catch { return false; }
 }
 
 const STALE_LOCK_MS = 30 * 60_000;

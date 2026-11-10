@@ -28,6 +28,7 @@ process.on('unhandledRejection', () => { unhandled++; });
     mode: 'lazy',
     loadModel: async () => { loads++; await gateOpen; return async () => vec(); },
     onReady: () => { readies++; },
+    isModelCached: () => false,   // not-ready rejection is now only for missing files (on-demand otherwise)
   });
   assert.equal(g.status.state, 'idle');
   await assert.rejects(() => g.embed('x', { priority: 'interactive' }), GateNotReadyError);
