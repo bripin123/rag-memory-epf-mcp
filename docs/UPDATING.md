@@ -113,6 +113,14 @@ path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
 is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
 the next start becomes a clean download owner.
 
+## v6.4.5 (schema v14, unchanged): embedding model in memory only while used
+
+**What changes for an existing database.** Nothing is migrated and nothing is re-embedded. What changes is the engine
+process in `lazy` mode (the default): the model is no longer loaded at boot, the first search or write that needs it
+loads it and waits, and it leaves memory after `RAG_MEMORY_MODEL_IDLE_MS` (default 180000) without use, so
+`model_state` normally reads `idle`. Set `RAG_MEMORY_MODEL_IDLE_MS=0` or `RAG_MEMORY_EMBEDDINGS=eager` to keep it
+resident. An engine that is already running keeps the old behaviour until it restarts on 6.4.5.
+
 ## v6.4.4 (schema v14, unchanged): real cosine similarity in default search, chunk orphan vectors cleaned
 
 **What changes for an existing database.** Nothing is migrated and nothing is re-embedded. On the first reconciliation

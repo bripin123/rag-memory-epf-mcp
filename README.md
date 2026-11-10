@@ -155,7 +155,7 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
-### Unreleased
+### v6.4.5 (2026-11-10)
 
 - **Changed — the embedding model is in memory only while it is being used.** `lazy` no longer loads it at boot. The
   first search or write that needs it loads it and waits (about 2 s on a warm disk) and still runs the vector path;
@@ -165,6 +165,7 @@ storeDocument(id, content, metadata)
 - **Changed — when search answers from FTS5 only.** A model that is merely out of memory no longer causes it. It now
   happens when the model files are not on the machine yet, when loading really failed or a caller has waited 45 s, with
   `RAG_MEMORY_EMBEDDINGS=off`, and during a legacy DB's reconciliation. `eager` keeps the model resident.
+- Not measured: Windows, a cold disk cache, several engines loading at the same moment.
 
 ### v6.4.4 (2026-11-07)
 
