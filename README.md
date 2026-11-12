@@ -155,7 +155,7 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
-### Unreleased
+### v6.4.6 (2026-11-12)
 
 - **Fixed — starting the engine no longer changes an already-initialised database file.** Every boot ran
   `INSERT OR IGNORE INTO embedding_profiles`; on that `AUTOINCREMENT` table the statement added no row but still

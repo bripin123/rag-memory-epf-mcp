@@ -113,6 +113,15 @@ path and holder pid (e.g. `.download-<key>.lock`). Verify the holder process
 is genuinely gone or hung (`ps -p <pid>`), then remove the lock file manually;
 the next start becomes a clean download owner.
 
+## v6.4.6 (schema v14, unchanged): starting the engine leaves the database file unchanged
+
+**What changes for an existing database.** Nothing is migrated and nothing is re-embedded. Up to 6.4.5 every boot
+advanced the `embedding_profiles` counter in `sqlite_sequence` without adding a row, so the file bytes changed even
+when no tool was called; that counter keeps the value it has reached and no longer moves on boot. A setup that
+compares the whole-file hash of one database across two machines stops seeing a session that was only opened and
+closed as a write. An engine that is already running keeps the old behaviour until it restarts on 6.4.6, and the
+first boot on 6.4.6 no longer changes the file.
+
 ## v6.4.5 (schema v14, unchanged): embedding model in memory only while used
 
 **What changes for an existing database.** Nothing is migrated and nothing is re-embedded. What changes is the engine
