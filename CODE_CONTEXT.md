@@ -420,6 +420,11 @@ The fingerprint serialisation (positional JSON array, evidence in input order, r
 - `INTEGER NOT NULL` is **not** type enforcement in SQLite (`'2x'` inserts fine) — pair it with
   `CHECK (typeof(col) = 'integer')`.
 - `TEXT PRIMARY KEY` **permits NULL** in SQLite — write `NOT NULL` explicitly.
+- **`INSERT OR IGNORE` into an `AUTOINCREMENT` table advances `sqlite_sequence` even when the row is
+  skipped** (measured 2026-11-12: `embedding_profiles` went 1166 → 1167 → 1168 over two boots with one
+  row). `total_changes()` stays 0, so the write-seq signal does not see it, but the file bytes change.
+  On a path that runs without a caller asking for a write (boot, idle ticks), `SELECT` first and insert
+  only when missing. `test/boot-idempotent.test.mjs` holds the boot path to "same sha256".
 - Embedding dimension is **1024, fixed**. Changing the model means a migration, not a config edit.
 - **Do not use `VACUUM INTO` to make a recovery point.** VACUUM may renumber the ROWIDs of tables
   without an explicit `INTEGER PRIMARY KEY`, and `entities` is one — `entities_fts` indexes it by
