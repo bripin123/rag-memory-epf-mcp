@@ -155,6 +155,16 @@ storeDocument(id, content, metadata)
 
 ## Changelog
 
+### Unreleased
+
+- **Fixed — starting the engine no longer changes an already-initialised database file.** Every boot ran
+  `INSERT OR IGNORE INTO embedding_profiles`; on that `AUTOINCREMENT` table the statement added no row but still
+  advanced `sqlite_sequence`, so a session that was only opened and closed left a different file. A launcher that
+  compares the whole-file hash across two machines then refused the other machine. The profile is now looked up
+  first and inserted only when missing. Measured on macOS: a 150 MB database copy keeps the same sha256 across two
+  boots with no tool call (`off` and `lazy`), where 6.4.5 changed it on each boot.
+- Not measured: Windows.
+
 ### v6.4.5 (2026-11-10)
 
 - **Changed — the embedding model is in memory only while it is being used.** `lazy` no longer loads it at boot. The

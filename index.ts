@@ -655,12 +655,20 @@ export class RAGKnowledgeGraphManager {
     if (!this.db) throw new Error('Database not initialized');
     const dims = 1024;
     if (dims !== 1024) throw new Error('unsupported embedding dims (vec0 tables are fixed at 1024)'); // fail-fast contract
-    this.db.prepare(`INSERT OR IGNORE INTO embedding_profiles
-      (model_id, revision, dtype, dims, pooling, normalize) VALUES (?,?,?,?,?,?)`)
-      .run(EMBEDDING_MODEL, MODEL_REVISION, MODEL_DTYPE, dims, 'cls', 1);
-    const row = this.db.prepare(`SELECT id FROM embedding_profiles
-      WHERE model_id=? AND revision=? AND dtype=? AND dims=? AND pooling=? AND normalize=?`)
-      .get(EMBEDDING_MODEL, MODEL_REVISION, MODEL_DTYPE, dims, 'cls', 1) as { id: number };
+    // Look the profile up first and insert only when it is missing (test/boot-idempotent.test.mjs).
+    // `INSERT OR IGNORE` on this AUTOINCREMENT + UNIQUE table reserved the next rowid in
+    // sqlite_sequence before the conflict skipped the row, so every boot changed the file with
+    // no row changed — the launcher's whole-file hash then refused the other machine.
+    const profile = [EMBEDDING_MODEL, MODEL_REVISION, MODEL_DTYPE, dims, 'cls', 1] as const;
+    const findProfile = this.db.prepare(`SELECT id FROM embedding_profiles
+      WHERE model_id=? AND revision=? AND dtype=? AND dims=? AND pooling=? AND normalize=?`);
+    let row = findProfile.get(...profile) as { id: number } | undefined;
+    if (!row) {
+      // OR IGNORE stays for the one case left: another engine inserted it between the two statements.
+      this.db.prepare(`INSERT OR IGNORE INTO embedding_profiles
+        (model_id, revision, dtype, dims, pooling, normalize) VALUES (?,?,?,?,?,?)`).run(...profile);
+      row = findProfile.get(...profile) as { id: number };
+    }
     this.db.prepare(`INSERT INTO server_meta(key,value) VALUES('current_profile_id',?)
       ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(String(row.id));
     // query_prefix_version: diagnostic marker of the query-input convention of the engine that last INITIALISED
