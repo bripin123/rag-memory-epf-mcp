@@ -1,0 +1,34 @@
+# Runs the whole suite on the same runner the release uses, on every push to main.
+#
+# The release workflow (publish.yml) runs on a tag and stops at the first failing test. A tag that
+# fails there has to be moved. This runs before that: it reports every failing test file in one
+# pass, so main is known to pass on the runner before a version tag is pushed.
+name: test
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - run: node -v && npm -v && sqlite3 --version && sw_vers -productVersion
+
+      - run: npm ci
+
+      - name: Run every test file and report all failures
+        run: node .github/scripts/run-all-tests.mjs
