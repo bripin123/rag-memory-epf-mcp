@@ -152,7 +152,11 @@ test('(2) sqlite3 -readonly backs up a WAL database when its -shm is present, an
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('(2) sqlite3 -readonly CANNOT open a WAL database whose -shm is absent — the fallback exists for this', () => {
+// This describes the `sqlite3` binary on the machine, not the engine. On macOS 15.8.3 (sqlite3 3.43.2) the
+// read-only open is refused; on the GitHub macOS runner (2026-11-12) it succeeds. Both are supported, so a
+// machine where it succeeds is reported, not failed: the fallback in snapshot.mjs has to stay for as long as
+// any machine refuses, and the next test covers that snapshot.mjs handles both.
+test('(2) sqlite3 -readonly CANNOT open a WAL database whose -shm is absent — the fallback exists for this', (t) => {
   const dir = mkdtempSync(join(TMP, 'gr-pf-noshm-'));
   try {
     const live = join(dir, 'live.db');
@@ -162,7 +166,11 @@ test('(2) sqlite3 -readonly CANNOT open a WAL database whose -shm is absent — 
     db.close();
     rmSync(live + '-wal', { force: true }); rmSync(live + '-shm', { force: true });
     const r = spawnSync('sqlite3', ['-readonly', live, `.backup '${join(dir, 'copy.db')}'`], { encoding: 'utf8' });
-    assert.notEqual(r.status, 0, 'if this ever starts passing, snapshot.mjs should drop the fallback');
+    if (r.status === 0) {
+      const v = spawnSync('sqlite3', ['--version'], { encoding: 'utf8' }).stdout.trim().split(' ')[0];
+      t.diagnostic(`sqlite3 ${v} on this machine opens it read-only; the snapshot.mjs fallback is not needed here`);
+      return;
+    }
     assert.match(r.stderr, /unable to open database file/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
