@@ -1,0 +1,50 @@
+# Publishes to npm when a version tag is pushed.
+#
+# No npm token and no 2FA prompt: npm trusts this workflow file in this repository
+# (npmjs.com -> package Settings -> Trusted Publisher) and the job proves who it is with a
+# short-lived OIDC token. Before this, a release needed a person at one specific Mac to approve
+# a browser prompt within about five minutes, and two releases in a row missed that window.
+#
+# The test gate is the package's own prepublishOnly (build + verify:invariants + verify:engine),
+# so nothing is published unless the suite passes on the tagged commit.
+#
+# Runner: macOS, because that is where the suite is measured. Linux is not measured.
+name: publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write   # required for npm trusted publishing (OIDC)
+
+jobs:
+  publish:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false   # never use caching in release builds
+
+      - name: Tag must match package.json version
+        run: |
+          want="v$(node -p "require('./package.json').version")"
+          if [ "$want" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $want"
+            exit 1
+          fi
+
+      # Trusted publishing needs npm 11.5.1 or later; print what the runner has so a too-old npm
+      # is readable in the log instead of showing up as an authentication error.
+      - run: node -v && npm -v
+
+      - run: npm ci
+
+      - run: npm publish
