@@ -434,6 +434,15 @@ The fingerprint serialisation (positional JSON array, evidence in input order, r
 - **`quick_check` does not validate an external-content FTS5 index.** Run
   `INSERT INTO <fts>(<fts>) VALUES('integrity-check')` when you need to know a snapshot is usable.
 - **Publish a file no-clobber with `linkSync`, not `renameSync`.** rename overwrites silently.
+- **The suite has to pass on the release runner, not only on the machine it was written on.** On 2026-11-12
+  two things differed there: Node 24.22.2 has a 64 KiB `Buffer` pool (8 KiB on 24.12.0), so `Buffer.from(buf)`
+  returned a pooled view where an independent copy was promised (use `Buffer.allocUnsafeSlow` + `copy` when
+  `byteOffset` 0 matters); and the runner's `sqlite3` opens a WAL database read-only without its `-shm`, which
+  the macOS 15 binary refuses. `.github/workflows/test.yml` runs every test command on each push to `main` and
+  lists all that fail, so check it before pushing a version tag.
+- **`tsc` does not clean `dist/`.** An output whose source was deleted stays there and is packed (`files`
+  includes `dist`): `dist/src/chunkText.js` shipped for months after `src/chunkText.ts` was removed. When a
+  source file is deleted, delete its `dist/` outputs too; a build on the runner starts from a clean checkout.
 - Node **>= 24** (`engines`). Published to npm as `rag-memory-epf-mcp`; **31 projects consume it**,
   so a schema or tool-contract change is a fleet event, not a local one.
 - A migration must be all-or-nothing: one transaction, and gates (`PRAGMA foreign_key_check`, plus
@@ -466,6 +475,7 @@ tests = `node:assert/strict` in `.test.mjs`, no runner.
 | Add an MCP tool | the four edits in §1 |
 | Change observation behaviour | `src/observations/lifecycle.ts` + the calling writer in `index.ts`, inside `mutateEntityAndInvalidate` (or, if already in a transaction, `rebuildProjection` + `invalidateDerivedForEntity`) |
 | Add a test | new `test/*.test.mjs` + wire into `verify:engine` |
+| Release | push `main` and wait for the `test` workflow on that commit → release commit (version, README changelog, `docs/UPDATING.md`) → push, wait for `test` again → `git tag -a vX.Y.Z -m vX.Y.Z` on the release commit and push the tag → the `publish` workflow runs `prepublishOnly` and `npm publish` through npm trusted publishing (no login, no 2FA). Publishing from a laptop is the fallback only; its browser approval expires after about five minutes |
 | Verify | `npm test > <logfile> 2>&1` as the LAST command, so the harness sees npm's own exit code (an `echo` after it exits 0 even when tests fail) — never pipe, and set `RAG_MEMORY_REALDATA_DB` to a pre-v13 copy to include the real-data regression |
 
 ---
