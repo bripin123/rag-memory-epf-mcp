@@ -163,6 +163,11 @@ storeDocument(id, content, metadata)
   compares the whole-file hash across two machines then refused the other machine. The profile is now looked up
   first and inserted only when missing. Measured on macOS: a 150 MB database copy keeps the same sha256 across two
   boots with no tool call (`off` and `lazy`), where 6.4.5 changed it on each boot.
+- **Fixed — a reused chunk vector is an independent buffer on every Node 24.x.** The copy was made with
+  `Buffer.from`, which Node 24.22 places in its shared pool (the pool grew from 8 KiB to 64 KiB), so the copy came
+  back at a non-zero `byteOffset` and the test suite failed there. Stored vectors were not affected: the engine
+  writes the buffer itself, not its underlying `ArrayBuffer`. Measured on Node 24.12.0 and 24.22.2.
+- Releases are now published from GitHub Actions with npm trusted publishing (no token, no 2FA prompt).
 - Not measured: Windows.
 
 ### v6.4.5 (2026-11-10)

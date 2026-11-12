@@ -397,7 +397,12 @@ export function selectReusableVector(
     if (r.text !== text) continue;                                          // 조건 3: exact text 최종판정
     if (r.profile_id !== currentProfileId) continue;                        // 조건 4: 현행 프로필
     if (r.provenance_state !== 'verified' && r.provenance_state !== 'legacy_assumed') continue; // 조건 5 (NULL 제외)
-    return { vec: Buffer.from(r.embedding), provenance: r.provenance_state };  // owned copy
+    // allocUnsafeSlow, not Buffer.from: Buffer.from copies into Node's shared pool when the size is under
+    // half of Buffer.poolSize. The pool is 8 KiB on Node 24.12.0 and 64 KiB on 24.22.2 (both measured), so
+    // on the newer one a 4,096-byte vector came back as a view at a non-zero byteOffset.
+    const vec = Buffer.allocUnsafeSlow(r.embedding.length);
+    r.embedding.copy(vec);
+    return { vec, provenance: r.provenance_state };  // owned copy, byteOffset 0
   }
   return null;
 }
